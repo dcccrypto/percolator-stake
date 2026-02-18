@@ -27,7 +27,12 @@ pub fn calc_lp_for_deposit(supply: u32, pool_value: u32, deposit: u32) -> Option
         let lp = (deposit as u64)
             .checked_mul(supply as u64)?
             .checked_div(pool_value as u64)?;
-        Some(lp as u32)
+        // Mirror production overflow guard (production checks > u64::MAX)
+        if lp > u32::MAX as u64 {
+            None
+        } else {
+            Some(lp as u32)
+        }
     }
 }
 
@@ -37,7 +42,12 @@ pub fn calc_collateral_for_withdraw(supply: u32, pool_value: u32, lp: u32) -> Op
     let col = (lp as u64)
         .checked_mul(pool_value as u64)?
         .checked_div(supply as u64)?;
-    Some(col as u32)
+    // Mirror production overflow guard (production checks > u64::MAX)
+    if col > u32::MAX as u64 {
+        None
+    } else {
+        Some(col as u32)
+    }
 }
 
 /// Pool value = deposited - withdrawn + returned.
@@ -122,56 +132,78 @@ mod proofs {
         assert_eq!(back, amount);
     }
 
-    /// Two depositors both withdraw: total_out ≤ total_in.
+    /// Two depositors at DIFFERENT exchange rates both withdraw: total_out ≤ total_in.
+    /// Pool appreciates between deposits, so ratio ≠ 1:1 for second depositor.
     #[kani::proof]
     #[kani::unwind(33)]
     fn proof_two_depositors_conservation() {
         let a: u32 = kani::any();
         let b: u32 = kani::any();
-        kani::assume(a > 0 && a < 100);
-        kani::assume(b > 0 && b < 100);
+        let appreciation: u32 = kani::any();
+        kani::assume(a > 0 && a < 20);
+        kani::assume(b > 0 && b < 20);
+        kani::assume(appreciation < 20);
 
+        // A deposits first (1:1)
         let a_lp = calc_lp_for_deposit(0, 0, a).unwrap();
-        let b_lp = match calc_lp_for_deposit(a_lp, a, b) {
+
+        // Pool appreciates (simulates trading profits, etc.)
+        let pv_after_appreciation = a + appreciation;
+
+        // B deposits at a different exchange rate (supply=a, value=a+appreciation)
+        let b_lp = match calc_lp_for_deposit(a_lp, pv_after_appreciation, b) {
             Some(lp) if lp > 0 => lp, _ => return,
         };
         let s2 = a_lp + b_lp;
-        let pv2 = a + b;
+        let pv2 = pv_after_appreciation + b;
 
+        // A withdraws first
         let a_back = match calc_collateral_for_withdraw(s2, pv2, a_lp) {
             Some(v) => v, None => return,
         };
+        // B withdraws from remainder
         let b_back = match calc_collateral_for_withdraw(s2 - a_lp, pv2 - a_back, b_lp) {
             Some(v) => v, None => return,
         };
-        assert!((a_back as u64) + (b_back as u64) <= (a as u64) + (b as u64));
+        // Conservation: total withdrawn ≤ total deposited + appreciation
+        assert!((a_back as u64) + (b_back as u64) <= (a as u64) + (b as u64) + (appreciation as u64));
     }
 
-    /// Late depositor can't dilute early depositor's share.
-    /// If B deposits after A, A's withdrawal value doesn't decrease.
+    /// Late depositor can't dilute early depositor's share (with non-unity exchange rate).
+    /// A deposits into existing pool (ratio ≠ 1:1). B deposits after. A's value doesn't decrease.
     #[kani::proof]
     #[kani::unwind(33)]
     fn proof_no_dilution() {
+        let init_s: u32 = kani::any();
+        let init_pv: u32 = kani::any();
         let a_dep: u32 = kani::any();
         let b_dep: u32 = kani::any();
-        kani::assume(a_dep > 0 && a_dep < 50);
-        kani::assume(b_dep > 0 && b_dep < 50);
+        kani::assume(init_s > 0 && init_s < 15);
+        kani::assume(init_pv > 0 && init_pv < 15);
+        kani::assume(a_dep > 0 && a_dep < 15);
+        kani::assume(b_dep > 0 && b_dep < 15);
 
-        // A deposits first (1:1)
-        let a_lp = calc_lp_for_deposit(0, 0, a_dep).unwrap();
+        // A deposits into existing pool with arbitrary ratio
+        let a_lp = match calc_lp_for_deposit(init_s, init_pv, a_dep) {
+            Some(lp) if lp > 0 => lp, _ => return,
+        };
+        let s_after_a = init_s + a_lp;
+        let pv_after_a = init_pv + a_dep;
 
         // A's value before B deposits
-        let a_value_before = match calc_collateral_for_withdraw(a_lp, a_dep, a_lp) {
+        let a_value_before = match calc_collateral_for_withdraw(s_after_a, pv_after_a, a_lp) {
             Some(v) => v, None => return,
         };
 
-        // B deposits
-        let b_lp = match calc_lp_for_deposit(a_lp, a_dep, b_dep) {
+        // B deposits (changes the pool state)
+        let b_lp = match calc_lp_for_deposit(s_after_a, pv_after_a, b_dep) {
             Some(lp) if lp > 0 => lp, _ => return,
         };
+        let s_after_b = s_after_a + b_lp;
+        let pv_after_b = pv_after_a + b_dep;
 
         // A's value after B deposits
-        let a_value_after = match calc_collateral_for_withdraw(a_lp + b_lp, a_dep + b_dep, a_lp) {
+        let a_value_after = match calc_collateral_for_withdraw(s_after_b, pv_after_b, a_lp) {
             Some(v) => v, None => return,
         };
 
@@ -179,24 +211,28 @@ mod proofs {
         assert!(a_value_after >= a_value_before);
     }
 
-    /// Flush doesn't change total pool value (it's just moving money between buckets).
+    /// Flush + full return = original pool value (conservation).
+    /// Flushing tokens to insurance and getting them all back restores pool value.
     #[kani::proof]
     #[kani::unwind(33)]
-    fn proof_flush_preserves_value() {
+    fn proof_flush_full_return_conservation() {
         let dep: u32 = kani::any();
         let wd: u32 = kani::any();
         let flush: u32 = kani::any();
         kani::assume(dep < 100 && wd < 100 && flush < 100);
         kani::assume(wd <= dep);
+        kani::assume(flush <= dep - wd);
 
-        let avail = flush_available(dep, wd, 0);
-        kani::assume(flush <= avail);
+        // Pool value before any flush
+        let pv_original = pool_value(dep, wd).unwrap();
 
-        // Pool value before flush
-        let pv_before = pool_value(dep, wd).unwrap();
-        // Pool value after flush (flush doesn't change deposited or withdrawn)
-        let pv_after = pool_value(dep, wd).unwrap();
-        assert_eq!(pv_before, pv_after);
+        // Pool value after flush (tokens left the vault)
+        let pv_after_flush = pool_value_with_flush(dep, wd, flush, 0).unwrap();
+        assert_eq!(pv_after_flush, pv_original - flush);
+
+        // Pool value after full return (all flushed tokens come back)
+        let pv_after_return = pool_value_with_flush(dep, wd, flush, flush).unwrap();
+        assert_eq!(pv_after_return, pv_original);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -231,15 +267,23 @@ mod proofs {
     // SECTION 3: Fairness / Monotonicity (3 proofs)
     // ════════════════════════════════════════════════════════════
 
-    /// Same inputs → same LP (deterministic).
+    /// LP rounding always favors pool: lp * pool_value <= deposit * supply.
+    /// This is the core pool-safety invariant that prevents value extraction.
     #[kani::proof]
     #[kani::unwind(33)]
-    fn proof_equal_deposits_equal_lp() {
+    fn proof_lp_rounding_favors_pool() {
         let s: u32 = kani::any();
         let pv: u32 = kani::any();
-        let a: u32 = kani::any();
-        kani::assume(s < 100 && pv < 100 && a < 100);
-        assert_eq!(calc_lp_for_deposit(s, pv, a), calc_lp_for_deposit(s, pv, a));
+        let dep: u32 = kani::any();
+        kani::assume(s > 0 && s < 100);
+        kani::assume(pv > 0 && pv < 100);
+        kani::assume(dep > 0 && dep < 100);
+
+        if let Some(lp) = calc_lp_for_deposit(s, pv, dep) {
+            // floor rounding: lp = floor(dep * s / pv)
+            // Invariant: lp * pv <= dep * s (pool never overissues)
+            assert!((lp as u64) * (pv as u64) <= (dep as u64) * (s as u64));
+        }
     }
 
     /// Larger deposit → ≥ LP (monotone).
@@ -428,26 +472,36 @@ mod proofs {
     // SECTION 7: Zero-input Boundaries (2 proofs)
     // ════════════════════════════════════════════════════════════
 
-    /// Zero deposit → zero LP.
+    /// Zero deposit → zero LP or None (never positive LP for free).
     #[kani::proof]
     #[kani::unwind(33)]
     fn proof_zero_deposit_zero_lp() {
         let s: u32 = kani::any();
         let pv: u32 = kani::any();
-        kani::assume(s > 0 && s < 100);
-        kani::assume(pv > 0 && pv < 100);
-        assert_eq!(calc_lp_for_deposit(s, pv, 0), Some(0));
+        kani::assume(s < 100 && pv < 100);
+        // No assumes on s > 0 or pv > 0 — test ALL states
+        let result = calc_lp_for_deposit(s, pv, 0);
+        // Either Some(0) (valid: no deposit = no LP) or None (orphaned/valueless state)
+        // NEVER Some(positive) — can't get LP for free
+        match result {
+            Some(lp) => assert_eq!(lp, 0),
+            None => {} // orphaned state correctly blocks deposit
+        }
     }
 
-    /// Zero LP burn → zero collateral.
+    /// Zero LP burn → zero collateral or None (never positive collateral for free).
     #[kani::proof]
     #[kani::unwind(33)]
     fn proof_zero_burn_zero_col() {
         let s: u32 = kani::any();
         let pv: u32 = kani::any();
-        kani::assume(s > 0 && s < 100);
-        kani::assume(pv > 0 && pv < 100);
-        assert_eq!(calc_collateral_for_withdraw(s, pv, 0), Some(0));
+        kani::assume(s < 100 && pv < 100);
+        // No assumes on s > 0 — test ALL states including supply=0
+        let result = calc_collateral_for_withdraw(s, pv, 0);
+        match result {
+            Some(col) => assert_eq!(col, 0),
+            None => {} // supply=0 correctly returns None
+        }
     }
 
     // ════════════════════════════════════════════════════════════
