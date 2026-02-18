@@ -135,10 +135,13 @@ impl StakePool {
         Pubkey::new_from_array(self.percolator_program)
     }
 
-    /// Total pool value = deposited - withdrawn.
-    /// (Flushed doesn't reduce value — those funds are still owned by LP holders, just in insurance.)
+    /// Total pool value = deposited - withdrawn + returned.
+    /// - Flushed doesn't reduce value (funds still owned by LP holders, just in insurance).
+    /// - Returned adds value back (insurance returned to vault after market resolution).
     pub fn total_pool_value(&self) -> Option<u64> {
-        crate::math::pool_value(self.total_deposited, self.total_withdrawn)
+        self.total_deposited
+            .checked_sub(self.total_withdrawn)?
+            .checked_add(self.total_returned)
     }
 
     /// Calculate LP tokens for a deposit amount.
@@ -172,4 +175,163 @@ pub fn derive_vault_authority(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8
 /// Derive the per-user deposit PDA.
 pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"stake_deposit", pool.as_ref(), user.as_ref()], program_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stake_pool_size() {
+        // Ensure struct is packed correctly (no surprise padding)
+        assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
+        // Check expected size: 1+1+1+1+4 + 5*32 + 7*8 + 32 + 96 = 8 + 160 + 56 + 32 + 96 = 352
+        assert_eq!(STAKE_POOL_SIZE, 352);
+    }
+
+    #[test]
+    fn test_stake_deposit_size() {
+        assert_eq!(STAKE_DEPOSIT_SIZE, std::mem::size_of::<StakeDeposit>());
+        // 1+1+6 + 2*32 + 2*8 + 64 = 8 + 64 + 16 + 64 = 152
+        assert_eq!(STAKE_DEPOSIT_SIZE, 152);
+    }
+
+    #[test]
+    fn test_pool_value_normal() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 300;
+        pool.total_returned = 0;
+        assert_eq!(pool.total_pool_value(), Some(700));
+    }
+
+    #[test]
+    fn test_pool_value_with_returns() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 300;
+        pool.total_returned = 200;
+        assert_eq!(pool.total_pool_value(), Some(900));
+    }
+
+    #[test]
+    fn test_pool_value_overdrawn() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 100;
+        pool.total_withdrawn = 200;
+        assert_eq!(pool.total_pool_value(), None);
+    }
+
+    #[test]
+    fn test_calc_lp_first_depositor() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 0;
+        pool.total_withdrawn = 0;
+        pool.total_lp_supply = 0;
+        assert_eq!(pool.calc_lp_for_deposit(1000), Some(1000));
+    }
+
+    #[test]
+    fn test_calc_lp_pro_rata() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 2000;
+        pool.total_withdrawn = 0;
+        pool.total_lp_supply = 1000;
+        // deposit 500 → 500 * 1000 / 2000 = 250
+        assert_eq!(pool.calc_lp_for_deposit(500), Some(250));
+    }
+
+    #[test]
+    fn test_calc_collateral_proportional() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 2000;
+        pool.total_withdrawn = 0;
+        pool.total_lp_supply = 1000;
+        // burn 250 LP → 250 * 2000 / 1000 = 500
+        assert_eq!(pool.calc_collateral_for_withdraw(250), Some(500));
+    }
+
+    #[test]
+    fn test_pda_derivation_deterministic() {
+        let program_id = Pubkey::new_unique();
+        let slab = Pubkey::new_unique();
+
+        let (pda1, bump1) = derive_pool_pda(&program_id, &slab);
+        let (pda2, bump2) = derive_pool_pda(&program_id, &slab);
+        assert_eq!(pda1, pda2);
+        assert_eq!(bump1, bump2);
+    }
+
+    #[test]
+    fn test_pda_different_slabs_different_pdas() {
+        let program_id = Pubkey::new_unique();
+        let slab1 = Pubkey::new_unique();
+        let slab2 = Pubkey::new_unique();
+
+        let (pda1, _) = derive_pool_pda(&program_id, &slab1);
+        let (pda2, _) = derive_pool_pda(&program_id, &slab2);
+        assert_ne!(pda1, pda2);
+    }
+
+    #[test]
+    fn test_vault_auth_derives_from_pool() {
+        let program_id = Pubkey::new_unique();
+        let slab = Pubkey::new_unique();
+
+        let (pool_pda, _) = derive_pool_pda(&program_id, &slab);
+        let (vault_auth, _) = derive_vault_authority(&program_id, &pool_pda);
+
+        // vault_auth should be different from pool
+        assert_ne!(vault_auth, pool_pda);
+
+        // Should be deterministic
+        let (vault_auth2, _) = derive_vault_authority(&program_id, &pool_pda);
+        assert_eq!(vault_auth, vault_auth2);
+    }
+
+    #[test]
+    fn test_deposit_pda_per_user() {
+        let program_id = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let user1 = Pubkey::new_unique();
+        let user2 = Pubkey::new_unique();
+
+        let (dep1, _) = derive_deposit_pda(&program_id, &pool, &user1);
+        let (dep2, _) = derive_deposit_pda(&program_id, &pool, &user2);
+        assert_ne!(dep1, dep2);
+    }
+
+    #[test]
+    fn test_deposit_pda_per_pool() {
+        let program_id = Pubkey::new_unique();
+        let pool1 = Pubkey::new_unique();
+        let pool2 = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+
+        let (dep1, _) = derive_deposit_pda(&program_id, &pool1, &user);
+        let (dep2, _) = derive_deposit_pda(&program_id, &pool2, &user);
+        assert_ne!(dep1, dep2);
+    }
+
+    #[test]
+    fn test_pubkey_helpers() {
+        let mut pool = StakePool::zeroed();
+        let key = Pubkey::new_unique();
+        pool.slab = key.to_bytes();
+        assert_eq!(pool.slab_pubkey(), key);
+
+        let admin = Pubkey::new_unique();
+        pool.admin = admin.to_bytes();
+        assert_eq!(pool.admin_pubkey(), admin);
+    }
+
+    #[test]
+    fn test_pool_value_returns_overflow() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = u64::MAX;
+        pool.total_withdrawn = 0;
+        pool.total_returned = 1;
+        // u64::MAX + 1 overflows → None
+        assert_eq!(pool.total_pool_value(), None);
+    }
 }

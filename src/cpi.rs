@@ -379,10 +379,10 @@ pub fn cpi_withdraw_insurance_limited<'a>(
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*vault_auth.key, true),   // authority (signer)
-            AccountMeta::new(*slab.key, true),                   // slab (writable)
-            AccountMeta::new(*stake_vault.key, true),            // authority_ata (writable)
-            AccountMeta::new(*wrapper_vault.key, true),          // insurance vault (writable)
+            AccountMeta::new_readonly(*vault_auth.key, true),    // authority (signer via PDA)
+            AccountMeta::new(*slab.key, false),                  // slab (writable, NOT signer)
+            AccountMeta::new(*stake_vault.key, false),           // authority_ata (writable, NOT signer)
+            AccountMeta::new(*wrapper_vault.key, false),         // insurance vault (writable, NOT signer)
             AccountMeta::new_readonly(*token_program.key, false),
             AccountMeta::new_readonly(*wrapper_vault_pda.key, false),
             AccountMeta::new_readonly(*clock.key, false),

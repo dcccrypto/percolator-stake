@@ -262,3 +262,198 @@ impl StakeInstruction {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack_u64(v: u64) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    fn pack_u128(v: u128) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    // ── Tag 0: InitPool ──
+
+    #[test]
+    fn test_unpack_init_pool() {
+        let mut data = vec![0u8]; // tag
+        data.extend_from_slice(&100u64.to_le_bytes()); // cooldown
+        data.extend_from_slice(&5000u64.to_le_bytes()); // cap
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::InitPool { cooldown_slots, deposit_cap } => {
+                assert_eq!(cooldown_slots, 100);
+                assert_eq!(deposit_cap, 5000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_init_pool_too_short() {
+        let data = vec![0u8, 1, 2, 3]; // only 3 bytes of payload
+        assert!(StakeInstruction::unpack(&data).is_err());
+    }
+
+    // ── Tag 1: Deposit ──
+
+    #[test]
+    fn test_unpack_deposit() {
+        let mut data = vec![1u8];
+        data.extend_from_slice(&42u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::Deposit { amount } => assert_eq!(amount, 42),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 2: Withdraw ──
+
+    #[test]
+    fn test_unpack_withdraw() {
+        let mut data = vec![2u8];
+        data.extend_from_slice(&999u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::Withdraw { lp_amount } => assert_eq!(lp_amount, 999),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 3: FlushToInsurance ──
+
+    #[test]
+    fn test_unpack_flush() {
+        let mut data = vec![3u8];
+        data.extend_from_slice(&500u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::FlushToInsurance { amount } => assert_eq!(amount, 500),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 4: UpdateConfig ──
+
+    #[test]
+    fn test_unpack_update_config_both() {
+        let mut data = vec![4u8];
+        data.push(1); // has_cooldown
+        data.extend_from_slice(&200u64.to_le_bytes());
+        data.push(1); // has_cap
+        data.extend_from_slice(&1000u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
+                assert_eq!(new_cooldown_slots, Some(200));
+                assert_eq!(new_deposit_cap, Some(1000));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_update_config_none() {
+        let mut data = vec![4u8];
+        data.push(0); // no cooldown
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(0); // no cap
+        data.extend_from_slice(&0u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
+                assert_eq!(new_cooldown_slots, None);
+                assert_eq!(new_deposit_cap, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 5: TransferAdmin ──
+
+    #[test]
+    fn test_unpack_transfer_admin() {
+        let data = vec![5u8];
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::TransferAdmin => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 7: AdminSetRiskThreshold ──
+
+    #[test]
+    fn test_unpack_risk_threshold() {
+        let mut data = vec![7u8];
+        data.extend_from_slice(&12345u128.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminSetRiskThreshold { new_threshold } => {
+                assert_eq!(new_threshold, 12345);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 8: AdminSetMaintenanceFee ──
+
+    #[test]
+    fn test_unpack_maintenance_fee() {
+        let mut data = vec![8u8];
+        data.extend_from_slice(&77u128.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminSetMaintenanceFee { new_fee } => {
+                assert_eq!(new_fee, 77);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 9: AdminResolveMarket ──
+
+    #[test]
+    fn test_unpack_resolve_market() {
+        let data = vec![9u8];
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminResolveMarket => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Tag 10: AdminWithdrawInsurance ──
+
+    #[test]
+    fn test_unpack_withdraw_insurance() {
+        let mut data = vec![10u8];
+        data.extend_from_slice(&1234u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminWithdrawInsurance { amount } => {
+                assert_eq!(amount, 1234);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Invalid tag ──
+
+    #[test]
+    fn test_unpack_invalid_tag() {
+        let data = vec![255u8];
+        assert!(StakeInstruction::unpack(&data).is_err());
+    }
+
+    #[test]
+    fn test_unpack_empty() {
+        let data: Vec<u8> = vec![];
+        assert!(StakeInstruction::unpack(&data).is_err());
+    }
+
+    // ── Boundary: max u64 values ──
+
+    #[test]
+    fn test_unpack_max_values() {
+        let mut data = vec![1u8]; // Deposit
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::Deposit { amount } => assert_eq!(amount, u64::MAX),
+            _ => panic!("wrong variant"),
+        }
+    }
+}

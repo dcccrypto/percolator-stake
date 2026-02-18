@@ -93,6 +93,8 @@ pub fn flush_available(total_deposited: u64, total_withdrawn: u64, total_flushed
 mod tests {
     use super::*;
 
+    // ── Basic Behavior ──
+
     #[test]
     fn test_first_depositor() {
         assert_eq!(calc_lp_for_deposit(0, 0, 1_000_000), Some(1_000_000));
@@ -117,246 +119,193 @@ mod tests {
     fn test_zero_supply_withdraw_none() {
         assert_eq!(calc_collateral_for_withdraw(0, 100, 10), None);
     }
+
+    // ── Conservation ──
+
+    #[test]
+    fn test_roundtrip_no_profit() {
+        // Deposit 1000 into pool with 5000 supply / 10000 value
+        let lp = calc_lp_for_deposit(5_000, 10_000, 1_000).unwrap();
+        assert_eq!(lp, 500); // 1000 * 5000 / 10000
+
+        // Withdraw those LP tokens from updated pool
+        let back = calc_collateral_for_withdraw(5_500, 11_000, 500).unwrap();
+        assert_eq!(back, 1_000); // exact roundtrip at 2:1 ratio
+    }
+
+    #[test]
+    fn test_roundtrip_with_rounding_loss() {
+        // Deposit 7 into pool with 3 supply / 10 value → lp = 7*3/10 = 2
+        let lp = calc_lp_for_deposit(3, 10, 7).unwrap();
+        assert_eq!(lp, 2);
+
+        // Withdraw 2 LP from pool (5 supply, 17 value) → col = 2*17/5 = 6
+        let back = calc_collateral_for_withdraw(5, 17, 2).unwrap();
+        assert_eq!(back, 6);
+        assert!(back <= 7); // Can't profit
+    }
+
+    #[test]
+    fn test_two_depositors_conservation() {
+        // A deposits 100 (first depositor, 1:1)
+        let a_lp = calc_lp_for_deposit(0, 0, 100).unwrap();
+        assert_eq!(a_lp, 100);
+
+        // B deposits 50
+        let b_lp = calc_lp_for_deposit(100, 100, 50).unwrap();
+        assert_eq!(b_lp, 50);
+
+        // A withdraws
+        let a_back = calc_collateral_for_withdraw(150, 150, 100).unwrap();
+        assert_eq!(a_back, 100);
+
+        // B withdraws from remaining
+        let b_back = calc_collateral_for_withdraw(50, 50, 50).unwrap();
+        assert_eq!(b_back, 50);
+
+        assert!(a_back + b_back <= 100 + 50);
+    }
+
+    // ── Dilution Protection ──
+
+    #[test]
+    fn test_no_dilution_attack() {
+        // A deposits 1000 (1:1)
+        let a_lp = calc_lp_for_deposit(0, 0, 1000).unwrap();
+
+        // A's value before B
+        let a_value_before = calc_collateral_for_withdraw(a_lp, 1000, a_lp).unwrap();
+        assert_eq!(a_value_before, 1000);
+
+        // B deposits 1 (tiny amount)
+        let b_lp = calc_lp_for_deposit(1000, 1000, 1).unwrap();
+        assert_eq!(b_lp, 1); // floor(1*1000/1000) = 1
+
+        // A's value after B deposits
+        let a_value_after = calc_collateral_for_withdraw(1001, 1001, 1000).unwrap();
+        assert!(a_value_after >= a_value_before); // A not diluted
+    }
+
+    // ── Edge Cases ──
+
+    #[test]
+    fn test_zero_deposit_zero_lp() {
+        assert_eq!(calc_lp_for_deposit(100, 200, 0), Some(0));
+    }
+
+    #[test]
+    fn test_zero_burn_zero_col() {
+        assert_eq!(calc_collateral_for_withdraw(100, 200, 0), Some(0));
+    }
+
+    #[test]
+    fn test_deposit_into_zero_value_pool() {
+        // Supply > 0 but value = 0 → first depositor path
+        assert_eq!(calc_lp_for_deposit(100, 0, 50), Some(50));
+    }
+
+    #[test]
+    fn test_large_values_no_overflow() {
+        let max = u64::MAX / 2;
+        // Should handle via u128 intermediates
+        assert!(calc_lp_for_deposit(max, max, max).is_some());
+        assert!(calc_collateral_for_withdraw(max, max, max).is_some());
+    }
+
+    #[test]
+    fn test_u64_max_deposit() {
+        // u64::MAX * u64::MAX could overflow u128? No — u128 max = 3.4e38, u64^2 = 3.4e38
+        // Actually u64::MAX^2 = (2^64-1)^2 ≈ 2^128 > u128::MAX. checked_mul returns None.
+        let result = calc_lp_for_deposit(u64::MAX, u64::MAX, u64::MAX);
+        // u64::MAX * u64::MAX overflows u128 → None from checked_mul
+        // Actually: u64::MAX as u128 * u64::MAX as u128 = (2^64-1)^2 = 2^128 - 2^65 + 1
+        // u128::MAX = 2^128 - 1, so it fits! Result = u64::MAX.
+        assert_eq!(result, Some(u64::MAX));
+    }
+
+    // ── Pool Value ──
+
+    #[test]
+    fn test_pool_value_normal() {
+        assert_eq!(pool_value(1000, 300), Some(700));
+    }
+
+    #[test]
+    fn test_pool_value_overdrawn() {
+        assert_eq!(pool_value(100, 200), None);
+    }
+
+    #[test]
+    fn test_pool_value_exact() {
+        assert_eq!(pool_value(100, 100), Some(0));
+    }
+
+    // ── Flush ──
+
+    #[test]
+    fn test_flush_available_normal() {
+        assert_eq!(flush_available(1000, 200, 300), 500);
+    }
+
+    #[test]
+    fn test_flush_available_overdrawn() {
+        // withdrawn > deposited → saturates to 0
+        assert_eq!(flush_available(100, 200, 0), 0);
+    }
+
+    #[test]
+    fn test_flush_available_fully_flushed() {
+        assert_eq!(flush_available(1000, 200, 800), 0);
+    }
+
+    #[test]
+    fn test_flush_available_over_flushed() {
+        // More flushed than available → saturates to 0
+        assert_eq!(flush_available(1000, 200, 900), 0);
+    }
+
+    // ── Rounding Direction ──
+
+    #[test]
+    fn test_lp_rounds_down_not_up() {
+        // deposit=7, supply=3, pool_value=10 → 7*3/10 = 2.1 → should be 2
+        let lp = calc_lp_for_deposit(3, 10, 7).unwrap();
+        assert_eq!(lp, 2);
+        // Verify: lp * pv <= dep * supply (pool-favoring)
+        assert!((lp as u128) * 10 <= (7u128) * 3);
+    }
+
+    #[test]
+    fn test_withdrawal_rounds_down_not_up() {
+        // lp=3, supply=7, pool_value=10 → 3*10/7 = 4.28 → should be 4
+        let col = calc_collateral_for_withdraw(7, 10, 3).unwrap();
+        assert_eq!(col, 4);
+        // Verify: col * supply <= lp * pv (pool-favoring)
+        assert!((col as u128) * 7 <= (3u128) * 10);
+    }
+
+    // ── Monotonicity ──
+
+    #[test]
+    fn test_larger_deposit_more_lp() {
+        let small = calc_lp_for_deposit(100, 200, 10).unwrap();
+        let large = calc_lp_for_deposit(100, 200, 20).unwrap();
+        assert!(large >= small);
+    }
+
+    #[test]
+    fn test_larger_burn_more_collateral() {
+        let small = calc_collateral_for_withdraw(100, 200, 10).unwrap();
+        let large = calc_collateral_for_withdraw(100, 200, 20).unwrap();
+        assert!(large >= small);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Kani Formal Verification Proofs
+// Kani Formal Verification
 // ═══════════════════════════════════════════════════════════════
 //
-// Proves: conservation, arithmetic safety, monotonicity, bounds.
-// Run all:  cargo kani --function proof_
-// Run one:  cargo kani --harness proof_first_depositor_exact
-
-#[cfg(kani)]
-mod kani_proofs {
-    use super::*;
-
-    // ── 1. Conservation ──
-
-    /// Deposit then withdraw returns ≤ deposited (no inflation).
-    #[kani::proof]
-    fn proof_deposit_withdraw_no_inflation() {
-        let supply: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let deposit: u64 = kani::any();
-
-        kani::assume(deposit > 0 && supply > 0 && pv > 0);
-        kani::assume(deposit <= 1_000_000_000);
-        kani::assume(supply <= 1_000_000_000);
-        kani::assume(pv <= 1_000_000_000);
-
-        let lp = match calc_lp_for_deposit(supply, pv, deposit) {
-            Some(lp) if lp > 0 => lp,
-            _ => return,
-        };
-
-        let new_supply = match supply.checked_add(lp) {
-            Some(v) => v, None => return,
-        };
-        let new_pv = match pv.checked_add(deposit) {
-            Some(v) => v, None => return,
-        };
-
-        let back = match calc_collateral_for_withdraw(new_supply, new_pv, lp) {
-            Some(v) => v, None => return,
-        };
-
-        assert!(back <= deposit);
-    }
-
-    /// First depositor: exact 1:1 roundtrip.
-    #[kani::proof]
-    fn proof_first_depositor_exact() {
-        let amount: u64 = kani::any();
-        kani::assume(amount > 0);
-
-        let lp = calc_lp_for_deposit(0, 0, amount).unwrap();
-        assert_eq!(lp, amount);
-
-        let back = calc_collateral_for_withdraw(lp, amount, lp).unwrap();
-        assert_eq!(back, amount);
-    }
-
-    /// Two depositors, both withdraw → total_out ≤ total_in.
-    #[kani::proof]
-    fn proof_two_depositors_conservation() {
-        let a: u64 = kani::any();
-        let b: u64 = kani::any();
-        kani::assume(a > 0 && a <= 100_000_000);
-        kani::assume(b > 0 && b <= 100_000_000);
-
-        let a_lp = calc_lp_for_deposit(0, 0, a).unwrap();
-        let b_lp = match calc_lp_for_deposit(a_lp, a, b) {
-            Some(lp) if lp > 0 => lp, _ => return,
-        };
-        let s2 = a_lp + b_lp;
-        let pv2 = a + b;
-
-        let a_back = match calc_collateral_for_withdraw(s2, pv2, a_lp) {
-            Some(v) => v, None => return,
-        };
-        let b_back = match calc_collateral_for_withdraw(s2 - a_lp, pv2 - a_back, b_lp) {
-            Some(v) => v, None => return,
-        };
-
-        assert!(a_back + b_back <= a + b);
-    }
-
-    // ── 2. Arithmetic Safety ──
-
-    /// calc_lp_for_deposit never panics.
-    #[kani::proof]
-    fn proof_lp_deposit_no_panic() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let a: u64 = kani::any();
-        let _ = calc_lp_for_deposit(s, pv, a);
-    }
-
-    /// calc_collateral_for_withdraw never panics.
-    #[kani::proof]
-    fn proof_collateral_withdraw_no_panic() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let lp: u64 = kani::any();
-        let _ = calc_collateral_for_withdraw(s, pv, lp);
-    }
-
-    /// pool_value never panics.
-    #[kani::proof]
-    fn proof_pool_value_no_panic() {
-        let d: u64 = kani::any();
-        let w: u64 = kani::any();
-        let _ = pool_value(d, w);
-    }
-
-    /// flush_available never panics.
-    #[kani::proof]
-    fn proof_flush_available_no_panic() {
-        let d: u64 = kani::any();
-        let w: u64 = kani::any();
-        let f: u64 = kani::any();
-        let _ = flush_available(d, w, f);
-    }
-
-    // ── 3. Fairness / Monotonicity ──
-
-    /// Equal deposits → equal LP (deterministic).
-    #[kani::proof]
-    fn proof_equal_deposits_equal_lp() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let a: u64 = kani::any();
-        assert_eq!(calc_lp_for_deposit(s, pv, a), calc_lp_for_deposit(s, pv, a));
-    }
-
-    /// Larger deposit → ≥ LP (monotone).
-    #[kani::proof]
-    fn proof_larger_deposit_more_lp() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let sm: u64 = kani::any();
-        let lg: u64 = kani::any();
-
-        kani::assume(s > 0 && pv > 0 && sm > 0 && lg > sm && lg <= 1_000_000_000);
-
-        match (calc_lp_for_deposit(s, pv, sm), calc_lp_for_deposit(s, pv, lg)) {
-            (Some(ls), Some(ll)) => assert!(ll >= ls),
-            _ => {}
-        }
-    }
-
-    /// Larger LP burn → ≥ collateral (monotone).
-    #[kani::proof]
-    fn proof_larger_burn_more_collateral() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let sm: u64 = kani::any();
-        let lg: u64 = kani::any();
-
-        kani::assume(s > 0 && pv > 0 && sm > 0 && lg > sm && lg <= s);
-
-        match (calc_collateral_for_withdraw(s, pv, sm), calc_collateral_for_withdraw(s, pv, lg)) {
-            (Some(cs), Some(cl)) => assert!(cl >= cs),
-            _ => {}
-        }
-    }
-
-    // ── 4. Bounds ──
-
-    /// Full LP burn ≤ pool value.
-    #[kani::proof]
-    fn proof_full_burn_bounded() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        kani::assume(s > 0);
-
-        if let Some(col) = calc_collateral_for_withdraw(s, pv, s) {
-            assert!(col <= pv);
-        }
-    }
-
-    /// flush_available ≤ deposited.
-    #[kani::proof]
-    fn proof_flush_bounded() {
-        let d: u64 = kani::any();
-        let w: u64 = kani::any();
-        let f: u64 = kani::any();
-        assert!(flush_available(d, w, f) <= d);
-    }
-
-    /// After max flush → available = 0.
-    #[kani::proof]
-    fn proof_flush_max_then_zero() {
-        let d: u64 = kani::any();
-        let w: u64 = kani::any();
-        let f: u64 = kani::any();
-        kani::assume(w <= d);
-        kani::assume(f <= d.saturating_sub(w));
-
-        let avail = flush_available(d, w, f);
-        assert_eq!(flush_available(d, w, f + avail), 0);
-    }
-
-    /// pool_value: None iff withdrawn > deposited.
-    #[kani::proof]
-    fn proof_pool_value_correctness() {
-        let d: u64 = kani::any();
-        let w: u64 = kani::any();
-        let r = pool_value(d, w);
-        if w > d { assert!(r.is_none()); }
-        else { assert_eq!(r, Some(d - w)); }
-    }
-
-    // ── 5. Rounding Direction ──
-
-    /// LP minting rounds DOWN: lp * pv ≤ deposit * supply.
-    #[kani::proof]
-    fn proof_lp_rounds_down() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let dep: u64 = kani::any();
-
-        kani::assume(s > 0 && pv > 0 && dep > 0);
-        kani::assume(s <= 1_000_000_000 && pv <= 1_000_000_000 && dep <= 1_000_000_000);
-
-        if let Some(lp) = calc_lp_for_deposit(s, pv, dep) {
-            assert!((lp as u128) * (pv as u128) <= (dep as u128) * (s as u128));
-        }
-    }
-
-    /// Withdrawal rounds DOWN: col * supply ≤ lp * pv.
-    #[kani::proof]
-    fn proof_withdrawal_rounds_down() {
-        let s: u64 = kani::any();
-        let pv: u64 = kani::any();
-        let lp: u64 = kani::any();
-
-        kani::assume(s > 0 && pv > 0 && lp > 0 && lp <= s);
-        kani::assume(s <= 1_000_000_000 && pv <= 1_000_000_000);
-
-        if let Some(col) = calc_collateral_for_withdraw(s, pv, lp) {
-            assert!((col as u128) * (s as u128) <= (lp as u128) * (pv as u128));
-        }
-    }
-}
+// Production-type (u64/u128) proofs live in kani-proofs/ crate with
+// u32/u64 mirrors for CBMC tractability. See kani-proofs/src/lib.rs.
+//
+// Keeping this note here so nobody adds u64 Kani proofs that timeout.

@@ -404,7 +404,10 @@ fn process_withdraw(
     let deposit_data_ref = deposit_pda.try_borrow_data()?;
     let deposit: &StakeDeposit = bytemuck::from_bytes(&deposit_data_ref[..STAKE_DEPOSIT_SIZE]);
 
-    if deposit.is_initialized != 1 || deposit.user != user.key.to_bytes() {
+    if deposit.is_initialized != 1
+        || deposit.user != user.key.to_bytes()
+        || deposit.pool != pool_pda.key.to_bytes()
+    {
         return Err(StakeError::Unauthorized.into());
     }
     if clock.slot < deposit.last_deposit_slot.saturating_add(pool.cooldown_slots) {
@@ -455,12 +458,14 @@ fn process_withdraw(
     // Update pool totals
     pool.total_withdrawn = pool.total_withdrawn.checked_add(collateral_amount)
         .ok_or(StakeError::Overflow)?;
-    pool.total_lp_supply = pool.total_lp_supply.saturating_sub(lp_amount);
+    pool.total_lp_supply = pool.total_lp_supply.checked_sub(lp_amount)
+        .ok_or(StakeError::Overflow)?;
 
     // Update deposit PDA
     let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
     let deposit_mut: &mut StakeDeposit = bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
-    deposit_mut.lp_amount = deposit_mut.lp_amount.saturating_sub(lp_amount);
+    deposit_mut.lp_amount = deposit_mut.lp_amount.checked_sub(lp_amount)
+        .ok_or(StakeError::InsufficientLpTokens)?;
 
     msg!("Withdrew {} collateral, burned {} LP tokens", collateral_amount, lp_amount);
     Ok(())
@@ -825,6 +830,14 @@ fn process_admin_withdraw_insurance(
         amount,
         vault_auth_seeds,
     )?;
+
+    // Update pool accounting — returned insurance increases pool value for LP holders
+    {
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+        pool.total_returned = pool.total_returned.checked_add(amount)
+            .ok_or(StakeError::Overflow)?;
+    }
 
     msg!("Insurance {} tokens withdrawn from wrapper to stake_vault via vault_auth CPI", amount);
     Ok(())
