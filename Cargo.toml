@@ -22,3 +22,4 @@ solana-sdk = "2.1"
 
 # solana-program-test is too heavy for CI — use only for integration tests
 # solana-program-test = "2.1"
+proptest = "1.4"
