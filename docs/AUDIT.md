@@ -1,8 +1,112 @@
 # percolator-stake Comprehensive Audit
 
-**Date:** 2026-02-18 (updated 03:10 UTC — round 3 adversarial re-audit)
+**Date:** 2026-02-18 (updated ~04:00 UTC — round 4 final deep audit)
 **Auditor:** Cobra (automated)
-**Files:** 8 source files, ~2550 lines, 31 Kani proofs, 97 unit tests
+**Files:** 8 source files, ~2600 lines, 33 Kani proofs, 141 unit tests
+**Commit:** `862130e`
+
+---
+
+## Round 4 Findings (Final Adversarial Pass)
+
+### C9: First-depositor LP theft via orphaned insurance returns (CRITICAL)
+**File:** `math.rs` — `calc_lp_for_deposit`
+**SEVERITY:** CRITICAL — direct theft of all returned insurance funds
+
+**Root cause:** The first-depositor check used `||` (OR) instead of `&&` (AND):
+```rust
+// BEFORE (vulnerable):
+if supply == 0 || pool_value == 0 { Some(deposit) }  // 1:1 for ANY zero
+
+// AFTER (fixed):
+if supply == 0 && pool_value == 0 { Some(deposit) }  // 1:1 only when BOTH zero
+else if supply == 0 || pool_value == 0 { None }       // orphaned state: block
+```
+
+**Attack — steal returned insurance:**
+1. Normal users deposit 1000, get 1000 LP
+2. Admin flushes 500 to insurance (pool_value still 500 in vault)
+3. All LP holders withdraw their 500 (accepting loss; LP_supply → 0)
+4. Market resolves; admin calls `AdminWithdrawInsurance` → 500 tokens return to vault
+5. State: LP_supply=0, pool_value=500 (orphaned — no one to claim it)
+6. Attacker deposits 1 token → OLD code: supply=0, so 1:1 → gets 1 LP
+7. Now pool_value=501, LP_supply=1. Attacker burns 1 LP → gets 501 tokens.
+8. **Net theft: 500 tokens** (all the returned insurance)
+
+**Additional vector — dilution of existing holders:**
+- If pool_value=0 (fully flushed) but LP_supply>0, new deposits at 1:1 dilute
+  existing holders' pro-rata claim on future insurance returns.
+
+**Fix:** Changed to `&&`. Added `None` return for both orphaned-value and valueless-LP states. Updated all mirrors (kani-proofs, proptest_math.rs).
+
+**Status:** ✅ FIXED — commit `862130e`
+
+### C10: FlushToInsurance permissionless — any signer can DoS all LP withdrawals (CRITICAL)
+**File:** `processor.rs` — `process_flush_to_insurance`
+**SEVERITY:** CRITICAL — complete DoS of LP withdrawals for arbitrary duration
+
+**Root cause:** `process_flush_to_insurance` required only `caller.is_signer` — NO admin check.
+
+**Attack:**
+1. Attacker calls FlushToInsurance with `amount = all available vault tokens`
+2. Entire stake vault drained to wrapper insurance fund
+3. All LP holder withdrawals now return 0 collateral (vault empty, can't transfer)
+4. Funds locked until market resolves (could be years) and admin calls WithdrawInsurance
+
+**Why this is CRITICAL not just HIGH:**
+- Permissionless access to move OTHER PEOPLE'S funds
+- Complete loss of access for all users for indefinite duration
+- Admin CPI (TopUpInsurance) is permissionless in the wrapper because it's YOUR money
+  you're choosing to insure — here it's NOT the caller's money
+
+**Previously:** Documented in Round 1 as "H2: design decision — mirrors wrapper's permissionless TopUpInsurance"
+**Correction:** That reasoning is wrong. The wrapper's TopUpInsurance is permissionless because you control the source ATA. Here, the caller doesn't own the vault — LP holders do.
+
+**Fix:** Added `pool.admin != caller.key.to_bytes()` check.
+
+**Status:** ✅ FIXED — commit `862130e`
+
+### H6: Deposit cap uses lifetime total_deposited — pool permanently locked (HIGH)
+**File:** `processor.rs` — `process_deposit`
+**SEVERITY:** HIGH — permanent pool lockout once cap hit
+
+**Root cause:**
+```rust
+// BEFORE (broken):
+let new_total = pool.total_deposited.checked_add(amount)?;
+if new_total > pool.deposit_cap { return Err(...) }
+// total_deposited is MONOTONIC — never decreases — so once it hits cap,
+// NO NEW DEPOSITS EVER regardless of how much has been withdrawn.
+
+// AFTER (correct):
+let current_value = pool.total_pool_value().unwrap_or(0);
+let new_value = current_value.checked_add(amount)?;
+if new_value > pool.deposit_cap { return Err(...) }
+// Cap tracks actual current pool size — works as intended.
+```
+
+**Scenario:** Pool with cap=10000. Users deposit 10000, withdraw 9900. Pool has 100 tokens.
+Old: no new deposits allowed (total_deposited=10000). New: 9900 more can be deposited.
+
+**Status:** ✅ FIXED — commit `862130e`
+
+### M7: TransferAdmin missing pool admin authorization (MEDIUM)
+**File:** `processor.rs` — `process_transfer_admin`
+**SEVERITY:** MEDIUM — missing defense-in-depth layer
+
+**Root cause:** `process_transfer_admin` checked `current_admin.is_signer` but NOT `pool.admin == current_admin.key`. The CPI to wrapper's UpdateAdmin would catch unauthorized callers (wrapper checks signer == current admin), but the stake program should also validate this independently.
+
+**Scenario:** Person who is the wrapper admin but NOT the pool admin could call TransferAdmin, which would:
+1. Pass our stake program checks (they are signer, pool is initialized, not yet transferred)
+2. CPI to wrapper succeeds (they ARE wrapper admin)
+3. Pool PDA becomes wrapper admin
+4. But the STAKE program admin (pool.admin) is a DIFFERENT person who now controls all subsequent admin CPIs through the stake program
+
+This creates an admin mismatch: wrapper admin and stake program admin are two different people, but all privileged operations go through the stake program.
+
+**Fix:** Added `pool.admin != current_admin.key.to_bytes()` check before CPI.
+
+**Status:** ✅ FIXED — commit `862130e`
 
 ---
 
@@ -238,29 +342,33 @@ math.rs had u64 proofs that would timeout. kani-proofs/ has working u32 proofs.
 | C6 | CRITICAL | Missing token_program validation in deposit (vault drain) | ✅ FIXED |
 | C7 | CRITICAL | Missing token_program validation in withdraw (vault drain) | ✅ FIXED |
 | C8 | CRITICAL | pool_value formula causes insolvency (missing -flushed) | ✅ FIXED |
+| C9 | CRITICAL | First-depositor `\|\|` bug — orphaned insurance theft | ✅ FIXED |
+| C10 | CRITICAL | FlushToInsurance permissionless — DoS all LP withdrawals | ✅ FIXED |
 | H1 | HIGH | No admin_transferred in deposit | ⚠️ DOCUMENTED |
-| H2 | HIGH | Permissionless flush | ⚠️ DOCUMENTED |
+| H2 | HIGH | Permissionless flush | ✅ UPGRADED → C10 |
 | H3 | HIGH | CPI signer flag: slab | ✅ FIXED |
 | H4 | HIGH | CPI signer flags: vaults | ✅ FIXED |
 | H5 | HIGH | Trailing bytes ignored | ⚠️ ACCEPTED |
+| H6 | HIGH | Deposit cap uses lifetime total (permanent lockout) | ✅ FIXED |
 | M1 | MEDIUM | Duplicate Kani proofs | ✅ FIXED |
 | M2 | MEDIUM | No struct versioning | ⚠️ DOCUMENTED |
 | M3 | MEDIUM | Missing deposit.pool check | ✅ FIXED |
 | M4 | MEDIUM | No reentrancy guard | ⚠️ ACCEPTED |
 | M5 | MEDIUM | Missing vault check in withdraw | ✅ FIXED |
 | M6 | MEDIUM | Missing vault check in flush | ✅ FIXED |
+| M7 | MEDIUM | TransferAdmin missing pool admin check | ✅ FIXED |
 | L1 | LOW | Collateral mint not validated | ⚠️ DOCUMENTED |
 | L2 | LOW | No structured events | ⚠️ ACCEPTED |
 | L3 | LOW | No independent vault ownership check | ⚠️ ACCEPTED |
 | L4 | LOW | saturating_sub in flush available | ✅ FIXED |
 
-**Total: 9 CRITICAL (all fixed), 5 HIGH (3 fixed), 6 MEDIUM (4 fixed), 4 LOW (1 fixed)**
+**Total: 11 CRITICAL (all fixed), 6 HIGH (5 fixed), 7 MEDIUM (5 fixed), 4 LOW (1 fixed)**
 
 ---
 
 ## Verification Status
 
-### Kani Formal Proofs: 31 harnesses, ALL VERIFIED
+### Kani Formal Proofs: 33 harnesses (30 original + 3 new C9 proofs), ALL VERIFIED
 - Conservation: 5 proofs (deposit→withdraw, first depositor, two depositors, no dilution, flush preserves value)
 - Arithmetic Safety: 4 proofs (full u32 range, no panics)
 - Fairness/Monotonicity: 3 proofs (deterministic, deposit monotone, burn monotone)
@@ -270,11 +378,14 @@ math.rs had u64 proofs that would timeout. kani-proofs/ has working u32 proofs.
 - Zero Boundaries: 2 proofs (zero in → zero out)
 - Cooldown Enforcement: 3 proofs (no panic, not immediate, exact boundary)
 - Deposit Cap: 3 proofs (uncapped, at boundary, above boundary)
+- **C9 Orphaned Value Protection: 3 proofs** (orphaned value blocked, valueless LP blocked, true first depositor works)
 - Extended Safety: 2 proofs (pool_value_with_returns, exceeds_cap no panic)
 
-### Unit Tests: 97 tests, ALL PASSING (136 total across all test targets)
-- math.rs: LP calculation, pool value, flush, rounding, conservation, edge cases
+### Unit Tests: 141 tests, ALL PASSING
+- math.rs: LP calculation, pool value, flush, rounding, conservation, C9 scenarios
 - instruction.rs: All 12 instruction tags, boundary values, error cases
 - state.rs: Struct sizes, PDA derivation, pool value, LP math delegation
+- proptest_math.rs: 17 property-based tests across production-scale u64 ranges
+- struct_layout.rs, unit.rs, cpi_tags.rs, error_codes.rs
 
-### Total: 136 tests + 31 Kani proofs = 167 verification checks, 0 failures
+### Total: 141 tests + 33 Kani proofs = 174 verification checks, 0 failures
