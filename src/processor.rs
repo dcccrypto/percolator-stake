@@ -73,13 +73,15 @@ pub fn process(
 // Helper: read pool, validate, return admin seeds
 // ═══════════════════════════════════════════════════════════════
 
-/// Validate pool is initialized, admin is signer, admin is transferred.
+/// Validate pool is initialized, admin is signer, admin is transferred,
+/// and percolator program matches stored value.
 /// Returns the pool bump for PDA signing.
 fn validate_admin_cpi(
     program_id: &Pubkey,
     pool_pda: &AccountInfo,
     admin: &AccountInfo,
     slab: &AccountInfo,
+    percolator_program: &AccountInfo,
 ) -> Result<u8, ProgramError> {
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -99,6 +101,9 @@ fn validate_admin_cpi(
     }
     if pool.slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
+    }
+    if pool.percolator_program != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
     // Verify pool PDA derivation
@@ -398,6 +403,9 @@ fn process_withdraw(
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
+    if pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
 
     // Check cooldown
     let clock = Clock::from_account_info(clock_sysvar)?;
@@ -509,15 +517,20 @@ fn process_flush_to_insurance(
     if pool.slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
+    if pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
     if pool.percolator_program != percolator_program.key.to_bytes() {
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
     // Verify vault balance — can't flush more than what's available in vault
     // Available = total_deposited - total_withdrawn - total_flushed
+    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
     let available = pool.total_deposited
-        .saturating_sub(pool.total_withdrawn)
-        .saturating_sub(pool.total_flushed);
+        .checked_sub(pool.total_withdrawn)
+        .and_then(|v| v.checked_sub(pool.total_flushed))
+        .ok_or(StakeError::Overflow)?;
     if amount > available {
         return Err(ProgramError::InsufficientFunds);
     }
@@ -669,7 +682,7 @@ fn process_admin_set_oracle_authority(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab)?;
+    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
     cpi::cpi_set_oracle_authority(
@@ -700,7 +713,7 @@ fn process_admin_set_risk_threshold(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab)?;
+    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
     cpi::cpi_set_risk_threshold(
@@ -731,7 +744,7 @@ fn process_admin_set_maintenance_fee(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab)?;
+    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
     cpi::cpi_set_maintenance_fee(
@@ -761,7 +774,7 @@ fn process_admin_resolve_market(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab)?;
+    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
     cpi::cpi_resolve_market(
@@ -798,7 +811,7 @@ fn process_admin_withdraw_insurance(
     let clock = next_account_info(accounts_iter)?;
 
     // Validate admin authority
-    let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab)?;
+    let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let _ = pool_bump; // pool_pda not signing this CPI
 
     // Derive vault_auth PDA and its seeds
@@ -862,7 +875,7 @@ fn process_admin_set_insurance_policy(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab)?;
+    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
     cpi::cpi_set_insurance_withdraw_policy(
