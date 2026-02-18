@@ -144,8 +144,8 @@ pub enum StakeInstruction {
     ///   6. `[]` Wrapper vault authority PDA
     ///   7. `[]` Percolator program
     ///   8. `[]` Token program
-    /// 10: AdminWithdrawInsurance — calls WithdrawInsuranceLimited via vault_auth PDA.
-    /// Requires market RESOLVED and SetInsuranceWithdrawPolicy called with vault_auth as authority.
+    /// 10: AdminWithdrawInsurance — CPIs WithdrawInsuranceLimited (wrapper Tag 23) via vault_auth PDA.
+    /// Requires market RESOLVED and SetInsuranceWithdrawPolicy (Tag 22) called with vault_auth as authority.
     AdminWithdrawInsurance { amount: u64 },
 
     /// Pool admin sets insurance withdrawal policy on wrapper.
