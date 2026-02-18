@@ -11,6 +11,17 @@ use solana_program::{
     sysvar::{clock::Clock, Sysvar},
 };
 
+/// Verify the token program is the real SPL Token program.
+/// CRITICAL: Without this check, an attacker can pass a fake token program,
+/// receive PDA signer authority via invoke_signed, and drain the vault.
+fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
+    if *token_program.key != spl_token::id() {
+        msg!("Error: invalid token program {}", token_program.key);
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
 use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
@@ -159,6 +170,9 @@ fn process_init_pool(
         return Err(StakeError::InvalidPda.into());
     }
 
+    // Validate token program BEFORE any invoke_signed that grants PDA signer authority
+    verify_token_program(token_program)?;
+
     let rent = Rent::from_account_info(rent_sysvar)?;
 
     // Create pool PDA account
@@ -280,6 +294,10 @@ fn process_deposit(
             return Err(StakeError::DepositCapExceeded.into());
         }
     }
+
+    // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
+    // Without this, attacker passes fake program → receives vault_auth signer → drains vault.
+    verify_token_program(token_program)?;
 
     // Calculate LP tokens to mint
     let lp_to_mint = pool.calc_lp_for_deposit(amount)
@@ -406,6 +424,9 @@ fn process_withdraw(
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
+
+    // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
+    verify_token_program(token_program)?;
 
     // Check cooldown
     let clock = Clock::from_account_info(clock_sysvar)?;

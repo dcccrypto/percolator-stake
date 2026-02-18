@@ -154,9 +154,34 @@ fn test_pool_value_with_flush() {
     pool.total_withdrawn = 0;
     pool.total_flushed = 3_000_000; // Flushed to insurance
 
-    // Pool value = deposited - withdrawn = 5M (flushed doesn't reduce pool value)
-    // Note: flushed funds are still "owned" by LP holders, just in insurance
+    // Pool value = deposited - withdrawn - flushed + returned = 5M - 0 - 3M + 0 = 2M
+    // Flushed reduces accessible value. LP tokens reflect vault balance only.
+    // Insurance portion tracked separately; returned after resolution.
+    assert_eq!(pool.total_pool_value().unwrap(), 2_000_000);
+}
+
+#[test]
+fn test_pool_value_flush_return_roundtrip() {
+    let mut pool = new_pool();
+    pool.total_deposited = 5_000_000;
+    pool.total_withdrawn = 0;
+    pool.total_flushed = 3_000_000;
+    pool.total_returned = 3_000_000; // Full return after resolution
+
+    // Full return: back to deposited - withdrawn
     assert_eq!(pool.total_pool_value().unwrap(), 5_000_000);
+}
+
+#[test]
+fn test_pool_value_flush_partial_return() {
+    let mut pool = new_pool();
+    pool.total_deposited = 5_000_000;
+    pool.total_withdrawn = 0;
+    pool.total_flushed = 3_000_000;
+    pool.total_returned = 1_000_000; // 2M lost to insurance payouts
+
+    // Partial: 5M - 0 - 3M + 1M = 3M (lost 2M to insurance)
+    assert_eq!(pool.total_pool_value().unwrap(), 3_000_000);
 }
 
 #[test]

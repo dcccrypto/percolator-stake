@@ -135,12 +135,20 @@ impl StakePool {
         Pubkey::new_from_array(self.percolator_program)
     }
 
-    /// Total pool value = deposited - withdrawn + returned.
-    /// - Flushed doesn't reduce value (funds still owned by LP holders, just in insurance).
-    /// - Returned adds value back (insurance returned to vault after market resolution).
+    /// Total pool value = deposited - withdrawn - flushed + returned.
+    ///
+    /// This equals the actual vault balance and reflects what LP holders can withdraw.
+    /// - Flushed tokens leave the vault (moved to wrapper insurance).
+    /// - Returned tokens come back to vault (withdrawn from insurance after resolution).
+    ///
+    /// IMPORTANT: Do NOT use `deposited - withdrawn + returned` — that double-counts
+    /// because returned tokens are already in the vault, and deposited conceptually
+    /// includes the flushed amount. Missing `-flushed` causes phantom inflation
+    /// that makes the pool insolvent after any flush+return cycle.
     pub fn total_pool_value(&self) -> Option<u64> {
         self.total_deposited
             .checked_sub(self.total_withdrawn)?
+            .checked_sub(self.total_flushed)?
             .checked_add(self.total_returned)
     }
 
@@ -201,17 +209,42 @@ mod tests {
         let mut pool = StakePool::zeroed();
         pool.total_deposited = 1000;
         pool.total_withdrawn = 300;
+        pool.total_flushed = 0;
         pool.total_returned = 0;
         assert_eq!(pool.total_pool_value(), Some(700));
     }
 
     #[test]
-    fn test_pool_value_with_returns() {
+    fn test_pool_value_with_flush() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 500;
+        pool.total_returned = 0;
+        // Flushed reduces accessible value: 1000 - 0 - 500 + 0 = 500
+        assert_eq!(pool.total_pool_value(), Some(500));
+    }
+
+    #[test]
+    fn test_pool_value_with_flush_and_returns() {
         let mut pool = StakePool::zeroed();
         pool.total_deposited = 1000;
         pool.total_withdrawn = 300;
+        pool.total_flushed = 500;
         pool.total_returned = 200;
-        assert_eq!(pool.total_pool_value(), Some(900));
+        // 1000 - 300 - 500 + 200 = 400
+        assert_eq!(pool.total_pool_value(), Some(400));
+    }
+
+    #[test]
+    fn test_pool_value_full_return_conservation() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 500;
+        pool.total_returned = 500;
+        // Full return: 1000 - 0 - 500 + 500 = 1000 (back to original)
+        assert_eq!(pool.total_pool_value(), Some(1000));
     }
 
     #[test]
@@ -219,6 +252,16 @@ mod tests {
         let mut pool = StakePool::zeroed();
         pool.total_deposited = 100;
         pool.total_withdrawn = 200;
+        assert_eq!(pool.total_pool_value(), None);
+    }
+
+    #[test]
+    fn test_pool_value_overflushed() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 1001;
+        // Can't flush more than deposited-withdrawn → None
         assert_eq!(pool.total_pool_value(), None);
     }
 
@@ -330,8 +373,9 @@ mod tests {
         let mut pool = StakePool::zeroed();
         pool.total_deposited = u64::MAX;
         pool.total_withdrawn = 0;
+        pool.total_flushed = 0;
         pool.total_returned = 1;
-        // u64::MAX + 1 overflows → None
+        // u64::MAX - 0 - 0 + 1 overflows → None
         assert_eq!(pool.total_pool_value(), None);
     }
 }

@@ -42,9 +42,10 @@ pub fn pool_value(deposited: u32, withdrawn: u32) -> Option<u32> {
     deposited.checked_sub(withdrawn)
 }
 
-/// Extended pool value with insurance returns.
-pub fn pool_value_with_returns(deposited: u32, withdrawn: u32, returned: u32) -> Option<u32> {
-    deposited.checked_sub(withdrawn)?.checked_add(returned)
+/// Full pool value with flush tracking and insurance returns.
+/// Mirrors StakePool::total_pool_value(): deposited - withdrawn - flushed + returned.
+pub fn pool_value_with_flush(deposited: u32, withdrawn: u32, flushed: u32, returned: u32) -> Option<u32> {
+    deposited.checked_sub(withdrawn)?.checked_sub(flushed)?.checked_add(returned)
 }
 
 /// Flush available = deposited - withdrawn - flushed (saturating).
@@ -372,20 +373,50 @@ mod proofs {
         }
     }
 
-    /// Pool value with returns: returns increase value.
+    /// Pool value tracks vault balance: deposited - withdrawn - flushed + returned.
+    /// After flush + full return, pool value == deposited - withdrawn (conservation).
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_flush_return_conservation() {
+        let d: u32 = kani::any();
+        let w: u32 = kani::any();
+        let f: u32 = kani::any();
+        let r: u32 = kani::any();
+        kani::assume(d < 100 && w < 100 && f < 100 && r < 100);
+        kani::assume(w <= d);
+        kani::assume(f <= d - w);
+        kani::assume(r <= f); // can't return more than flushed
+
+        if let Some(pv) = pool_value_with_flush(d, w, f, r) {
+            // Pool value always ≤ deposited - withdrawn (optimistic ceiling)
+            assert!(pv <= d - w);
+            // Full return: pv == deposited - withdrawn
+            if r == f {
+                assert_eq!(pv, d - w);
+            }
+            // Partial return: pv < deposited - withdrawn
+            if r < f {
+                assert!(pv < d - w);
+            }
+        }
+    }
+
+    /// Returns increase pool value (for fixed flush amount).
     #[kani::proof]
     #[kani::unwind(33)]
     fn proof_returns_increase_value() {
         let d: u32 = kani::any();
         let w: u32 = kani::any();
+        let f: u32 = kani::any();
         let r: u32 = kani::any();
-        kani::assume(d < 100 && w < 100 && r < 100);
-        kani::assume(w <= d && r > 0);
+        kani::assume(d < 50 && w < 50 && f < 50 && r < 50);
+        kani::assume(w <= d && f <= d - w && r < f);
 
-        let base = pool_value(d, w).unwrap();
-        if let Some(with_returns) = pool_value_with_returns(d, w, r) {
-            assert!(with_returns > base);
-            assert_eq!(with_returns, base + r);
+        let before = pool_value_with_flush(d, w, f, r);
+        let after = pool_value_with_flush(d, w, f, r + 1);
+        match (before, after) {
+            (Some(b), Some(a)) => assert!(a > b),
+            _ => {}
         }
     }
 
@@ -494,11 +525,11 @@ mod proofs {
     // SECTION 10: Extended Arithmetic Safety (2 proofs)
     // ════════════════════════════════════════════════════════════
 
-    /// pool_value_with_returns never panics.
+    /// pool_value_with_flush never panics.
     #[kani::proof]
     #[kani::unwind(33)]
-    fn proof_pool_value_with_returns_no_panic() {
-        let _ = pool_value_with_returns(kani::any(), kani::any(), kani::any());
+    fn proof_pool_value_with_flush_no_panic() {
+        let _ = pool_value_with_flush(kani::any(), kani::any(), kani::any(), kani::any());
     }
 
     /// exceeds_cap never panics.
