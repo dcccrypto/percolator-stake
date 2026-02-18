@@ -8,6 +8,27 @@
 
 ## CRITICAL Issues
 
+### C0: CPI Instruction Tag Mismatch (Tags 21/22/23)
+**File:** `cpi.rs:19-20`
+**SEVERITY:** CRITICAL — would invoke wrong wrapper instruction
+```rust
+// BEFORE (WRONG):
+const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 21; // Actually AdminForceCloseAccount!
+const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 22;     // Actually SetInsuranceWithdrawPolicy!
+
+// AFTER (CORRECT):
+const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 22;
+const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+```
+**Impact:** Tag 21 in the wrapper is `AdminForceCloseAccount`, not insurance policy.
+- `AdminSetInsurancePolicy` → would force-close a user's position (fund loss)
+- `AdminWithdrawInsurance` → would set insurance policy (no-op at best, wrong config at worst)
+
+**Root cause:** Tag 21 (`AdminForceCloseAccount`) was added to wrapper after our initial tag mapping. We incorrectly assumed tags were contiguous from 20.
+
+**Fix:** Updated tags + added 9 CPI tag verification tests as regression guard.
+
+
 ### C1: `process_withdraw` — LP supply decremented with `saturating_sub` instead of `checked_sub`
 **File:** `processor.rs:334`
 ```rust
