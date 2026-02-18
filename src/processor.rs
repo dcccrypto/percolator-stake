@@ -286,11 +286,15 @@ fn process_deposit(
         return Err(StakeError::InvalidPda.into());
     }
 
-    // Check deposit cap
+    // Check deposit cap against CURRENT pool value, not lifetime deposits.
+    // Using total_deposited (monotonically increasing) would permanently lock
+    // the pool once lifetime deposits hit the cap, even if 99% was withdrawn.
+    // (H6 fix)
     if pool.deposit_cap > 0 {
-        let new_total = pool.total_deposited.checked_add(amount)
+        let current_value = pool.total_pool_value().unwrap_or(0);
+        let new_value = current_value.checked_add(amount)
             .ok_or(StakeError::Overflow)?;
-        if new_total > pool.deposit_cap {
+        if new_value > pool.deposit_cap {
             return Err(StakeError::DepositCapExceeded.into());
         }
     }
@@ -535,6 +539,15 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+
+    // CRITICAL (C10): FlushToInsurance must be admin-only.
+    // Without this, ANY signer can drain the stake vault to wrapper insurance,
+    // locking all LP holder withdrawals until market resolution.
+    // This is a DoS vector that freezes depositor funds indefinitely.
+    if pool.admin != caller.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
     if pool.slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
@@ -650,6 +663,13 @@ fn process_transfer_admin(
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
+    }
+    // M7: Verify caller is pool admin (defense-in-depth).
+    // The wrapper CPI will also check, but we should reject early if the
+    // caller isn't even our admin — prevents non-admin from triggering
+    // admin transfer on wrapper if they happen to be the wrapper admin.
+    if pool.admin != current_admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
     }
     if pool.admin_transferred == 1 {
         return Err(StakeError::AdminAlreadyTransferred.into());

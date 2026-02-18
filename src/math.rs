@@ -22,9 +22,19 @@ pub fn calc_lp_for_deposit(
     total_pool_value: u64,
     deposit_amount: u64,
 ) -> Option<u64> {
-    if total_lp_supply == 0 || total_pool_value == 0 {
-        // First depositor — 1:1
+    if total_lp_supply == 0 && total_pool_value == 0 {
+        // True first depositor — 1:1
         Some(deposit_amount)
+    } else if total_lp_supply == 0 {
+        // CRITICAL: LP supply is 0 but pool has orphaned value (e.g., returned insurance
+        // after all LP holders withdrew). Allowing 1:1 deposits here would let the
+        // depositor withdraw the entire orphaned value. Block deposits.
+        None
+    } else if total_pool_value == 0 {
+        // LP tokens exist but pool value is 0 (fully flushed to insurance).
+        // Existing holders have a claim on future insurance returns.
+        // Allowing deposits would dilute that claim. Block deposits.
+        None
     } else {
         // Pro-rata via u128 to prevent overflow
         let lp = (deposit_amount as u128)
@@ -199,9 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn test_deposit_into_zero_value_pool() {
-        // Supply > 0 but value = 0 → first depositor path
-        assert_eq!(calc_lp_for_deposit(100, 0, 50), Some(50));
+    fn test_deposit_into_zero_value_pool_blocked() {
+        // Supply > 0 but value = 0 → blocked (C9 fix: protects existing holders'
+        // claim on future insurance returns from dilution)
+        assert_eq!(calc_lp_for_deposit(100, 0, 50), None);
+    }
+
+    #[test]
+    fn test_deposit_orphaned_value_blocked() {
+        // Supply = 0 but value > 0 → blocked (C9 fix: prevents theft of
+        // orphaned insurance returns by first new depositor)
+        assert_eq!(calc_lp_for_deposit(0, 500, 1), None);
     }
 
     #[test]
@@ -214,12 +232,10 @@ mod tests {
 
     #[test]
     fn test_u64_max_deposit() {
-        // u64::MAX * u64::MAX could overflow u128? No — u128 max = 3.4e38, u64^2 = 3.4e38
-        // Actually u64::MAX^2 = (2^64-1)^2 ≈ 2^128 > u128::MAX. checked_mul returns None.
+        // All three are u64::MAX → pro-rata path (supply > 0, value > 0)
+        // u64::MAX as u128 * u64::MAX as u128 = (2^64-1)^2 = 2^128 - 2^65 + 1
+        // u128::MAX = 2^128 - 1, so it fits. Result = u64::MAX.
         let result = calc_lp_for_deposit(u64::MAX, u64::MAX, u64::MAX);
-        // u64::MAX * u64::MAX overflows u128 → None from checked_mul
-        // Actually: u64::MAX as u128 * u64::MAX as u128 = (2^64-1)^2 = 2^128 - 2^65 + 1
-        // u128::MAX = 2^128 - 1, so it fits! Result = u64::MAX.
         assert_eq!(result, Some(u64::MAX));
     }
 
@@ -282,6 +298,37 @@ mod tests {
         assert_eq!(col, 4);
         // Verify: col * supply <= lp * pv (pool-favoring)
         assert!((col as u128) * 7 <= (3u128) * 10);
+    }
+
+    // ── C9 Attack Scenarios ──
+
+    #[test]
+    fn test_c9_orphaned_insurance_theft_blocked() {
+        // Scenario: All LP holders withdrew, then insurance returned to vault.
+        // pool_value > 0, LP_supply = 0. Attacker deposits 1 token.
+        // OLD behavior: attacker gets 1 LP (1:1), then withdraws entire pool_value.
+        // NEW behavior: None — deposits blocked when orphaned value exists.
+        assert_eq!(calc_lp_for_deposit(0, 10_000_000, 1), None);
+    }
+
+    #[test]
+    fn test_c9_dilution_attack_blocked() {
+        // Scenario: Pool fully flushed (value=0), LP holders still have tokens.
+        // New depositor at 1:1 would dilute existing holders' insurance claims.
+        // Blocked: pool_value == 0 with supply > 0.
+        assert_eq!(calc_lp_for_deposit(1000, 0, 500), None);
+    }
+
+    #[test]
+    fn test_c9_true_first_depositor_works() {
+        // True first deposit: both supply and value are 0. 1:1 ratio.
+        assert_eq!(calc_lp_for_deposit(0, 0, 1000), Some(1000));
+    }
+
+    #[test]
+    fn test_c9_normal_pro_rata_unaffected() {
+        // Normal state: supply > 0, value > 0. Pro-rata works as before.
+        assert_eq!(calc_lp_for_deposit(1000, 2000, 500), Some(250));
     }
 
     // ── Monotonicity ──

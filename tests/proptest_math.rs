@@ -8,8 +8,11 @@ use proptest::prelude::*;
 
 // Mirror production functions exactly (from src/math.rs)
 fn calc_lp_for_deposit(supply: u64, pool_value: u64, deposit: u64) -> Option<u64> {
-    if supply == 0 || pool_value == 0 {
+    // C9 fix: block deposits when orphaned value or valueless LP exists
+    if supply == 0 && pool_value == 0 {
         Some(deposit)
+    } else if supply == 0 || pool_value == 0 {
+        None
     } else {
         let lp = (deposit as u128)
             .checked_mul(supply as u128)?

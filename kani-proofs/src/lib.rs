@@ -16,9 +16,13 @@
 // ═══════════════════════════════════════════════════════════════
 
 /// LP tokens for deposit. First depositor: 1:1. Subsequent: pro-rata (floor).
+/// C9 fix: returns None when orphaned value exists (supply=0, value>0) or
+/// when pool is valueless but LP exists (supply>0, value=0).
 pub fn calc_lp_for_deposit(supply: u32, pool_value: u32, deposit: u32) -> Option<u32> {
-    if supply == 0 || pool_value == 0 {
-        Some(deposit)
+    if supply == 0 && pool_value == 0 {
+        Some(deposit) // True first depositor — 1:1
+    } else if supply == 0 || pool_value == 0 {
+        None // Orphaned value or valueless LP — block deposits
     } else {
         let lp = (deposit as u64)
             .checked_mul(supply as u64)?
@@ -522,7 +526,44 @@ mod proofs {
     }
 
     // ════════════════════════════════════════════════════════════
-    // SECTION 10: Extended Arithmetic Safety (2 proofs)
+    // SECTION 10: C9 Orphaned Value Protection (3 proofs)
+    // ════════════════════════════════════════════════════════════
+
+    /// Orphaned value: supply=0, value>0 → deposits blocked (None).
+    /// Prevents theft of returned insurance after all LP holders withdraw.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_c9_orphaned_value_blocked() {
+        let pv: u32 = kani::any();
+        let dep: u32 = kani::any();
+        kani::assume(pv > 0 && pv < 100);
+        kani::assume(dep > 0 && dep < 100);
+        assert!(calc_lp_for_deposit(0, pv, dep).is_none());
+    }
+
+    /// Valueless LP: supply>0, value=0 → deposits blocked (None).
+    /// Prevents dilution of existing holders' insurance claims.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_c9_valueless_lp_blocked() {
+        let supply: u32 = kani::any();
+        let dep: u32 = kani::any();
+        kani::assume(supply > 0 && supply < 100);
+        kani::assume(dep > 0 && dep < 100);
+        assert!(calc_lp_for_deposit(supply, 0, dep).is_none());
+    }
+
+    /// True first depositor (both 0) still works 1:1.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn proof_c9_true_first_depositor() {
+        let dep: u32 = kani::any();
+        kani::assume(dep > 0 && dep < 100);
+        assert_eq!(calc_lp_for_deposit(0, 0, dep), Some(dep));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // SECTION 11: Extended Arithmetic Safety (2 proofs)
     // ════════════════════════════════════════════════════════════
 
     /// pool_value_with_flush never panics.
