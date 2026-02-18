@@ -2,3 +2,5 @@
 /kani-proofs/target/
 Cargo.lock
 kani-proofs/Cargo.lock
+node_modules/
+dist/
