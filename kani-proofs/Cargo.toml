@@ -1,0 +1,9 @@
+[package]
+name = "percolator-stake-kani"
+version = "0.1.0"
+edition = "2021"
+description = "Kani formal proofs for percolator-stake LP math (zero deps)"
+
+# ZERO dependencies — pure Rust only.
+# This allows CBMC to model-check quickly without Solana bloat.
+[dependencies]

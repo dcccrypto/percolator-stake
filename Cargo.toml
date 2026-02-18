@@ -1,0 +1,24 @@
+[package]
+name = "percolator-stake"
+version = "0.2.0"
+edition = "2021"
+description = "PDA-admin insurance LP staking program for Percolator"
+
+[features]
+no-entrypoint = []
+test = []
+kani = []
+
+[dependencies]
+solana-program = "2.1"
+spl-token = { version = "6.0", features = ["no-entrypoint"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dev-dependencies]
+solana-sdk = "2.1"
+
+# solana-program-test is too heavy for CI — use only for integration tests
+# solana-program-test = "2.1"
