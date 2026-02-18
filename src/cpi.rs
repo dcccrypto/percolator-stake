@@ -23,8 +23,9 @@ const TAG_SET_ORACLE_AUTHORITY: u8 = 16;
 const TAG_SET_ORACLE_PRICE_CAP: u8 = 18;
 const TAG_RESOLVE_MARKET: u8 = 19;
 const TAG_WITHDRAW_INSURANCE: u8 = 20;
-const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 21;
-const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 22;
+// Tag 21 = AdminForceCloseAccount (not used by stake program)
+const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 22; // Was incorrectly 21!
+const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 23;     // Was incorrectly 22!
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — permissionless, anyone can top up
