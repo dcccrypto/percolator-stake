@@ -1,8 +1,66 @@
 # percolator-stake Comprehensive Audit
 
-**Date:** 2026-02-18 (updated 02:50 UTC — round 2 deep re-audit)
+**Date:** 2026-02-18 (updated 03:10 UTC — round 3 adversarial re-audit)
 **Auditor:** Cobra (automated)
-**Files:** 8 source files, ~2500 lines, 30 Kani proofs, 92 unit tests
+**Files:** 8 source files, ~2550 lines, 31 Kani proofs, 97 unit tests
+
+---
+
+## Round 3 Findings (Adversarial Deep Dive)
+
+### C6: Missing token_program validation in `process_deposit` — VAULT DRAIN (CRITICAL)
+**File:** `processor.rs` — `process_deposit`
+**SEVERITY:** CRITICAL — any user can drain entire vault
+
+The `token_program` account is never validated against `spl_token::id()`. Both `invoke` (transfer) and `invoke_signed` (mint_to with vault_auth PDA signer) dispatch to whatever program is passed.
+
+**Attack:**
+1. Attacker deploys malicious Solana program
+2. Calls Deposit with fake program as `token_program`
+3. Our `invoke_signed` adds `vault_auth` PDA as signer (it's the LP mint authority)
+4. Fake program receives vault_auth as signer — **signer propagates through CPI chains on Solana**
+5. Fake program CPIs into real SPL Token: `transfer(stake_vault → attacker_ata, vault_auth)`
+6. **All depositor tokens drained.** Also: can `mint_to` unlimited LP or `set_authority` on mint/vault.
+
+**Who can exploit:** ANY user (not just admin). This is worse than C5.
+
+**Fix:** Added `verify_token_program()` check — validates `token_program.key == spl_token::id()` before any `invoke_signed`.
+
+**Status:** ✅ FIXED
+
+### C7: Missing token_program validation in `process_withdraw` — SAME VAULT DRAIN (CRITICAL)
+**File:** `processor.rs` — `process_withdraw`
+**SEVERITY:** CRITICAL — same attack vector as C6
+
+The `invoke_signed` for SPL transfer passes vault_auth as signer to the unvalidated token_program.
+
+**Fix:** Same `verify_token_program()` check added.
+
+**Status:** ✅ FIXED
+
+### C8: pool_value formula causes insolvency after flush+return (CRITICAL)
+**File:** `state.rs` — `total_pool_value()`
+**SEVERITY:** CRITICAL — LP overpricing → pool insolvency
+
+The formula was `deposited - withdrawn + returned`. The correct formula is `deposited - withdrawn - flushed + returned`.
+
+**The missing `-flushed` causes phantom inflation:**
+```
+Example: deposit 1000, flush 500, insurance returns 300
+WRONG:   pool_value = 1000 - 0 + 300 = 1300 (vault has 800!)
+CORRECT: pool_value = 1000 - 0 - 500 + 300 = 800 ✓
+```
+
+After any flush+return cycle, LP tokens are overpriced by the entire flushed amount:
+- Early withdrawers claim more than their share
+- Late withdrawers can't withdraw (vault insufficient)
+- Pool becomes insolvent
+
+**Note:** This bug was INTRODUCED by the previous C4 "fix" which added `+returned` without `-flushed`. The original formula `deposited - withdrawn` was better.
+
+**Fix:** Changed formula to `deposited - withdrawn - flushed + returned`. Updated all tests + Kani proofs.
+
+**Status:** ✅ FIXED
 
 ---
 
@@ -175,8 +233,11 @@ math.rs had u64 proofs that would timeout. kani-proofs/ has working u32 proofs.
 | C1 | CRITICAL | saturating_sub on LP supply | ✅ FIXED |
 | C2 | CRITICAL | saturating_sub on deposit LP | ✅ FIXED |
 | C3 | CRITICAL | total_returned never updated | ✅ FIXED |
-| C4 | CRITICAL | pool_value missing returns | ✅ FIXED |
+| C4 | CRITICAL | pool_value missing returns | ✅ FIXED (then corrected in C8) |
 | C5 | CRITICAL | Missing percolator_program validation in admin CPIs | ✅ FIXED |
+| C6 | CRITICAL | Missing token_program validation in deposit (vault drain) | ✅ FIXED |
+| C7 | CRITICAL | Missing token_program validation in withdraw (vault drain) | ✅ FIXED |
+| C8 | CRITICAL | pool_value formula causes insolvency (missing -flushed) | ✅ FIXED |
 | H1 | HIGH | No admin_transferred in deposit | ⚠️ DOCUMENTED |
 | H2 | HIGH | Permissionless flush | ⚠️ DOCUMENTED |
 | H3 | HIGH | CPI signer flag: slab | ✅ FIXED |
@@ -193,13 +254,13 @@ math.rs had u64 proofs that would timeout. kani-proofs/ has working u32 proofs.
 | L3 | LOW | No independent vault ownership check | ⚠️ ACCEPTED |
 | L4 | LOW | saturating_sub in flush available | ✅ FIXED |
 
-**Total: 6 CRITICAL (all fixed), 5 HIGH (3 fixed), 6 MEDIUM (4 fixed), 4 LOW (1 fixed)**
+**Total: 9 CRITICAL (all fixed), 5 HIGH (3 fixed), 6 MEDIUM (4 fixed), 4 LOW (1 fixed)**
 
 ---
 
 ## Verification Status
 
-### Kani Formal Proofs: 30 harnesses, ALL VERIFIED
+### Kani Formal Proofs: 31 harnesses, ALL VERIFIED
 - Conservation: 5 proofs (deposit→withdraw, first depositor, two depositors, no dilution, flush preserves value)
 - Arithmetic Safety: 4 proofs (full u32 range, no panics)
 - Fairness/Monotonicity: 3 proofs (deterministic, deposit monotone, burn monotone)
@@ -211,9 +272,9 @@ math.rs had u64 proofs that would timeout. kani-proofs/ has working u32 proofs.
 - Deposit Cap: 3 proofs (uncapped, at boundary, above boundary)
 - Extended Safety: 2 proofs (pool_value_with_returns, exceeds_cap no panic)
 
-### Unit Tests: 92 tests, ALL PASSING
+### Unit Tests: 97 tests, ALL PASSING (136 total across all test targets)
 - math.rs: LP calculation, pool value, flush, rounding, conservation, edge cases
 - instruction.rs: All 12 instruction tags, boundary values, error cases
 - state.rs: Struct sizes, PDA derivation, pool value, LP math delegation
 
-### Total: 122 verification checks, 0 failures
+### Total: 136 tests + 31 Kani proofs = 167 verification checks, 0 failures
