@@ -26,7 +26,7 @@ use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
 use crate::state::{
-    self, StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
+    self, derive_vault_authority, StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
 };
 
 pub fn process(
@@ -236,6 +236,7 @@ fn process_init_pool(
     pool.total_returned = 0;
     pool.total_withdrawn = 0;
     pool.percolator_program = percolator_program.key.to_bytes();
+    pool.set_discriminator();
 
     msg!("StakePool initialized for slab {} (admin transfer pending)", slab.key);
     Ok(())
@@ -279,11 +280,25 @@ fn process_deposit(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
+    }
+
+    // I7: Block deposits after market resolution
+    if pool._reserved[0] != 0 {
+        return Err(StakeError::MarketResolved.into());
+    }
+
+    // I5: Validate vault_auth PDA derivation
+    let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidAccount.into());
     }
 
     // Check deposit cap against CURRENT pool value, not lifetime deposits.
@@ -353,6 +368,13 @@ fn process_deposit(
         return Err(StakeError::InvalidPda.into());
     }
 
+    // I4: Verify deposit PDA ownership for existing accounts
+    if !deposit_pda.data_is_empty() {
+        if *deposit_pda.owner != *program_id {
+            return Err(StakeError::InvalidAccount.into());
+        }
+    }
+
     if deposit_pda.data_is_empty() {
         let deposit_seeds: &[&[u8]] = &[
             b"stake_deposit", pool_pda.key.as_ref(), user.key.as_ref(), &[deposit_bump],
@@ -374,6 +396,9 @@ fn process_deposit(
     let mut deposit_data = deposit_pda.try_borrow_mut_data()?;
     let deposit: &mut StakeDeposit = bytemuck::from_bytes_mut(&mut deposit_data[..STAKE_DEPOSIT_SIZE]);
 
+    if deposit.is_initialized != 1 {
+        deposit.set_discriminator();
+    }
     deposit.is_initialized = 1;
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
@@ -422,6 +447,9 @@ fn process_withdraw(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
@@ -431,6 +459,12 @@ fn process_withdraw(
 
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
     verify_token_program(token_program)?;
+
+    // I5: Validate vault_auth PDA derivation
+    let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidAccount.into());
+    }
 
     // Check cooldown
     let clock = Clock::from_account_info(clock_sysvar)?;
@@ -824,6 +858,13 @@ fn process_admin_resolve_market(
         slab,
         admin_seeds,
     )?;
+
+    // I7: Set resolved flag to block future deposits
+    {
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+        pool._reserved[0] = 1;
+    }
 
     msg!("ResolveMarket forwarded via CPI");
     Ok(())

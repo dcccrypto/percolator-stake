@@ -35,6 +35,8 @@ pub enum StakeError {
     InvalidPercolatorProgram = 14,
     /// CPI to percolator failed
     CpiFailed = 15,
+    /// Invalid account ownership
+    InvalidAccount = 16,
 }
 
 impl From<StakeError> for ProgramError {

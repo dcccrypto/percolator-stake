@@ -1,6 +1,11 @@
 use bytemuck::{Pod, Zeroable};
 use solana_program::pubkey::Pubkey;
 
+/// 8-byte discriminator for StakePool accounts ("SPOOL_V1")
+pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = [0x53, 0x50, 0x4F, 0x4F, 0x4C, 0x5F, 0x56, 0x31];
+/// 8-byte discriminator for StakeDeposit accounts ("SDEP_V1\0")
+pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 0x56, 0x31, 0x00];
+
 /// Stake pool state — one per slab (market).
 /// PDA seeds: [b"stake_pool", slab_pubkey]
 ///
@@ -110,6 +115,19 @@ pub struct StakeDeposit {
 /// Size of StakeDeposit in bytes
 pub const STAKE_DEPOSIT_SIZE: usize = core::mem::size_of::<StakeDeposit>();
 
+impl StakeDeposit {
+    /// Set discriminator in first 8 bytes of _reserved. Call on init.
+    pub fn set_discriminator(&mut self) {
+        self._reserved[..8].copy_from_slice(&STAKE_DEPOSIT_DISCRIMINATOR);
+    }
+
+    /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
+    pub fn validate_discriminator(&self) -> bool {
+        let disc = &self._reserved[..8];
+        disc == &[0u8; 8] || disc == &STAKE_DEPOSIT_DISCRIMINATOR
+    }
+}
+
 impl StakePool {
     pub fn slab_pubkey(&self) -> Pubkey {
         Pubkey::new_from_array(self.slab)
@@ -133,6 +151,17 @@ impl StakePool {
 
     pub fn percolator_program_pubkey(&self) -> Pubkey {
         Pubkey::new_from_array(self.percolator_program)
+    }
+
+    /// Set discriminator in first 8 bytes of _reserved. Call on init.
+    pub fn set_discriminator(&mut self) {
+        self._reserved[..8].copy_from_slice(&STAKE_POOL_DISCRIMINATOR);
+    }
+
+    /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
+    pub fn validate_discriminator(&self) -> bool {
+        let disc = &self._reserved[..8];
+        disc == &[0u8; 8] || disc == &STAKE_POOL_DISCRIMINATOR
     }
 
     /// Total pool value = deposited - withdrawn - flushed + returned.
