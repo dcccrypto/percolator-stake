@@ -31,12 +31,13 @@ const TAG_WITHDRAW_INSURANCE: u8 = 20;
 // Tag 26 = WithdrawInsuranceLP (not used by stake program)
 // Tag 27 = PauseMarket (not used by stake program)
 // Tag 28 = UnpauseMarket (not used by stake program)
+// Tag 29 = AcceptAdmin (two-step admin transfer, added in PERC-112)
 //
-// Tags 29 and 30 were added to percolator-launch in PERC-110.
+// Tags 30 and 31 were added to percolator-launch in PERC-110.
 // Previous values of 22/23 were WRONG — they would have called UpdateRiskParams
 // and RenounceAdmin respectively, which is catastrophically incorrect.
-const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 29;
-const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 30;
+const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 30;
+const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — permissionless, anyone can top up
