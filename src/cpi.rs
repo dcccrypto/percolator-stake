@@ -32,12 +32,11 @@ const TAG_WITHDRAW_INSURANCE: u8 = 20;
 // Tag 27 = PauseMarket (not used by stake program)
 // Tag 28 = UnpauseMarket (not used by stake program)
 //
-// ⚠️ CRITICAL: SetInsuranceWithdrawPolicy and WithdrawInsuranceLimited
-// are NOT YET IMPLEMENTED in percolator-launch. Tags 29 and 30 are
-// reserved for them. DO NOT call these CPIs until percolator-launch
-// implements the matching instructions.
-const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 29; // RESERVED — not yet in percolator-launch!
-const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 30;     // RESERVED — not yet in percolator-launch!
+// Tags 29 and 30 were added to percolator-launch in PERC-110.
+// Previous values of 22/23 were WRONG — they would have called UpdateRiskParams
+// and RenounceAdmin respectively, which is catastrophically incorrect.
+const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 29;
+const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 30;
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — permissionless, anyone can top up
