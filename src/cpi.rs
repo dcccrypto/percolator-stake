@@ -24,8 +24,20 @@ const TAG_SET_ORACLE_PRICE_CAP: u8 = 18;
 const TAG_RESOLVE_MARKET: u8 = 19;
 const TAG_WITHDRAW_INSURANCE: u8 = 20;
 // Tag 21 = AdminForceCloseAccount (not used by stake program)
-const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 22; // Was incorrectly 21!
-const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 23;     // Was incorrectly 22!
+// Tag 22 = UpdateRiskParams (not used by stake program)
+// Tag 23 = RenounceAdmin (not used by stake program)
+// Tag 24 = CreateInsuranceMint (not used by stake program)
+// Tag 25 = DepositInsuranceLP (not used by stake program)
+// Tag 26 = WithdrawInsuranceLP (not used by stake program)
+// Tag 27 = PauseMarket (not used by stake program)
+// Tag 28 = UnpauseMarket (not used by stake program)
+//
+// ⚠️ CRITICAL: SetInsuranceWithdrawPolicy and WithdrawInsuranceLimited
+// are NOT YET IMPLEMENTED in percolator-launch. Tags 29 and 30 are
+// reserved for them. DO NOT call these CPIs until percolator-launch
+// implements the matching instructions.
+const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 29; // RESERVED — not yet in percolator-launch!
+const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 30;     // RESERVED — not yet in percolator-launch!
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — permissionless, anyone can top up
