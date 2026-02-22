@@ -290,6 +290,14 @@ fn process_deposit(
         return Err(StakeError::InvalidPda.into());
     }
 
+    // H1: Require admin transfer before accepting deposits.
+    // Without this, users can deposit into a pool where the stake program
+    // doesn't yet have admin control over the wrapper — their funds would
+    // be unprotected by the stake program's safety mechanisms.
+    if pool.admin_transferred != 1 {
+        return Err(StakeError::AdminNotTransferred.into());
+    }
+
     // I7: Block deposits after market resolution
     if pool._reserved[0] != 0 {
         return Err(StakeError::MarketResolved.into());
