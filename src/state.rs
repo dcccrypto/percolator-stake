@@ -153,9 +153,19 @@ impl StakePool {
         Pubkey::new_from_array(self.percolator_program)
     }
 
-    /// Set discriminator in first 8 bytes of _reserved. Call on init.
+    /// Current struct version. Increment when layout changes.
+    pub const CURRENT_VERSION: u8 = 1;
+
+    /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
+    /// Call on init.
     pub fn set_discriminator(&mut self) {
         self._reserved[..8].copy_from_slice(&STAKE_POOL_DISCRIMINATOR);
+        self._reserved[8] = Self::CURRENT_VERSION;
+    }
+
+    /// Read the struct version (byte 8 of _reserved). Returns 0 for pre-versioning accounts.
+    pub fn version(&self) -> u8 {
+        self._reserved[8]
     }
 
     /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
