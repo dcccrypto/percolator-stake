@@ -122,6 +122,18 @@ cd kani-proofs && cargo kani --lib
 - [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md) — Proof-by-proof analysis
 - [`docs/WRAPPER-HARDENING.md`](docs/WRAPPER-HARDENING.md) — Wrapper foot gun limits
 
+## Related Repositories
+
+| Repository | Description |
+|-----------|-------------|
+| [percolator](https://github.com/dcccrypto/percolator) | Core risk engine crate (Rust) |
+| [percolator-prog](https://github.com/dcccrypto/percolator-prog) | Solana on-chain program (wrapper) |
+| [percolator-matcher](https://github.com/dcccrypto/percolator-matcher) | Reference matcher program for LP pricing |
+| [percolator-sdk](https://github.com/dcccrypto/percolator-sdk) | TypeScript SDK for client integration |
+| [percolator-ops](https://github.com/dcccrypto/percolator-ops) | Operations dashboard |
+| [percolator-mobile](https://github.com/dcccrypto/percolator-mobile) | Solana Seeker mobile trading app |
+| [percolator-launch](https://github.com/dcccrypto/percolator-launch) | Full-stack launch platform (monorepo) |
+
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE).
