@@ -3,7 +3,7 @@
 //! Ensures bytemuck Pod compliance and that struct sizes
 //! don't accidentally change (would break on-chain state).
 
-use percolator_stake::state::{StakePool, StakeDeposit, STAKE_POOL_SIZE, STAKE_DEPOSIT_SIZE};
+use percolator_stake::state::{StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
 
 #[test]
 fn test_stake_pool_size_is_352() {

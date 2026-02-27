@@ -29,12 +29,12 @@
 //!  10 - AdminWithdrawInsurance: CPI WithdrawInsurance → distribute to LP holders
 //!  11 - AdminSetInsurancePolicy: CPI SetInsuranceWithdrawPolicy on wrapper
 
+pub mod cpi;
 pub mod error;
 pub mod instruction;
 pub mod math;
 pub mod processor;
 pub mod state;
-pub mod cpi;
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint;

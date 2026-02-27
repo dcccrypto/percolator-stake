@@ -17,16 +17,26 @@ fn calc_lp_for_deposit(supply: u64, pool_value: u64, deposit: u64) -> Option<u64
         let lp = (deposit as u128)
             .checked_mul(supply as u128)?
             .checked_div(pool_value as u128)?;
-        if lp > u64::MAX as u128 { None } else { Some(lp as u64) }
+        if lp > u64::MAX as u128 {
+            None
+        } else {
+            Some(lp as u64)
+        }
     }
 }
 
 fn calc_collateral_for_withdraw(supply: u64, pool_value: u64, lp: u64) -> Option<u64> {
-    if supply == 0 { return None; }
+    if supply == 0 {
+        return None;
+    }
     let col = (lp as u128)
         .checked_mul(pool_value as u128)?
         .checked_div(supply as u128)?;
-    if col > u64::MAX as u128 { None } else { Some(col as u64) }
+    if col > u64::MAX as u128 {
+        None
+    } else {
+        Some(col as u64)
+    }
 }
 
 fn flush_available(deposited: u64, withdrawn: u64, flushed: u64) -> u64 {
@@ -247,7 +257,7 @@ proptest! {
 fn test_production_scale_conservation() {
     // Simulate a real pool: 10M USDC total, 1M LP tokens
     let supply = 1_000_000_000_000u64; // 1M LP (6 decimals)
-    let pv = 10_000_000_000_000u64;    // 10M USDC (6 decimals)
+    let pv = 10_000_000_000_000u64; // 10M USDC (6 decimals)
 
     // User deposits 50K USDC
     let deposit = 50_000_000_000u64;

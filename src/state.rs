@@ -221,7 +221,10 @@ pub fn derive_vault_authority(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8
 
 /// Derive the per-user deposit PDA.
 pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"stake_deposit", pool.as_ref(), user.as_ref()], program_id)
+    Pubkey::find_program_address(
+        &[b"stake_deposit", pool.as_ref(), user.as_ref()],
+        program_id,
+    )
 }
 
 #[cfg(test)]

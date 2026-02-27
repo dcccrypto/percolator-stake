@@ -19,7 +19,7 @@ jobs:
         with:
           toolchain: stable
       - run: cargo build --features no-entrypoint
-      - run: cargo test --features no-entrypoint,test
+      - run: RUSTFLAGS="--check-cfg cfg(kani)" cargo test --features no-entrypoint,test
 
   clippy:
     name: Clippy
