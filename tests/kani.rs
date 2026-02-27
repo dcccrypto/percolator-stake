@@ -58,7 +58,12 @@ mod kani_proofs {
         };
 
         // CRITICAL PROPERTY: can't get back more than deposited
-        assert!(back <= deposit, "INFLATION: deposited {} but withdrew {}", deposit, back);
+        assert!(
+            back <= deposit,
+            "INFLATION: deposited {} but withdrew {}",
+            deposit,
+            back
+        );
     }
 
     /// PROOF: First depositor gets exact 1:1 (no loss, no gain).
@@ -112,7 +117,11 @@ mod kani_proofs {
         // CONSERVATION: total_out ≤ total_in
         assert!(
             a_back + b_back <= a + b,
-            "INFLATION: in={}+{}, out={}+{}", a, b, a_back, b_back
+            "INFLATION: in={}+{}, out={}+{}",
+            a,
+            b,
+            a_back,
+            b_back
         );
     }
 
@@ -193,7 +202,10 @@ mod kani_proofs {
             None => return,
         };
 
-        assert!(lp_l >= lp_s, "Monotonicity violated: more deposit → less LP");
+        assert!(
+            lp_l >= lp_s,
+            "Monotonicity violated: more deposit → less LP"
+        );
     }
 
     /// PROOF: Larger LP burn → ≥ collateral (monotonicity).
@@ -218,7 +230,10 @@ mod kani_proofs {
             None => return,
         };
 
-        assert!(c_l >= c_s, "Monotonicity violated: more LP burn → less collateral");
+        assert!(
+            c_l >= c_s,
+            "Monotonicity violated: more LP burn → less collateral"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -326,7 +341,10 @@ mod kani_proofs {
         kani::assume(new_deposit > 0);
 
         let old = pool_value(deposited, withdrawn);
-        let new = pool_value(deposited.checked_add(new_deposit).unwrap_or(u64::MAX), withdrawn);
+        let new = pool_value(
+            deposited.checked_add(new_deposit).unwrap_or(u64::MAX),
+            withdrawn,
+        );
 
         match (old, new) {
             (Some(o), Some(n)) => assert!(n >= o, "Deposit must not decrease value"),

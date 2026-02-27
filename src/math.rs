@@ -112,12 +112,18 @@ mod tests {
 
     #[test]
     fn test_pro_rata() {
-        assert_eq!(calc_lp_for_deposit(1_000_000, 1_000_000, 500_000), Some(500_000));
+        assert_eq!(
+            calc_lp_for_deposit(1_000_000, 1_000_000, 500_000),
+            Some(500_000)
+        );
     }
 
     #[test]
     fn test_withdraw_proportional() {
-        assert_eq!(calc_collateral_for_withdraw(2_000_000, 2_000_000, 1_000_000), Some(1_000_000));
+        assert_eq!(
+            calc_collateral_for_withdraw(2_000_000, 2_000_000, 1_000_000),
+            Some(1_000_000)
+        );
     }
 
     #[test]

@@ -32,7 +32,11 @@ fn test_all_error_codes_unique() {
 
     // Check sequential (0..15)
     for (i, &code) in codes.iter().enumerate() {
-        assert_eq!(code, i as u32, "Error code {} expected {}, got {}", i, i, code);
+        assert_eq!(
+            code, i as u32,
+            "Error code {} expected {}, got {}",
+            i, i, code
+        );
     }
 }
 

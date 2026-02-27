@@ -58,14 +58,20 @@ fn test_cpi_tag_resolve_market() {
 fn test_cpi_tag_set_insurance_withdraw_policy() {
     // CRITICAL: Must be 22, NOT 21 (21 = AdminForceCloseAccount)
     let data = build_cpi_data_insurance_policy();
-    assert_eq!(data[0], 22, "SetInsuranceWithdrawPolicy must be tag 22, not 21");
+    assert_eq!(
+        data[0], 22,
+        "SetInsuranceWithdrawPolicy must be tag 22, not 21"
+    );
 }
 
 #[test]
 fn test_cpi_tag_withdraw_insurance_limited() {
     // CRITICAL: Must be 23, NOT 22 (22 = SetInsuranceWithdrawPolicy)
     let data = build_cpi_data_withdraw_limited(500);
-    assert_eq!(data[0], 23, "WithdrawInsuranceLimited must be tag 23, not 22");
+    assert_eq!(
+        data[0], 23,
+        "WithdrawInsuranceLimited must be tag 23, not 22"
+    );
 }
 
 #[test]
@@ -73,10 +79,16 @@ fn test_tag_21_is_force_close_not_insurance() {
     // Tag 21 is AdminForceCloseAccount — we must NOT use it for insurance policy
     // This test exists as a regression guard after the tag mismatch was caught
     let policy_data = build_cpi_data_insurance_policy();
-    assert_ne!(policy_data[0], 21, "Bug: tag 21 would call AdminForceCloseAccount!");
+    assert_ne!(
+        policy_data[0], 21,
+        "Bug: tag 21 would call AdminForceCloseAccount!"
+    );
 
     let limited_data = build_cpi_data_withdraw_limited(100);
-    assert_ne!(limited_data[0], 22, "Bug: tag 22 would call SetInsuranceWithdrawPolicy!");
+    assert_ne!(
+        limited_data[0], 22,
+        "Bug: tag 22 would call SetInsuranceWithdrawPolicy!"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
