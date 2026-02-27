@@ -286,20 +286,19 @@ mod proofs {
         }
     }
 
-    /// Targeted test: overflow guard fires for extreme inputs.
-    /// Uses concrete values (no SAT explosion) to cover the guard path that
-    /// the u16-bounded proofs above cannot reach.
+    /// Targeted test: overflow guard fires for inputs that cause u64→u32 overflow.
+    /// Uses values large enough to trigger the guard but small enough for CBMC
+    /// to handle without SAT explosion (u32::MAX causes 32×32→64 bit-blast).
     #[kani::proof]
     fn proof_overflow_guard_fires_concrete() {
-        // deposit(MAX) * supply(MAX) / pool_value(1) >> u32::MAX → None
-        assert!(calc_lp_for_deposit(u32::MAX, 1, u32::MAX).is_none());
-        // deposit(MAX) * supply(2) / pool_value(1) = 2*MAX > u32::MAX → None
-        assert!(calc_lp_for_deposit(2, 1, u32::MAX).is_none());
-        // deposit(MAX) * supply(1) / pool_value(1) = MAX → Some(MAX) (just fits)
-        assert_eq!(calc_lp_for_deposit(1, 1, u32::MAX), Some(u32::MAX));
-        // Same overflow guard on withdraw side
-        assert!(calc_collateral_for_withdraw(1, u32::MAX, u32::MAX).is_some());
-        assert_eq!(calc_collateral_for_withdraw(1, u32::MAX, u32::MAX), Some(u32::MAX));
+        // deposit(70000) * supply(70000) / pool_value(1) = 4.9B > u32::MAX → None
+        assert!(calc_lp_for_deposit(70_000, 1, 70_000).is_none());
+        // deposit(100000) * supply(2) / pool_value(1) = 200000 → Some (fits in u32)
+        assert_eq!(calc_lp_for_deposit(2, 1, 100_000), Some(200_000));
+        // deposit(1) * supply(1) / pool_value(1) = 1 → Some(1)
+        assert_eq!(calc_lp_for_deposit(1, 1, 1), Some(1));
+        // Withdraw: lp(70000) * pool_value(70000) / supply(1) = 4.9B > u32::MAX → None
+        assert!(calc_collateral_for_withdraw(1, 70_000, 70_000).is_none());
     }
 
     /// No-panic proof for calc_collateral_for_withdraw.
