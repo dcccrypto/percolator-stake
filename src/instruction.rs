@@ -273,10 +273,12 @@ impl StakeInstruction {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn pack_u64(v: u64) -> Vec<u8> {
         v.to_le_bytes().to_vec()
     }
 
+    #[allow(dead_code)]
     fn pack_u128(v: u128) -> Vec<u8> {
         v.to_le_bytes().to_vec()
     }
