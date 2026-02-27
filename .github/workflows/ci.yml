@@ -57,9 +57,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Kani
-        uses: model-checking/kani-verifier-action@v1
       - name: Run Kani proofs (standalone zero-dep crate)
-        working-directory: kani-proofs
-        run: cargo kani --lib
+        uses: model-checking/kani-github-action@v1
+        with:
+          working-directory: kani-proofs
+          args: --lib
         timeout-minutes: 30

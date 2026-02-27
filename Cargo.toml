@@ -16,6 +16,9 @@ bytemuck = { version = "1.14", features = ["derive"] }
 # Pin blake3 to avoid edition2024 (SBF platform-tools has Rust 1.84)
 blake3 = ">=1.5.0, <1.8.0"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [lib]
 crate-type = ["cdylib", "lib"]
 
