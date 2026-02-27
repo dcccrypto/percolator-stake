@@ -61,5 +61,5 @@ jobs:
         uses: model-checking/kani-github-action@v1
         with:
           working-directory: kani-proofs
-          args: --lib
-        timeout-minutes: 30
+          args: --lib --output-format terse --jobs 2
+        timeout-minutes: 90
