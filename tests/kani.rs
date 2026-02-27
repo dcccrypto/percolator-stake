@@ -121,38 +121,79 @@ mod kani_proofs {
     // ═══════════════════════════════════════════════════════════
 
     /// PROOF: calc_lp_for_deposit never panics for any u64 inputs.
+    /// Also verifies: result is None or pool-favoring (lp * pv <= amount * supply).
     #[kani::proof]
     fn proof_lp_deposit_no_panic() {
         let supply: u64 = kani::any();
         let pv: u64 = kani::any();
         let amount: u64 = kani::any();
-        let _ = calc_lp_for_deposit(supply, pv, amount);
+        let result = calc_lp_for_deposit(supply, pv, amount);
+
+        // Explicit assertion: if Some, the result must be pool-favoring
+        // (minted LP * pool_value <= deposit * supply — i.e., rounds down)
+        if let Some(lp) = result {
+            if supply > 0 && pv > 0 {
+                let lhs = (lp as u128) * (pv as u128);
+                let rhs = (amount as u128) * (supply as u128);
+                assert!(lhs <= rhs, "LP minting must round down (pool-favoring)");
+            }
+            // First depositor: lp == amount
+            if supply == 0 && pv == 0 {
+                assert!(lp == amount, "First depositor must get 1:1");
+            }
+        }
     }
 
     /// PROOF: calc_collateral_for_withdraw never panics for any u64 inputs.
+    /// Also verifies: result is None or pool-favoring (col * supply <= lp * pv).
     #[kani::proof]
     fn proof_collateral_withdraw_no_panic() {
         let supply: u64 = kani::any();
         let pv: u64 = kani::any();
         let lp: u64 = kani::any();
-        let _ = calc_collateral_for_withdraw(supply, pv, lp);
+        let result = calc_collateral_for_withdraw(supply, pv, lp);
+
+        // Explicit assertion: if Some, the result must be pool-favoring
+        // (collateral * supply <= lp * pool_value — i.e., rounds down)
+        if let Some(col) = result {
+            let lhs = (col as u128) * (supply as u128);
+            let rhs = (lp as u128) * (pv as u128);
+            assert!(lhs <= rhs, "Withdrawal must round down (pool-favoring)");
+            // Collateral must not exceed pool value
+            assert!(col <= pv, "Withdrawal must not exceed pool value");
+        }
     }
 
     /// PROOF: pool_value never panics.
+    /// Also verifies: result semantics match deposited - withdrawn.
     #[kani::proof]
     fn proof_pool_value_no_panic() {
         let deposited: u64 = kani::any();
         let withdrawn: u64 = kani::any();
-        let _ = pool_value(deposited, withdrawn);
+        let result = pool_value(deposited, withdrawn);
+
+        // Explicit assertion: None iff overdrawn, Some(d - w) otherwise
+        if withdrawn > deposited {
+            assert!(result.is_none(), "Must be None when overdrawn");
+        } else {
+            assert!(result == Some(deposited - withdrawn), "Must equal deposited - withdrawn");
+        }
     }
 
     /// PROOF: flush_available never panics.
+    /// Also verifies: result is bounded by deposited and by pool value.
     #[kani::proof]
     fn proof_flush_available_no_panic() {
         let deposited: u64 = kani::any();
         let withdrawn: u64 = kani::any();
         let flushed: u64 = kani::any();
-        let _ = flush_available(deposited, withdrawn, flushed);
+        let result = flush_available(deposited, withdrawn, flushed);
+
+        // Explicit assertions on bounds
+        assert!(result <= deposited, "Flush available must not exceed total deposited");
+        // Result must not exceed pool value (deposited - withdrawn, saturating)
+        let pv = deposited.saturating_sub(withdrawn);
+        assert!(result <= pv, "Flush available must not exceed pool value");
     }
 
     // ═══════════════════════════════════════════════════════════
