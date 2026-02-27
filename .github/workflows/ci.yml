@@ -62,4 +62,4 @@ jobs:
         with:
           working-directory: kani-proofs
           args: --lib --output-format terse --jobs 2
-        timeout-minutes: 90
+        timeout-minutes: 30
