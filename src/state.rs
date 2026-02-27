@@ -124,7 +124,7 @@ impl StakeDeposit {
     /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
     pub fn validate_discriminator(&self) -> bool {
         let disc = &self._reserved[..8];
-        disc == &[0u8; 8] || disc == &STAKE_DEPOSIT_DISCRIMINATOR
+        disc == [0u8; 8] || disc == STAKE_DEPOSIT_DISCRIMINATOR
     }
 }
 
@@ -171,7 +171,7 @@ impl StakePool {
     /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
     pub fn validate_discriminator(&self) -> bool {
         let disc = &self._reserved[..8];
-        disc == &[0u8; 8] || disc == &STAKE_POOL_DISCRIMINATOR
+        disc == [0u8; 8] || disc == STAKE_POOL_DISCRIMINATOR
     }
 
     /// Total pool value = deposited - withdrawn - flushed + returned.
@@ -221,7 +221,10 @@ pub fn derive_vault_authority(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8
 
 /// Derive the per-user deposit PDA.
 pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[b"stake_deposit", pool.as_ref(), user.as_ref()], program_id)
+    Pubkey::find_program_address(
+        &[b"stake_deposit", pool.as_ref(), user.as_ref()],
+        program_id,
+    )
 }
 
 #[cfg(test)]

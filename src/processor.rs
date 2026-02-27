@@ -37,24 +37,22 @@ pub fn process(
     let instruction = StakeInstruction::unpack(instruction_data)?;
 
     match instruction {
-        StakeInstruction::InitPool { cooldown_slots, deposit_cap } => {
-            process_init_pool(program_id, accounts, cooldown_slots, deposit_cap)
-        }
-        StakeInstruction::Deposit { amount } => {
-            process_deposit(program_id, accounts, amount)
-        }
+        StakeInstruction::InitPool {
+            cooldown_slots,
+            deposit_cap,
+        } => process_init_pool(program_id, accounts, cooldown_slots, deposit_cap),
+        StakeInstruction::Deposit { amount } => process_deposit(program_id, accounts, amount),
         StakeInstruction::Withdraw { lp_amount } => {
             process_withdraw(program_id, accounts, lp_amount)
         }
         StakeInstruction::FlushToInsurance { amount } => {
             process_flush_to_insurance(program_id, accounts, amount)
         }
-        StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
-            process_update_config(program_id, accounts, new_cooldown_slots, new_deposit_cap)
-        }
-        StakeInstruction::TransferAdmin => {
-            process_transfer_admin(program_id, accounts)
-        }
+        StakeInstruction::UpdateConfig {
+            new_cooldown_slots,
+            new_deposit_cap,
+        } => process_update_config(program_id, accounts, new_cooldown_slots, new_deposit_cap),
+        StakeInstruction::TransferAdmin => process_transfer_admin(program_id, accounts),
         StakeInstruction::AdminSetOracleAuthority { new_authority } => {
             process_admin_set_oracle_authority(program_id, accounts, &new_authority)
         }
@@ -64,19 +62,23 @@ pub fn process(
         StakeInstruction::AdminSetMaintenanceFee { new_fee } => {
             process_admin_set_maintenance_fee(program_id, accounts, new_fee)
         }
-        StakeInstruction::AdminResolveMarket => {
-            process_admin_resolve_market(program_id, accounts)
-        }
+        StakeInstruction::AdminResolveMarket => process_admin_resolve_market(program_id, accounts),
         StakeInstruction::AdminWithdrawInsurance { amount } => {
             process_admin_withdraw_insurance(program_id, accounts, amount)
         }
         StakeInstruction::AdminSetInsurancePolicy {
-            authority, min_withdraw_base, max_withdraw_bps, cooldown_slots
-        } => {
-            process_admin_set_insurance_policy(
-                program_id, accounts, &authority, min_withdraw_base, max_withdraw_bps, cooldown_slots,
-            )
-        }
+            authority,
+            min_withdraw_base,
+            max_withdraw_bps,
+            cooldown_slots,
+        } => process_admin_set_insurance_policy(
+            program_id,
+            accounts,
+            &authority,
+            min_withdraw_base,
+            max_withdraw_bps,
+            cooldown_slots,
+        ),
     }
 }
 
@@ -165,7 +167,8 @@ fn process_init_pool(
     }
 
     // Derive vault authority
-    let (expected_vault_auth, vault_auth_bump) = state::derive_vault_authority(program_id, &expected_pool);
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, &expected_pool);
     if *vault_auth.key != expected_vault_auth {
         return Err(StakeError::InvalidPda.into());
     }
@@ -211,7 +214,12 @@ fn process_init_pool(
             collateral_mint.key,
             vault_auth.key,
         )?,
-        &[vault.clone(), collateral_mint.clone(), vault_auth.clone(), rent_sysvar.clone()],
+        &[
+            vault.clone(),
+            collateral_mint.clone(),
+            vault_auth.clone(),
+            rent_sysvar.clone(),
+        ],
         &[vault_auth_seeds],
     )?;
 
@@ -238,7 +246,10 @@ fn process_init_pool(
     pool.percolator_program = percolator_program.key.to_bytes();
     pool.set_discriminator();
 
-    msg!("StakePool initialized for slab {} (admin transfer pending)", slab.key);
+    msg!(
+        "StakePool initialized for slab {} (admin transfer pending)",
+        slab.key
+    );
     Ok(())
 }
 
@@ -246,11 +257,7 @@ fn process_init_pool(
 // 1: Deposit
 // ═══════════════════════════════════════════════════════════════
 
-fn process_deposit(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    amount: u64,
-) -> ProgramResult {
+fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
     if amount == 0 {
         return Err(StakeError::ZeroAmount.into());
     }
@@ -315,7 +322,8 @@ fn process_deposit(
     // (H6 fix)
     if pool.deposit_cap > 0 {
         let current_value = pool.total_pool_value().unwrap_or(0);
-        let new_value = current_value.checked_add(amount)
+        let new_value = current_value
+            .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
         if new_value > pool.deposit_cap {
             return Err(StakeError::DepositCapExceeded.into());
@@ -327,7 +335,8 @@ fn process_deposit(
     verify_token_program(token_program)?;
 
     // Calculate LP tokens to mint
-    let lp_to_mint = pool.calc_lp_for_deposit(amount)
+    let lp_to_mint = pool
+        .calc_lp_for_deposit(amount)
         .ok_or(StakeError::Overflow)?;
     if lp_to_mint == 0 {
         return Err(StakeError::ZeroAmount.into());
@@ -343,7 +352,12 @@ fn process_deposit(
             &[],
             amount,
         )?,
-        &[user_ata.clone(), vault.clone(), user.clone(), token_program.clone()],
+        &[
+            user_ata.clone(),
+            vault.clone(),
+            user.clone(),
+            token_program.clone(),
+        ],
     )?;
 
     // Mint LP tokens to user
@@ -359,33 +373,44 @@ fn process_deposit(
             &[],
             lp_to_mint,
         )?,
-        &[lp_mint.clone(), user_lp_ata.clone(), vault_auth.clone(), token_program.clone()],
+        &[
+            lp_mint.clone(),
+            user_lp_ata.clone(),
+            vault_auth.clone(),
+            token_program.clone(),
+        ],
         &[vault_auth_seeds],
     )?;
 
     // Update pool totals
-    pool.total_deposited = pool.total_deposited.checked_add(amount)
+    pool.total_deposited = pool
+        .total_deposited
+        .checked_add(amount)
         .ok_or(StakeError::Overflow)?;
-    pool.total_lp_supply = pool.total_lp_supply.checked_add(lp_to_mint)
+    pool.total_lp_supply = pool
+        .total_lp_supply
+        .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
 
     // Create or update per-user deposit PDA (cooldown tracking)
     let clock = Clock::from_account_info(clock_sysvar)?;
-    let (expected_deposit_pda, deposit_bump) = state::derive_deposit_pda(program_id, pool_pda.key, user.key);
+    let (expected_deposit_pda, deposit_bump) =
+        state::derive_deposit_pda(program_id, pool_pda.key, user.key);
     if *deposit_pda.key != expected_deposit_pda {
         return Err(StakeError::InvalidPda.into());
     }
 
     // I4: Verify deposit PDA ownership for existing accounts
-    if !deposit_pda.data_is_empty() {
-        if *deposit_pda.owner != *program_id {
-            return Err(StakeError::InvalidAccount.into());
-        }
+    if !deposit_pda.data_is_empty() && *deposit_pda.owner != *program_id {
+        return Err(StakeError::InvalidAccount.into());
     }
 
     if deposit_pda.data_is_empty() {
         let deposit_seeds: &[&[u8]] = &[
-            b"stake_deposit", pool_pda.key.as_ref(), user.key.as_ref(), &[deposit_bump],
+            b"stake_deposit",
+            pool_pda.key.as_ref(),
+            user.key.as_ref(),
+            &[deposit_bump],
         ];
         let rent = Rent::get()?;
         invoke_signed(
@@ -402,7 +427,8 @@ fn process_deposit(
     }
 
     let mut deposit_data = deposit_pda.try_borrow_mut_data()?;
-    let deposit: &mut StakeDeposit = bytemuck::from_bytes_mut(&mut deposit_data[..STAKE_DEPOSIT_SIZE]);
+    let deposit: &mut StakeDeposit =
+        bytemuck::from_bytes_mut(&mut deposit_data[..STAKE_DEPOSIT_SIZE]);
 
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
@@ -412,10 +438,16 @@ fn process_deposit(
     deposit.pool = pool_pda.key.to_bytes();
     deposit.user = user.key.to_bytes();
     deposit.last_deposit_slot = clock.slot;
-    deposit.lp_amount = deposit.lp_amount.checked_add(lp_to_mint)
+    deposit.lp_amount = deposit
+        .lp_amount
+        .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
 
-    msg!("Deposited {} collateral, minted {} LP tokens", amount, lp_to_mint);
+    msg!(
+        "Deposited {} collateral, minted {} LP tokens",
+        amount,
+        lp_to_mint
+    );
     Ok(())
 }
 
@@ -485,7 +517,11 @@ fn process_withdraw(
     {
         return Err(StakeError::Unauthorized.into());
     }
-    if clock.slot < deposit.last_deposit_slot.saturating_add(pool.cooldown_slots) {
+    if clock.slot
+        < deposit
+            .last_deposit_slot
+            .saturating_add(pool.cooldown_slots)
+    {
         return Err(StakeError::CooldownNotElapsed.into());
     }
     if lp_amount > deposit.lp_amount {
@@ -494,7 +530,8 @@ fn process_withdraw(
     drop(deposit_data_ref);
 
     // Calculate collateral to return (proportional to LP burned)
-    let collateral_amount = pool.calc_collateral_for_withdraw(lp_amount)
+    let collateral_amount = pool
+        .calc_collateral_for_withdraw(lp_amount)
         .ok_or(StakeError::Overflow)?;
     if collateral_amount == 0 {
         return Err(StakeError::ZeroAmount.into());
@@ -510,7 +547,12 @@ fn process_withdraw(
             &[],
             lp_amount,
         )?,
-        &[user_lp_ata.clone(), lp_mint.clone(), user.clone(), token_program.clone()],
+        &[
+            user_lp_ata.clone(),
+            lp_mint.clone(),
+            user.clone(),
+            token_program.clone(),
+        ],
     )?;
 
     // Transfer collateral: vault → user ATA
@@ -526,23 +568,39 @@ fn process_withdraw(
             &[],
             collateral_amount,
         )?,
-        &[vault.clone(), user_ata.clone(), vault_auth.clone(), token_program.clone()],
+        &[
+            vault.clone(),
+            user_ata.clone(),
+            vault_auth.clone(),
+            token_program.clone(),
+        ],
         &[vault_auth_seeds],
     )?;
 
     // Update pool totals
-    pool.total_withdrawn = pool.total_withdrawn.checked_add(collateral_amount)
+    pool.total_withdrawn = pool
+        .total_withdrawn
+        .checked_add(collateral_amount)
         .ok_or(StakeError::Overflow)?;
-    pool.total_lp_supply = pool.total_lp_supply.checked_sub(lp_amount)
+    pool.total_lp_supply = pool
+        .total_lp_supply
+        .checked_sub(lp_amount)
         .ok_or(StakeError::Overflow)?;
 
     // Update deposit PDA
     let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
-    let deposit_mut: &mut StakeDeposit = bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
-    deposit_mut.lp_amount = deposit_mut.lp_amount.checked_sub(lp_amount)
+    let deposit_mut: &mut StakeDeposit =
+        bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
+    deposit_mut.lp_amount = deposit_mut
+        .lp_amount
+        .checked_sub(lp_amount)
         .ok_or(StakeError::InsufficientLpTokens)?;
 
-    msg!("Withdrew {} collateral, burned {} LP tokens", collateral_amount, lp_amount);
+    msg!(
+        "Withdrew {} collateral, burned {} LP tokens",
+        collateral_amount,
+        lp_amount
+    );
     Ok(())
 }
 
@@ -603,7 +661,8 @@ fn process_flush_to_insurance(
     // Verify vault balance — can't flush more than what's available in vault
     // Available = total_deposited - total_withdrawn - total_flushed
     // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
-    let available = pool.total_deposited
+    let available = pool
+        .total_deposited
         .checked_sub(pool.total_withdrawn)
         .and_then(|v| v.checked_sub(pool.total_flushed))
         .ok_or(StakeError::Overflow)?;
@@ -612,7 +671,8 @@ fn process_flush_to_insurance(
     }
 
     // Derive vault authority for signing
-    let (expected_vault_auth, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
         return Err(StakeError::InvalidPda.into());
     }
@@ -624,20 +684,25 @@ fn process_flush_to_insurance(
     // Our vault's owner (in SPL token terms) = vault_auth PDA = signer. ✓
     cpi::cpi_top_up_insurance(
         percolator_program,
-        vault_auth,          // signer (PDA, we invoke_signed)
+        vault_auth, // signer (PDA, we invoke_signed)
         slab,
-        vault,               // signer_ata (owned by vault_auth PDA)
-        wrapper_vault,       // percolator vault
+        vault,         // signer_ata (owned by vault_auth PDA)
+        wrapper_vault, // percolator vault
         token_program,
         amount,
         vault_auth_seeds,
     )?;
 
     // Update pool tracking
-    pool.total_flushed = pool.total_flushed.checked_add(amount)
+    pool.total_flushed = pool
+        .total_flushed
+        .checked_add(amount)
         .ok_or(StakeError::Overflow)?;
 
-    msg!("Flushed {} collateral to percolator insurance via CPI", amount);
+    msg!(
+        "Flushed {} collateral to percolator insurance via CPI",
+        amount
+    );
     Ok(())
 }
 
@@ -685,10 +750,7 @@ fn process_update_config(
 // 5: TransferAdmin — one-time setup, transfers wrapper admin to pool PDA
 // ═══════════════════════════════════════════════════════════════
 
-fn process_transfer_admin(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-) -> ProgramResult {
+fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
     let current_admin = next_account_info(accounts_iter)?; // Human (current wrapper admin)
@@ -830,13 +892,7 @@ fn process_admin_set_maintenance_fee(
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
-    cpi::cpi_set_maintenance_fee(
-        percolator_program,
-        pool_pda,
-        slab,
-        new_fee,
-        admin_seeds,
-    )?;
+    cpi::cpi_set_maintenance_fee(percolator_program, pool_pda, slab, new_fee, admin_seeds)?;
 
     msg!("SetMaintenanceFee forwarded via CPI");
     Ok(())
@@ -846,10 +902,7 @@ fn process_admin_set_maintenance_fee(
 // 9: AdminResolveMarket
 // ═══════════════════════════════════════════════════════════════
 
-fn process_admin_resolve_market(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-) -> ProgramResult {
+fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
     let admin = next_account_info(accounts_iter)?;
@@ -860,12 +913,7 @@ fn process_admin_resolve_market(
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
-    cpi::cpi_resolve_market(
-        percolator_program,
-        pool_pda,
-        slab,
-        admin_seeds,
-    )?;
+    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
 
     // I7: Set resolved flag to block future deposits
     {
@@ -892,8 +940,8 @@ fn process_admin_withdraw_insurance(
     let admin = next_account_info(accounts_iter)?;
     let pool_pda = next_account_info(accounts_iter)?;
     let slab = next_account_info(accounts_iter)?;
-    let vault_auth = next_account_info(accounts_iter)?;    // vault_auth PDA (signer for CPI)
-    let stake_vault = next_account_info(accounts_iter)?;   // receives insurance (owned by vault_auth ✓)
+    let vault_auth = next_account_info(accounts_iter)?; // vault_auth PDA (signer for CPI)
+    let stake_vault = next_account_info(accounts_iter)?; // receives insurance (owned by vault_auth ✓)
     let wrapper_vault = next_account_info(accounts_iter)?; // wrapper insurance vault
     let wrapper_vault_pda = next_account_info(accounts_iter)?; // wrapper's vault authority PDA
     let percolator_program = next_account_info(accounts_iter)?;
@@ -906,10 +954,8 @@ fn process_admin_withdraw_insurance(
 
     // Derive vault_auth PDA and its seeds
     // vault_auth = PDA([b"vault_auth", pool_pda])
-    let (expected_vault_auth, vault_auth_bump) = Pubkey::find_program_address(
-        &[b"vault_auth", pool_pda.key.as_ref()],
-        program_id,
-    );
+    let (expected_vault_auth, vault_auth_bump) =
+        Pubkey::find_program_address(&[b"vault_auth", pool_pda.key.as_ref()], program_id);
     if vault_auth.key != &expected_vault_auth {
         return Err(solana_program::program_error::ProgramError::InvalidArgument);
     }
@@ -938,11 +984,16 @@ fn process_admin_withdraw_insurance(
     {
         let mut pool_data = pool_pda.try_borrow_mut_data()?;
         let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-        pool.total_returned = pool.total_returned.checked_add(amount)
+        pool.total_returned = pool
+            .total_returned
+            .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
     }
 
-    msg!("Insurance {} tokens withdrawn from wrapper to stake_vault via vault_auth CPI", amount);
+    msg!(
+        "Insurance {} tokens withdrawn from wrapper to stake_vault via vault_auth CPI",
+        amount
+    );
     Ok(())
 }
 

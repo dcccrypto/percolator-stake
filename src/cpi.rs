@@ -2,6 +2,7 @@
 //!
 //! We construct raw instruction data manually since we don't depend on percolator-prog.
 //! Instruction tags match the wrapper's Instruction::decode() in percolator.rs.
+#![allow(clippy::too_many_arguments)]
 
 use solana_program::{
     account_info::AccountInfo,
@@ -47,9 +48,9 @@ const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
 
 pub fn cpi_top_up_insurance<'a>(
     percolator_program: &AccountInfo<'a>,
-    signer: &AccountInfo<'a>,       // vault_auth PDA (we sign)
+    signer: &AccountInfo<'a>, // vault_auth PDA (we sign)
     slab: &AccountInfo<'a>,
-    signer_ata: &AccountInfo<'a>,    // stake vault (owned by vault_auth)
+    signer_ata: &AccountInfo<'a>, // stake vault (owned by vault_auth)
     wrapper_vault: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
     amount: u64,
@@ -111,10 +112,7 @@ pub fn cpi_update_admin<'a>(
     };
 
     // No invoke_signed — current admin (human) is the signer of the outer tx
-    solana_program::program::invoke(
-        &ix,
-        &[current_admin.clone(), slab.clone()],
-    )
+    solana_program::program::invoke(&ix, &[current_admin.clone(), slab.clone()])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -143,11 +141,7 @@ pub fn cpi_set_oracle_authority<'a>(
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[admin_pda.clone(), slab.clone()],
-        &[admin_seeds],
-    )
+    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -176,11 +170,7 @@ pub fn cpi_set_risk_threshold<'a>(
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[admin_pda.clone(), slab.clone()],
-        &[admin_seeds],
-    )
+    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -209,11 +199,7 @@ pub fn cpi_set_maintenance_fee<'a>(
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[admin_pda.clone(), slab.clone()],
-        &[admin_seeds],
-    )
+    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -242,11 +228,7 @@ pub fn cpi_set_oracle_price_cap<'a>(
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[admin_pda.clone(), slab.clone()],
-        &[admin_seeds],
-    )
+    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -272,11 +254,7 @@ pub fn cpi_resolve_market<'a>(
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[admin_pda.clone(), slab.clone()],
-        &[admin_seeds],
-    )
+    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -289,7 +267,7 @@ pub fn cpi_withdraw_insurance<'a>(
     percolator_program: &AccountInfo<'a>,
     admin_pda: &AccountInfo<'a>,
     slab: &AccountInfo<'a>,
-    admin_ata: &AccountInfo<'a>,     // ATA owned by admin PDA to receive insurance
+    admin_ata: &AccountInfo<'a>, // ATA owned by admin PDA to receive insurance
     wrapper_vault: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
     vault_authority: &AccountInfo<'a>, // wrapper's vault authority PDA
@@ -356,11 +334,7 @@ pub fn cpi_set_insurance_withdraw_policy<'a>(
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[admin_pda.clone(), slab.clone()],
-        &[admin_seeds],
-    )
+    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -375,15 +349,15 @@ pub fn cpi_set_insurance_withdraw_policy<'a>(
 // so vault_auth signs here and stake_vault (owned by vault_auth) is authority_ata.
 pub fn cpi_withdraw_insurance_limited<'a>(
     percolator_program: &AccountInfo<'a>,
-    vault_auth: &AccountInfo<'a>,        // policy authority (signer via PDA seeds)
+    vault_auth: &AccountInfo<'a>, // policy authority (signer via PDA seeds)
     slab: &AccountInfo<'a>,
-    stake_vault: &AccountInfo<'a>,       // authority_ata — owned by vault_auth ✓
-    wrapper_vault: &AccountInfo<'a>,     // insurance vault (writable)
+    stake_vault: &AccountInfo<'a>, // authority_ata — owned by vault_auth ✓
+    wrapper_vault: &AccountInfo<'a>, // insurance vault (writable)
     token_program: &AccountInfo<'a>,
     wrapper_vault_pda: &AccountInfo<'a>, // wrapper's vault PDA authority
     clock: &AccountInfo<'a>,
     amount: u64,
-    vault_auth_seeds: &[&[u8]],          // [b"vault_auth", pool_pda_key, bump_byte]
+    vault_auth_seeds: &[&[u8]], // [b"vault_auth", pool_pda_key, bump_byte]
 ) -> ProgramResult {
     let mut data = Vec::with_capacity(9);
     data.push(TAG_WITHDRAW_INSURANCE_LIMITED);
@@ -392,10 +366,10 @@ pub fn cpi_withdraw_insurance_limited<'a>(
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*vault_auth.key, true),    // authority (signer via PDA)
-            AccountMeta::new(*slab.key, false),                  // slab (writable, NOT signer)
-            AccountMeta::new(*stake_vault.key, false),           // authority_ata (writable, NOT signer)
-            AccountMeta::new(*wrapper_vault.key, false),         // insurance vault (writable, NOT signer)
+            AccountMeta::new_readonly(*vault_auth.key, true), // authority (signer via PDA)
+            AccountMeta::new(*slab.key, false),               // slab (writable, NOT signer)
+            AccountMeta::new(*stake_vault.key, false), // authority_ata (writable, NOT signer)
+            AccountMeta::new(*wrapper_vault.key, false), // insurance vault (writable, NOT signer)
             AccountMeta::new_readonly(*token_program.key, false),
             AccountMeta::new_readonly(*wrapper_vault_pda.key, false),
             AccountMeta::new_readonly(*clock.key, false),

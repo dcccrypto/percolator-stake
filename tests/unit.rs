@@ -1,8 +1,8 @@
 //! Unit tests for percolator-stake LP math, state, and instruction decoding.
 
 use bytemuck::Zeroable;
-use percolator_stake::state::{StakePool, StakeDeposit, STAKE_POOL_SIZE, STAKE_DEPOSIT_SIZE};
 use percolator_stake::instruction::StakeInstruction;
+use percolator_stake::state::{StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
 
 // ═══════════════════════════════════════════════════════════════
 // Helper: create a zeroed StakePool with basic fields set
@@ -120,7 +120,10 @@ fn test_rounding_favors_pool() {
 
     // Deposit 1 unit: 1 * 999_999 / 1_000_000 = 0 (rounds down)
     let lp = pool.calc_lp_for_deposit(1).unwrap();
-    assert_eq!(lp, 0, "Tiny deposit should round down to 0 LP (pool-favoring)");
+    assert_eq!(
+        lp, 0,
+        "Tiny deposit should round down to 0 LP (pool-favoring)"
+    );
 }
 
 #[test]
@@ -192,8 +195,10 @@ fn test_pool_value_underflow_returns_zero() {
 
     // checked_sub returns None on underflow — which is correct behavior
     // (this state is invalid, so None signals an error)
-    assert!(pool.total_pool_value().is_none(),
-        "Over-withdrawn pool should return None (invalid state)");
+    assert!(
+        pool.total_pool_value().is_none(),
+        "Over-withdrawn pool should return None (invalid state)"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -208,7 +213,8 @@ fn test_flush_available_calculation() {
     pool.total_flushed = 3_000_000;
 
     // Available for flush = deposited - withdrawn - flushed
-    let available = pool.total_deposited
+    let available = pool
+        .total_deposited
         .saturating_sub(pool.total_withdrawn)
         .saturating_sub(pool.total_flushed);
     assert_eq!(available, 5_000_000);
@@ -221,7 +227,8 @@ fn test_flush_available_zero_when_fully_flushed() {
     pool.total_withdrawn = 0;
     pool.total_flushed = 10_000_000;
 
-    let available = pool.total_deposited
+    let available = pool
+        .total_deposited
         .saturating_sub(pool.total_withdrawn)
         .saturating_sub(pool.total_flushed);
     assert_eq!(available, 0);
@@ -245,7 +252,10 @@ fn test_deposit_withdraw_conservation() {
     let collateral_back = pool.calc_collateral_for_withdraw(lp).unwrap();
 
     // Should get back exactly what was deposited (first depositor, 1:1)
-    assert_eq!(collateral_back, deposit_amount, "First depositor should get exact amount back");
+    assert_eq!(
+        collateral_back, deposit_amount,
+        "First depositor should get exact amount back"
+    );
 }
 
 #[test]
@@ -300,7 +310,9 @@ fn test_three_depositors_fairness() {
         assert!(
             back >= amounts[i] - 1 && back <= amounts[i] + 1,
             "Depositor {} deposited {} but would get back {}",
-            i, amounts[i], back
+            i,
+            amounts[i],
+            back
         );
     }
 }
@@ -331,8 +343,8 @@ fn test_stake_deposit_size() {
 
 #[test]
 fn test_pda_derivation_deterministic() {
+    use percolator_stake::state::{derive_deposit_pda, derive_pool_pda, derive_vault_authority};
     use solana_program::pubkey::Pubkey;
-    use percolator_stake::state::{derive_pool_pda, derive_vault_authority, derive_deposit_pda};
 
     let program_id = Pubkey::new_unique();
     let slab = Pubkey::new_unique();
@@ -356,8 +368,8 @@ fn test_pda_derivation_deterministic() {
 
 #[test]
 fn test_different_slabs_different_pools() {
-    use solana_program::pubkey::Pubkey;
     use percolator_stake::state::derive_pool_pda;
+    use solana_program::pubkey::Pubkey;
 
     let program_id = Pubkey::new_unique();
     let slab_a = Pubkey::new_unique();
@@ -365,13 +377,16 @@ fn test_different_slabs_different_pools() {
 
     let (pool_a, _) = derive_pool_pda(&program_id, &slab_a);
     let (pool_b, _) = derive_pool_pda(&program_id, &slab_b);
-    assert_ne!(pool_a, pool_b, "Different slabs must have different pool PDAs");
+    assert_ne!(
+        pool_a, pool_b,
+        "Different slabs must have different pool PDAs"
+    );
 }
 
 #[test]
 fn test_different_users_different_deposits() {
+    use percolator_stake::state::{derive_deposit_pda, derive_pool_pda};
     use solana_program::pubkey::Pubkey;
-    use percolator_stake::state::{derive_pool_pda, derive_deposit_pda};
 
     let program_id = Pubkey::new_unique();
     let slab = Pubkey::new_unique();
@@ -382,7 +397,10 @@ fn test_different_users_different_deposits() {
 
     let (dep_a, _) = derive_deposit_pda(&program_id, &pool, &user_a);
     let (dep_b, _) = derive_deposit_pda(&program_id, &pool, &user_b);
-    assert_ne!(dep_a, dep_b, "Different users must have different deposit PDAs");
+    assert_ne!(
+        dep_a, dep_b,
+        "Different users must have different deposit PDAs"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -397,7 +415,10 @@ fn test_decode_init_pool() {
 
     let ix = StakeInstruction::unpack(&data).unwrap();
     match ix {
-        StakeInstruction::InitPool { cooldown_slots, deposit_cap } => {
+        StakeInstruction::InitPool {
+            cooldown_slots,
+            deposit_cap,
+        } => {
             assert_eq!(cooldown_slots, 100);
             assert_eq!(deposit_cap, 5_000_000);
         }
@@ -451,7 +472,10 @@ fn test_decode_update_config_both() {
 
     let ix = StakeInstruction::unpack(&data).unwrap();
     match ix {
-        StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
+        StakeInstruction::UpdateConfig {
+            new_cooldown_slots,
+            new_deposit_cap,
+        } => {
             assert_eq!(new_cooldown_slots, Some(200));
             assert_eq!(new_deposit_cap, Some(10_000_000));
         }
@@ -469,7 +493,10 @@ fn test_decode_update_config_none() {
 
     let ix = StakeInstruction::unpack(&data).unwrap();
     match ix {
-        StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
+        StakeInstruction::UpdateConfig {
+            new_cooldown_slots,
+            new_deposit_cap,
+        } => {
             assert_eq!(new_cooldown_slots, None);
             assert_eq!(new_deposit_cap, None);
         }
@@ -496,7 +523,10 @@ fn test_decode_admin_withdraw_insurance() {
     let mut data = vec![10u8];
     data.extend_from_slice(&5_000_000u64.to_le_bytes()); // amount = 5M tokens
     let ix = StakeInstruction::unpack(&data).unwrap();
-    assert!(matches!(ix, StakeInstruction::AdminWithdrawInsurance { amount: 5_000_000 }));
+    assert!(matches!(
+        ix,
+        StakeInstruction::AdminWithdrawInsurance { amount: 5_000_000 }
+    ));
 }
 
 #[test]
@@ -546,7 +576,9 @@ fn test_multiple_cycles_conservation() {
 
         // Deposit
         let lp = pool.calc_lp_for_deposit(amount).unwrap();
-        if lp == 0 { continue; } // Skip if rounding kills it
+        if lp == 0 {
+            continue;
+        } // Skip if rounding kills it
         pool.total_deposited += amount;
         pool.total_lp_supply += lp;
         total_in += amount;
@@ -559,7 +591,16 @@ fn test_multiple_cycles_conservation() {
     }
 
     // Conservation: total out ≤ total in (rounding favors pool)
-    assert!(total_out <= total_in, "total_out={} > total_in={}", total_out, total_in);
+    assert!(
+        total_out <= total_in,
+        "total_out={} > total_in={}",
+        total_out,
+        total_in
+    );
     // Rounding dust should be tiny
-    assert!(total_in - total_out <= 10, "Too much rounding dust: {}", total_in - total_out);
+    assert!(
+        total_in - total_out <= 10,
+        "Too much rounding dust: {}",
+        total_in - total_out
+    );
 }

@@ -144,6 +144,7 @@ pub enum StakeInstruction {
     ///   6. `[]` Wrapper vault authority PDA
     ///   7. `[]` Percolator program
     ///   8. `[]` Token program
+    ///
     /// 10: AdminWithdrawInsurance — CPIs WithdrawInsuranceLimited (wrapper Tag 31) via vault_auth PDA.
     /// Requires market RESOLVED and SetInsuranceWithdrawPolicy (wrapper Tag 30) called with vault_auth as authority.
     AdminWithdrawInsurance { amount: u64 },
@@ -165,7 +166,9 @@ pub enum StakeInstruction {
 
 impl StakeInstruction {
     pub fn unpack(data: &[u8]) -> Result<Self, ProgramError> {
-        let (&tag, rest) = data.split_first().ok_or(ProgramError::InvalidInstructionData)?;
+        let (&tag, rest) = data
+            .split_first()
+            .ok_or(ProgramError::InvalidInstructionData)?;
 
         match tag {
             0 => {
@@ -175,7 +178,10 @@ impl StakeInstruction {
                 }
                 let cooldown_slots = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                 let deposit_cap = u64::from_le_bytes(rest[8..16].try_into().unwrap());
-                Ok(Self::InitPool { cooldown_slots, deposit_cap })
+                Ok(Self::InitPool {
+                    cooldown_slots,
+                    deposit_cap,
+                })
             }
             1 => {
                 if rest.len() < 8 {
@@ -267,10 +273,12 @@ impl StakeInstruction {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn pack_u64(v: u64) -> Vec<u8> {
         v.to_le_bytes().to_vec()
     }
 
+    #[allow(dead_code)]
     fn pack_u128(v: u128) -> Vec<u8> {
         v.to_le_bytes().to_vec()
     }
@@ -283,7 +291,10 @@ mod tests {
         data.extend_from_slice(&100u64.to_le_bytes()); // cooldown
         data.extend_from_slice(&5000u64.to_le_bytes()); // cap
         match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::InitPool { cooldown_slots, deposit_cap } => {
+            StakeInstruction::InitPool {
+                cooldown_slots,
+                deposit_cap,
+            } => {
                 assert_eq!(cooldown_slots, 100);
                 assert_eq!(deposit_cap, 5000);
             }
@@ -343,7 +354,10 @@ mod tests {
         data.push(1); // has_cap
         data.extend_from_slice(&1000u64.to_le_bytes());
         match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
+            StakeInstruction::UpdateConfig {
+                new_cooldown_slots,
+                new_deposit_cap,
+            } => {
                 assert_eq!(new_cooldown_slots, Some(200));
                 assert_eq!(new_deposit_cap, Some(1000));
             }
@@ -359,7 +373,10 @@ mod tests {
         data.push(0); // no cap
         data.extend_from_slice(&0u64.to_le_bytes());
         match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::UpdateConfig { new_cooldown_slots, new_deposit_cap } => {
+            StakeInstruction::UpdateConfig {
+                new_cooldown_slots,
+                new_deposit_cap,
+            } => {
                 assert_eq!(new_cooldown_slots, None);
                 assert_eq!(new_deposit_cap, None);
             }
