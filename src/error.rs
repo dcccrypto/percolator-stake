@@ -37,6 +37,8 @@ pub enum StakeError {
     CpiFailed = 15,
     /// Invalid account ownership
     InvalidAccount = 16,
+    /// Pool mode mismatch (e.g., AccrueFees on insurance pool)
+    InvalidPoolMode = 17,
 }
 
 impl From<StakeError> for ProgramError {

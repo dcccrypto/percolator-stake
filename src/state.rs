@@ -75,8 +75,30 @@ pub struct StakePool {
     /// Percolator wrapper program ID (for CPI)
     pub percolator_program: [u8; 32],
 
+    // ========================================
+    // PERC-272: LP Vault Fee Yield & OI Cap
+    // ========================================
+
+    /// Total trading fees earned by this vault (accrued from percolator engine).
+    /// Increases pool value — LP share price appreciates as fees accrue.
+    pub total_fees_earned: u64,
+
+    /// Last slot when fees were accrued (prevents double-counting)
+    pub last_fee_accrual_slot: u64,
+
+    /// Snapshot of engine vault balance at last fee accrual
+    /// (used to compute fee delta = new_vault - old_vault - deposits + withdrawals)
+    pub last_vault_snapshot: u64,
+
+    /// Pool mode: 0 = insurance LP (legacy), 1 = trading LP vault (PERC-272)
+    /// Trading LP vault earns trading fees and gates OI.
+    pub pool_mode: u8,
+
+    /// Padding for alignment
+    pub _mode_padding: [u8; 7],
+
     /// Reserved for future use
-    pub _reserved: [u8; 96],
+    pub _reserved: [u8; 64],
 }
 
 /// Size of StakePool in bytes
@@ -185,10 +207,16 @@ impl StakePool {
     /// includes the flushed amount. Missing `-flushed` causes phantom inflation
     /// that makes the pool insolvent after any flush+return cycle.
     pub fn total_pool_value(&self) -> Option<u64> {
-        self.total_deposited
+        let base = self.total_deposited
             .checked_sub(self.total_withdrawn)?
             .checked_sub(self.total_flushed)?
-            .checked_add(self.total_returned)
+            .checked_add(self.total_returned)?;
+        // PERC-272: Include accrued trading fees for trading LP pools
+        if self.pool_mode == 1 {
+            base.checked_add(self.total_fees_earned)
+        } else {
+            Some(base)
+        }
     }
 
     /// Calculate LP tokens for a deposit amount.

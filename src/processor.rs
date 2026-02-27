@@ -22,6 +22,8 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+use solana_program::program_pack::Pack;
+
 use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
@@ -79,6 +81,11 @@ pub fn process(
             max_withdraw_bps,
             cooldown_slots,
         ),
+        StakeInstruction::AccrueFees => process_accrue_fees(program_id, accounts),
+        StakeInstruction::InitTradingPool {
+            cooldown_slots,
+            deposit_cap,
+        } => process_init_trading_pool(program_id, accounts, cooldown_slots, deposit_cap),
     }
 }
 
@@ -1031,5 +1038,93 @@ fn process_admin_set_insurance_policy(
     )?;
 
     msg!("SetInsuranceWithdrawPolicy forwarded via CPI");
+    Ok(())
+}
+
+// ============================================================================
+// PERC-272: LP Vault — Fee Accrual & Trading Pool Init
+// ============================================================================
+
+/// Accrue trading fees from the percolator engine to the LP vault.
+/// Permissionless: reads vault token account balance and updates pool state.
+///
+/// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
+/// To keep it simple and trustless: we track the vault token account balance directly.
+/// Any increase in vault balance beyond deposits is fee revenue.
+fn process_accrue_fees(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let _caller = next_account_info(accounts_iter)?; // signer, permissionless
+    let pool_ai = next_account_info(accounts_iter)?;
+    let vault_ai = next_account_info(accounts_iter)?;
+    let clock_ai = next_account_info(accounts_iter)?;
+
+    // Validate pool PDA
+    let mut pool_data = pool_ai.try_borrow_mut_data()?;
+    let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if pool.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Only trading LP mode pools accrue fees
+    if pool.pool_mode != 1 {
+        msg!("AccrueFees: pool is not in trading LP mode");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+
+    // Read vault token account balance
+    let vault_data = vault_ai.try_borrow_data()?;
+    let vault_state = spl_token::state::Account::unpack(&vault_data)?;
+    let current_balance = vault_state.amount;
+
+    // Verify vault matches pool
+    if vault_ai.key.to_bytes() != pool.vault {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let clock = Clock::from_account_info(clock_ai)?;
+
+    // Compute fee delta: any balance increase beyond what was deposited (net of withdrawals)
+    // pool_value = total_deposited - total_withdrawn + total_fees_earned
+    // If current_balance > pool_value, the difference is new fees
+    let pool_value = pool.total_deposited
+        .saturating_sub(pool.total_withdrawn)
+        .saturating_add(pool.total_fees_earned);
+
+    if current_balance > pool_value {
+        let fee_delta = current_balance - pool_value;
+        pool.total_fees_earned = pool.total_fees_earned.saturating_add(fee_delta);
+        msg!("AccrueFees: accrued {} fees, total_fees_earned={}", fee_delta, pool.total_fees_earned);
+    }
+
+    pool.last_fee_accrual_slot = clock.slot;
+    pool.last_vault_snapshot = current_balance;
+
+    Ok(())
+}
+
+/// Initialize a pool in trading LP vault mode (PERC-272).
+/// Same mechanics as InitPool but sets pool_mode = 1.
+fn process_init_trading_pool(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cooldown_slots: u64,
+    deposit_cap: u64,
+) -> ProgramResult {
+    // Reuse InitPool logic
+    process_init_pool(program_id, accounts, cooldown_slots, deposit_cap)?;
+
+    // Now update pool_mode to 1 (trading LP)
+    let pool_ai = &accounts[2]; // Pool PDA is account [2] in InitPool
+    let mut pool_data = pool_ai.try_borrow_mut_data()?;
+    let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    pool.pool_mode = 1;
+
+    msg!("InitTradingPool: pool_mode set to 1 (trading LP vault)");
     Ok(())
 }

@@ -127,5 +127,5 @@ fn test_stake_pool_field_offsets() {
     assert_eq!(&pool.total_returned as *const _ as usize - base, 208);
     assert_eq!(&pool.total_withdrawn as *const _ as usize - base, 216);
     assert_eq!(&pool.percolator_program as *const _ as usize - base, 224);
-    assert_eq!(&pool._reserved as *const _ as usize - base, 256);
+    assert_eq!(&pool._reserved as *const _ as usize - base, 288);
 }

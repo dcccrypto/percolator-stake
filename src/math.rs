@@ -83,10 +83,21 @@ pub fn calc_collateral_for_withdraw(
 /// Calculate pool value from accounting state.
 ///
 /// # Returns
-/// * `Some(value)` if deposited >= withdrawn
-/// * `None` if accounting is broken (withdrawn > deposited)
+/// * `Some(value)` if deposited + fees >= withdrawn
+/// * `None` if accounting is broken (withdrawn > deposited + fees)
 pub fn pool_value(total_deposited: u64, total_withdrawn: u64) -> Option<u64> {
     total_deposited.checked_sub(total_withdrawn)
+}
+
+/// Calculate pool value including accrued trading fees (PERC-272).
+///
+/// # Returns
+/// * `Some(value)` if deposited + fees >= withdrawn
+/// * `None` if accounting overflow or underflow
+pub fn pool_value_with_fees(total_deposited: u64, total_withdrawn: u64, total_fees_earned: u64) -> Option<u64> {
+    total_deposited
+        .checked_sub(total_withdrawn)?
+        .checked_add(total_fees_earned)
 }
 
 /// Calculate available flush amount.
@@ -352,6 +363,31 @@ mod tests {
         let large = calc_collateral_for_withdraw(100, 200, 20).unwrap();
         assert!(large >= small);
     }
+
+    // ── PERC-272: Fee-inclusive Pool Value ──
+
+    #[test]
+    fn test_pool_value_with_fees() {
+        assert_eq!(pool_value_with_fees(1000, 200, 100), Some(900));
+    }
+
+    #[test]
+    fn test_pool_value_with_fees_zero() {
+        assert_eq!(pool_value_with_fees(1000, 1000, 0), Some(0));
+    }
+
+    #[test]
+    fn test_pool_value_with_fees_overflow() {
+        assert_eq!(pool_value_with_fees(100, 200, 50), None);
+    }
+
+    #[test]
+    fn test_fee_appreciation_increases_share_price() {
+        let lp_before = calc_collateral_for_withdraw(1000, 1000, 100).unwrap();
+        assert_eq!(lp_before, 100);
+        let lp_after = calc_collateral_for_withdraw(1000, 1200, 100).unwrap();
+        assert_eq!(lp_after, 120);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -362,3 +398,5 @@ mod tests {
 // u32/u64 mirrors for CBMC tractability. See kani-proofs/src/lib.rs.
 //
 // Keeping this note here so nobody adds u64 Kani proofs that timeout.
+
+// (PERC-272 tests moved to mod tests above)

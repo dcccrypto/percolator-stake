@@ -162,6 +162,26 @@ pub enum StakeInstruction {
         max_withdraw_bps: u16,
         cooldown_slots: u64,
     },
+
+    /// PERC-272: Accrue trading fees from percolator engine to LP vault.
+    /// Permissionless — anyone can trigger fee accrual.
+    /// Reads the vault token account balance and computes fee delta.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Caller (permissionless, just pays tx fee)
+    ///   1. `[writable]` Pool PDA (state updated: total_fees_earned, last_fee_accrual_slot)
+    ///   2. `[]` Pool vault token account (read balance)
+    ///   3. `[]` Clock sysvar
+    AccrueFees,
+
+    /// PERC-272: Initialize pool in trading LP mode.
+    /// Same as InitPool but sets pool_mode = 1 (trading LP vault).
+    ///
+    /// Accounts: same as InitPool
+    InitTradingPool {
+        cooldown_slots: u64,
+        deposit_cap: u64,
+    },
 }
 
 impl StakeInstruction {
@@ -262,6 +282,19 @@ impl StakeInstruction {
                     min_withdraw_base,
                     max_withdraw_bps,
                     cooldown_slots,
+                })
+            }
+            12 => Ok(Self::AccrueFees),
+            13 => {
+                // InitTradingPool: cooldown_slots(8) + deposit_cap(8)
+                if rest.len() < 16 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let cooldown_slots = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let deposit_cap = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+                Ok(Self::InitTradingPool {
+                    cooldown_slots,
+                    deposit_cap,
                 })
             }
             _ => Err(ProgramError::InvalidInstructionData),
