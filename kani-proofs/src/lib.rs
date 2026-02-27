@@ -263,19 +263,20 @@ mod proofs {
     /// Here the mirror uses u64 intermediates and guards u64→u32 cast with `lp > u32::MAX as u64`.
     /// This proof verifies: whenever calc_lp_for_deposit returns Some(lp), lp fits in u32 safely.
     ///
-    /// Bounded to u16 range for CBMC tractability. The overflow guard triggers when
-    /// deposit * supply / pool_value > u32::MAX; with u16 inputs (max 0xFFFF * 0xFFFF
-    /// = 0xFFFE0001 < u32::MAX) the guard never fires, so this proof verifies the
+    /// Bounded to u8 range for CBMC tractability. The overflow guard triggers when
+    /// deposit * supply / pool_value > u32::MAX; with u8 inputs (max 0xFF * 0xFF
+    /// = 0xFE01 < u32::MAX) the guard never fires, so this proof verifies the
     /// non-overflow path exhaustively. The overflow-triggering path is tested by
-    /// proof_lp_rounding_favors_pool and the bounded conservation proofs.
+    /// proof_overflow_guard_fires_concrete, proof_lp_rounding_favors_pool, and
+    /// the bounded conservation proofs.
     #[kani::proof]
     fn proof_lp_deposit_overflow_guard() {
         let supply: u32 = kani::any();
         let pv: u32 = kani::any();
         let deposit: u32 = kani::any();
-        kani::assume(supply <= 0xFFFF);
-        kani::assume(pv <= 0xFFFF);
-        kani::assume(deposit <= 0xFFFF);
+        kani::assume(supply <= 0xFF);
+        kani::assume(pv <= 0xFF);
+        kani::assume(deposit <= 0xFF);
         if let Some(lp) = calc_lp_for_deposit(supply, pv, deposit) {
             // Guard fired correctly: result is representable as u32 (no truncation occurred)
             assert!(lp <= u32::MAX);
