@@ -94,7 +94,11 @@ pub fn pool_value(total_deposited: u64, total_withdrawn: u64) -> Option<u64> {
 /// # Returns
 /// * `Some(value)` if deposited + fees >= withdrawn
 /// * `None` if accounting overflow or underflow
-pub fn pool_value_with_fees(total_deposited: u64, total_withdrawn: u64, total_fees_earned: u64) -> Option<u64> {
+pub fn pool_value_with_fees(
+    total_deposited: u64,
+    total_withdrawn: u64,
+    total_fees_earned: u64,
+) -> Option<u64> {
     total_deposited
         .checked_sub(total_withdrawn)?
         .checked_add(total_fees_earned)

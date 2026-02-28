@@ -78,7 +78,6 @@ pub struct StakePool {
     // ========================================
     // PERC-272: LP Vault Fee Yield & OI Cap
     // ========================================
-
     /// Total trading fees earned by this vault (accrued from percolator engine).
     /// Increases pool value — LP share price appreciates as fees accrue.
     pub total_fees_earned: u64,
@@ -209,7 +208,8 @@ impl StakePool {
     /// includes the flushed amount. Missing `-flushed` causes phantom inflation
     /// that makes the pool insolvent after any flush+return cycle.
     pub fn total_pool_value(&self) -> Option<u64> {
-        let base = self.total_deposited
+        let base = self
+            .total_deposited
             .checked_sub(self.total_withdrawn)?
             .checked_sub(self.total_flushed)?
             .checked_add(self.total_returned)?;

@@ -1051,10 +1051,7 @@ fn process_admin_set_insurance_policy(
 /// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
 /// To keep it simple and trustless: we track the vault token account balance directly.
 /// Any increase in vault balance beyond deposits is fee revenue.
-fn process_accrue_fees(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-) -> ProgramResult {
+fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
     if !caller.is_signer {
@@ -1096,7 +1093,8 @@ fn process_accrue_fees(
     // pool_value = total_deposited - total_withdrawn + total_fees_earned
     // If current_balance > pool_value, the difference is new fees
     // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
-    let pool_value = pool.total_deposited
+    let pool_value = pool
+        .total_deposited
         .checked_sub(pool.total_withdrawn)
         .ok_or(StakeError::Overflow)?
         .checked_add(pool.total_fees_earned)
@@ -1104,10 +1102,15 @@ fn process_accrue_fees(
 
     if current_balance > pool_value {
         let fee_delta = current_balance - pool_value;
-        pool.total_fees_earned = pool.total_fees_earned
+        pool.total_fees_earned = pool
+            .total_fees_earned
             .checked_add(fee_delta)
             .ok_or(StakeError::Overflow)?;
-        msg!("AccrueFees: accrued {} fees, total_fees_earned={}", fee_delta, pool.total_fees_earned);
+        msg!(
+            "AccrueFees: accrued {} fees, total_fees_earned={}",
+            fee_delta,
+            pool.total_fees_earned
+        );
     }
 
     pool.last_fee_accrual_slot = clock.slot;
