@@ -83,7 +83,9 @@ pub struct StakePool {
     /// Increases pool value — LP share price appreciates as fees accrue.
     pub total_fees_earned: u64,
 
-    /// Last slot when fees were accrued (prevents double-counting)
+    /// Last slot when fees were accrued. Currently informational only —
+    /// no rate-limiting enforced (AccrueFees is idempotent via balance delta).
+    /// Reserved for future slot-based rate limiting if needed.
     pub last_fee_accrual_slot: u64,
 
     /// Snapshot of engine vault balance at last fee accrual
