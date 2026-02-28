@@ -1056,7 +1056,11 @@ fn process_accrue_fees(
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
-    let _caller = next_account_info(accounts_iter)?; // signer, permissionless
+    let caller = next_account_info(accounts_iter)?; // signer, permissionless
+    if !caller.is_signer {
+        msg!("AccrueFees: caller must be a signer");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     let pool_ai = next_account_info(accounts_iter)?;
     let vault_ai = next_account_info(accounts_iter)?;
     let clock_ai = next_account_info(accounts_iter)?;
@@ -1091,13 +1095,18 @@ fn process_accrue_fees(
     // Compute fee delta: any balance increase beyond what was deposited (net of withdrawals)
     // pool_value = total_deposited - total_withdrawn + total_fees_earned
     // If current_balance > pool_value, the difference is new fees
+    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
     let pool_value = pool.total_deposited
-        .saturating_sub(pool.total_withdrawn)
-        .saturating_add(pool.total_fees_earned);
+        .checked_sub(pool.total_withdrawn)
+        .ok_or(StakeError::Overflow)?
+        .checked_add(pool.total_fees_earned)
+        .ok_or(StakeError::Overflow)?;
 
     if current_balance > pool_value {
         let fee_delta = current_balance - pool_value;
-        pool.total_fees_earned = pool.total_fees_earned.saturating_add(fee_delta);
+        pool.total_fees_earned = pool.total_fees_earned
+            .checked_add(fee_delta)
+            .ok_or(StakeError::Overflow)?;
         msg!("AccrueFees: accrued {} fees, total_fees_earned={}", fee_delta, pool.total_fees_earned);
     }
 
