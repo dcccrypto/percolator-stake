@@ -597,7 +597,7 @@ fn process_withdraw(
         let current_tvl = pool.total_pool_value().unwrap_or(0);
         let hwm = pool.refresh_hwm(clock.epoch, current_tvl);
         let post_tvl = current_tvl
-            .checked_sub(collateral_amount)
+            .checked_sub(withdrawal_amount)
             .ok_or(StakeError::Overflow)?;
         if !crate::math::hwm_withdrawal_allowed(post_tvl, hwm, pool.hwm_floor_bps()) {
             msg!(
