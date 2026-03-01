@@ -164,11 +164,7 @@ pub fn calc_senior_collateral_for_withdraw(
 /// # Returns
 /// (junior_loss, senior_loss)
 /// Invariant: junior_loss + senior_loss == loss_amount (unless capped at total).
-pub fn distribute_loss(
-    junior_balance: u64,
-    senior_balance: u64,
-    loss_amount: u64,
-) -> (u64, u64) {
+pub fn distribute_loss(junior_balance: u64, senior_balance: u64, loss_amount: u64) -> (u64, u64) {
     let total = junior_balance.saturating_add(senior_balance);
     let capped_loss = loss_amount.min(total);
 
@@ -228,11 +224,7 @@ pub fn distribute_fees(
 ///
 /// Given initial senior balance and post-loss senior balance,
 /// returns true if senior is protected (no loss while junior > 0).
-pub fn senior_protected(
-    junior_balance: u64,
-    _senior_balance: u64,
-    loss_amount: u64,
-) -> bool {
+pub fn senior_protected(junior_balance: u64, _senior_balance: u64, loss_amount: u64) -> bool {
     // If loss <= junior_balance, senior takes zero loss
     loss_amount <= junior_balance
 }
@@ -532,20 +524,29 @@ mod tests {
 
     #[test]
     fn test_junior_withdraw_proportional() {
-        assert_eq!(calc_junior_collateral_for_withdraw(1000, 2000, 500), Some(1000));
+        assert_eq!(
+            calc_junior_collateral_for_withdraw(1000, 2000, 500),
+            Some(1000)
+        );
     }
 
     #[test]
     fn test_junior_withdraw_after_loss() {
         // Junior balance reduced from 1000 to 500 by losses
         // 1000 LP tokens, 500 balance → each LP worth 0.5
-        assert_eq!(calc_junior_collateral_for_withdraw(1000, 500, 1000), Some(500));
+        assert_eq!(
+            calc_junior_collateral_for_withdraw(1000, 500, 1000),
+            Some(500)
+        );
     }
 
     #[test]
     fn test_senior_withdraw_full_protection() {
         // Senior balance untouched (1000), junior absorbed all losses
-        assert_eq!(calc_senior_collateral_for_withdraw(500, 1000, 500), Some(1000));
+        assert_eq!(
+            calc_senior_collateral_for_withdraw(500, 1000, 500),
+            Some(1000)
+        );
     }
 
     #[test]

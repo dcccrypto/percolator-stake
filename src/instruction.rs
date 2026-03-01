@@ -188,9 +188,7 @@ pub enum StakeInstruction {
     /// Accounts:
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
-    AdminSetTrancheConfig {
-        junior_fee_mult_bps: u16,
-    },
+    AdminSetTrancheConfig { junior_fee_mult_bps: u16 },
 
     /// PERC-303: Deposit into the junior (first-loss) tranche.
     /// Junior LP absorbs losses first, earns multiplied fee share.

@@ -604,10 +604,9 @@ fn process_withdraw(
         // Junior withdrawal: value from junior sub-pool
         let junior_lp = pool.junior_total_lp();
         let junior_bal = pool.junior_balance();
-        let junior_col = crate::math::calc_junior_collateral_for_withdraw(
-            junior_lp, junior_bal, lp_amount,
-        )
-        .ok_or(StakeError::Overflow)?;
+        let junior_col =
+            crate::math::calc_junior_collateral_for_withdraw(junior_lp, junior_bal, lp_amount)
+                .ok_or(StakeError::Overflow)?;
         if junior_col == 0 {
             return Err(StakeError::ZeroAmount.into());
         }
@@ -1301,7 +1300,7 @@ fn process_admin_set_tranche_config(
     }
 
     // Validate multiplier: minimum 10000 (1x), maximum 50000 (5x)
-    if junior_fee_mult_bps < 10_000 || junior_fee_mult_bps > 50_000 {
+    if !(10_000..=50_000).contains(&junior_fee_mult_bps) {
         msg!(
             "AdminSetTrancheConfig: junior_fee_mult_bps must be 10000..50000, got {}",
             junior_fee_mult_bps

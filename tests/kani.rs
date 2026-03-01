@@ -444,7 +444,8 @@ mod kani_proofs {
         kani::assume(senior_balance <= 1_000_000_000);
         kani::assume(loss_amount <= junior_balance); // Loss within junior capacity
 
-        let (junior_loss, senior_loss) = distribute_loss(junior_balance, senior_balance, loss_amount);
+        let (junior_loss, senior_loss) =
+            distribute_loss(junior_balance, senior_balance, loss_amount);
 
         // Senior MUST NOT take any loss
         assert_eq!(senior_loss, 0, "Senior lost while junior was positive");
@@ -465,16 +466,23 @@ mod kani_proofs {
         kani::assume(senior_balance <= 1_000_000_000);
         kani::assume(loss_amount <= 1_000_000_000);
 
-        let (junior_loss, senior_loss) = distribute_loss(junior_balance, senior_balance, loss_amount);
+        let (junior_loss, senior_loss) =
+            distribute_loss(junior_balance, senior_balance, loss_amount);
 
         // Total distributed ≤ loss_amount
         let total = junior_loss as u128 + senior_loss as u128;
         assert!(total <= loss_amount as u128, "Distributed more than loss");
 
         // Junior never loses more than its balance
-        assert!(junior_loss <= junior_balance, "Junior lost more than balance");
+        assert!(
+            junior_loss <= junior_balance,
+            "Junior lost more than balance"
+        );
         // Senior never loses more than its balance
-        assert!(senior_loss <= senior_balance, "Senior lost more than balance");
+        assert!(
+            senior_loss <= senior_balance,
+            "Senior lost more than balance"
+        );
     }
 
     /// PROOF: Fee distribution conserves total — junior_fee + senior_fee ≤ total_fee.
@@ -492,7 +500,12 @@ mod kani_proofs {
         kani::assume(junior_fee_mult_bps >= 10_000 && junior_fee_mult_bps <= 50_000);
         kani::assume(total_fee <= 1_000_000_000);
 
-        let (jf, sf) = distribute_fees(junior_balance, senior_balance, junior_fee_mult_bps, total_fee);
+        let (jf, sf) = distribute_fees(
+            junior_balance,
+            senior_balance,
+            junior_fee_mult_bps,
+            total_fee,
+        );
 
         assert!(
             jf as u128 + sf as u128 <= total_fee as u128,
