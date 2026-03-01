@@ -281,6 +281,76 @@ impl StakePool {
         disc == [0u8; 8] || disc == STAKE_POOL_DISCRIMINATOR
     }
 
+    // ════════════════════════════════════════════════════════════
+    // PERC-313: High-Water Mark Protection — _reserved layout
+    // ════════════════════════════════════════════════════════════
+    // Bytes 0-7:   discriminator (STAKE_POOL_DISCRIMINATOR)
+    // Byte  8:     version
+    // Byte  9:     hwm_enabled (0 = off, 1 = on)
+    // Bytes 10-11: hwm_floor_bps (u16 LE, default 5000 = 50%)
+    // Bytes 12-15: reserved padding
+    // Bytes 16-23: epoch_high_water_tvl (u64 LE)
+    // Bytes 24-31: hwm_last_epoch (u64 LE)
+    // Bytes 32-63: free
+
+    /// Whether high-water mark protection is enabled.
+    pub fn hwm_enabled(&self) -> bool {
+        self._reserved[9] == 1
+    }
+
+    /// Set high-water mark enabled flag.
+    pub fn set_hwm_enabled(&mut self, enabled: bool) {
+        self._reserved[9] = if enabled { 1 } else { 0 };
+    }
+
+    /// High-water mark floor in basis points (e.g. 5000 = 50%).
+    pub fn hwm_floor_bps(&self) -> u16 {
+        u16::from_le_bytes([self._reserved[10], self._reserved[11]])
+    }
+
+    /// Set high-water mark floor bps.
+    pub fn set_hwm_floor_bps(&mut self, bps: u16) {
+        let bytes = bps.to_le_bytes();
+        self._reserved[10] = bytes[0];
+        self._reserved[11] = bytes[1];
+    }
+
+    /// Epoch high-water mark TVL (max pool value seen in current epoch).
+    pub fn epoch_high_water_tvl(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[16..24].try_into().unwrap())
+    }
+
+    /// Set epoch high-water mark TVL.
+    pub fn set_epoch_high_water_tvl(&mut self, tvl: u64) {
+        self._reserved[16..24].copy_from_slice(&tvl.to_le_bytes());
+    }
+
+    /// Last epoch when HWM was updated.
+    pub fn hwm_last_epoch(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[24..32].try_into().unwrap())
+    }
+
+    /// Set last HWM epoch.
+    pub fn set_hwm_last_epoch(&mut self, epoch: u64) {
+        self._reserved[24..32].copy_from_slice(&epoch.to_le_bytes());
+    }
+
+    /// Refresh HWM tracking for a new epoch. If current epoch differs from
+    /// the stored epoch, reset epoch_high_water_tvl to the current pool value.
+    /// Then update the HWM if current_tvl exceeds it.
+    /// Returns the (possibly updated) epoch_high_water_tvl.
+    pub fn refresh_hwm(&mut self, current_epoch: u64, current_tvl: u64) -> u64 {
+        if current_epoch != self.hwm_last_epoch() {
+            // New epoch — reset HWM to current TVL
+            self.set_epoch_high_water_tvl(current_tvl);
+            self.set_hwm_last_epoch(current_epoch);
+        } else if current_tvl > self.epoch_high_water_tvl() {
+            // Same epoch — raise the water mark
+            self.set_epoch_high_water_tvl(current_tvl);
+        }
+        self.epoch_high_water_tvl()
+    }
+
     /// Total pool value = deposited - withdrawn - flushed + returned.
     ///
     /// This equals the actual vault balance and reflects what LP holders can withdraw.
@@ -522,6 +592,99 @@ mod tests {
         let admin = Pubkey::new_unique();
         pool.admin = admin.to_bytes();
         assert_eq!(pool.admin_pubkey(), admin);
+    }
+
+    // ── PERC-313: HWM Accessors ──
+
+    #[test]
+    fn test_hwm_defaults_zero() {
+        let pool = StakePool::zeroed();
+        assert!(!pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 0);
+        assert_eq!(pool.epoch_high_water_tvl(), 0);
+        assert_eq!(pool.hwm_last_epoch(), 0);
+    }
+
+    #[test]
+    fn test_hwm_set_enabled() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_enabled(true);
+        assert!(pool.hwm_enabled());
+        pool.set_hwm_enabled(false);
+        assert!(!pool.hwm_enabled());
+    }
+
+    #[test]
+    fn test_hwm_set_floor_bps() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_floor_bps(5000);
+        assert_eq!(pool.hwm_floor_bps(), 5000);
+        pool.set_hwm_floor_bps(10_000);
+        assert_eq!(pool.hwm_floor_bps(), 10_000);
+    }
+
+    #[test]
+    fn test_hwm_set_epoch_tvl() {
+        let mut pool = StakePool::zeroed();
+        pool.set_epoch_high_water_tvl(1_000_000);
+        assert_eq!(pool.epoch_high_water_tvl(), 1_000_000);
+    }
+
+    #[test]
+    fn test_hwm_set_last_epoch() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(42);
+        assert_eq!(pool.hwm_last_epoch(), 42);
+    }
+
+    #[test]
+    fn test_refresh_hwm_new_epoch_resets() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(5);
+        pool.set_epoch_high_water_tvl(2000);
+        // New epoch — should reset to current TVL
+        let hwm = pool.refresh_hwm(6, 1500);
+        assert_eq!(hwm, 1500);
+        assert_eq!(pool.hwm_last_epoch(), 6);
+    }
+
+    #[test]
+    fn test_refresh_hwm_same_epoch_raises() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(5);
+        pool.set_epoch_high_water_tvl(1000);
+        // Same epoch, higher TVL — should raise
+        let hwm = pool.refresh_hwm(5, 1500);
+        assert_eq!(hwm, 1500);
+    }
+
+    #[test]
+    fn test_refresh_hwm_same_epoch_no_lower() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(5);
+        pool.set_epoch_high_water_tvl(2000);
+        // Same epoch, lower TVL — should NOT lower the mark
+        let hwm = pool.refresh_hwm(5, 1500);
+        assert_eq!(hwm, 2000);
+    }
+
+    #[test]
+    fn test_hwm_does_not_clobber_discriminator() {
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        let disc_before: [u8; 8] = pool._reserved[..8].try_into().unwrap();
+
+        pool.set_hwm_enabled(true);
+        pool.set_hwm_floor_bps(5000);
+        pool.set_epoch_high_water_tvl(1_000_000);
+        pool.set_hwm_last_epoch(42);
+
+        let disc_after: [u8; 8] = pool._reserved[..8].try_into().unwrap();
+        assert_eq!(
+            disc_before, disc_after,
+            "HWM must not clobber discriminator"
+        );
+        assert_eq!(pool.version(), 1, "HWM must not clobber version");
     }
 
     #[test]
