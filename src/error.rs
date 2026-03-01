@@ -45,6 +45,8 @@ pub enum StakeError {
     TrancheNotEnabled = 19,
     /// Junior tranche has insufficient balance for this operation
     JuniorBalanceInsufficient = 20,
+    /// Wrong tranche — deposit PDA already belongs to a different tranche
+    WrongTranche = 21,
 }
 
 impl From<StakeError> for ProgramError {

@@ -181,13 +181,25 @@ impl StakePool {
     // Layout in _reserved:
     //   [0..8]   = discriminator (SPOOL_V1)
     //   [8]      = version
-    //   [9..32]  = reserved for PERC-313 HWM
+    //   [9]      = market_resolved (0=active, 1=resolved)
+    //   [10..32] = reserved for PERC-313 HWM
     //   [32]     = tranche_enabled (0=disabled, 1=enabled)
     //   [33..41] = junior_balance: u64 (LE)
     //   [41..49] = junior_total_lp: u64 (LE)
     //   [49..51] = junior_fee_mult_bps: u16 (LE, default 20000 = 2x)
     //   [51..64] = free
     // ════════════════════════════════════════════════════════════
+
+    /// Whether the market has been resolved (blocks new deposits).
+    /// Stored at _reserved[9] to avoid conflicting with the discriminator at [0..8].
+    pub fn market_resolved(&self) -> bool {
+        self._reserved[9] != 0
+    }
+
+    /// Set the market resolved flag.
+    pub fn set_market_resolved(&mut self, resolved: bool) {
+        self._reserved[9] = if resolved { 1 } else { 0 };
+    }
 
     /// Whether senior/junior tranches are enabled on this pool.
     pub fn tranche_enabled(&self) -> bool {
@@ -230,8 +242,17 @@ impl StakePool {
     }
 
     /// Derived: senior LP supply = total_lp_supply - junior_total_lp.
+    /// Panics if junior_total_lp exceeds total_lp_supply (accounting drift).
     pub fn senior_total_lp(&self) -> u64 {
-        self.total_lp_supply.saturating_sub(self.junior_total_lp())
+        self.total_lp_supply
+            .checked_sub(self.junior_total_lp())
+            .unwrap_or_else(|| {
+                panic!(
+                    "LP accounting drift: total_lp_supply={} < junior_total_lp={}",
+                    self.total_lp_supply,
+                    self.junior_total_lp()
+                )
+            })
     }
 
     /// Derived: senior balance = total_pool_value - junior_balance.

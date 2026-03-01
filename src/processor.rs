@@ -319,7 +319,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     }
 
     // I7: Block deposits after market resolution
-    if pool._reserved[0] != 0 {
+    if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
 
@@ -446,6 +446,13 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
     }
+
+    // PERC-303: Prevent mixing senior and junior LP in the same deposit PDA.
+    // If this deposit is flagged as junior and already has LP, reject senior deposits.
+    if deposit._reserved[8] == 1 && deposit.lp_amount > 0 {
+        return Err(StakeError::WrongTranche.into());
+    }
+
     deposit.is_initialized = 1;
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
@@ -519,38 +526,64 @@ fn process_withdraw(
         return Err(StakeError::InvalidAccount.into());
     }
 
-    // Check cooldown
+    // Validate deposit PDA derivation and ownership (defense-in-depth)
+    let (expected_deposit_pda, _deposit_bump) =
+        state::derive_deposit_pda(program_id, pool_pda.key, user.key);
+    if *deposit_pda.key != expected_deposit_pda {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if *deposit_pda.owner != *program_id {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if deposit_pda.data_len() < STAKE_DEPOSIT_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    // Check cooldown + read tranche flag in same borrow
     let clock = Clock::from_account_info(clock_sysvar)?;
-    let deposit_data_ref = deposit_pda.try_borrow_data()?;
-    let deposit: &StakeDeposit = bytemuck::from_bytes(&deposit_data_ref[..STAKE_DEPOSIT_SIZE]);
-
-    if deposit.is_initialized != 1
-        || deposit.user != user.key.to_bytes()
-        || deposit.pool != pool_pda.key.to_bytes()
+    let is_junior;
     {
-        return Err(StakeError::Unauthorized.into());
-    }
-    if clock.slot
-        < deposit
-            .last_deposit_slot
-            .saturating_add(pool.cooldown_slots)
-    {
-        return Err(StakeError::CooldownNotElapsed.into());
-    }
-    if lp_amount > deposit.lp_amount {
-        return Err(StakeError::InsufficientLpTokens.into());
-    }
-    drop(deposit_data_ref);
+        let deposit_data_ref = deposit_pda.try_borrow_data()?;
+        let deposit: &StakeDeposit =
+            bytemuck::from_bytes(&deposit_data_ref[..STAKE_DEPOSIT_SIZE]);
 
-    // Calculate collateral to return (proportional to LP burned)
-    let collateral_amount = pool
-        .calc_collateral_for_withdraw(lp_amount)
-        .ok_or(StakeError::Overflow)?;
-    if collateral_amount == 0 {
+        if deposit.is_initialized != 1
+            || deposit.user != user.key.to_bytes()
+            || deposit.pool != pool_pda.key.to_bytes()
+        {
+            return Err(StakeError::Unauthorized.into());
+        }
+        if clock.slot
+            < deposit
+                .last_deposit_slot
+                .saturating_add(pool.cooldown_slots)
+        {
+            return Err(StakeError::CooldownNotElapsed.into());
+        }
+        if lp_amount > deposit.lp_amount {
+            return Err(StakeError::InsufficientLpTokens.into());
+        }
+        // Read tranche flag while we have the borrow
+        is_junior = deposit._reserved[8] == 1;
+    }
+
+    // PERC-303: Determine withdrawal amount based on tranche
+    let withdrawal_amount = if pool.tranche_enabled() && is_junior {
+        // Junior withdrawal: valued against junior sub-pool only
+        let junior_lp = pool.junior_total_lp();
+        let junior_bal = pool.junior_balance();
+        crate::math::calc_junior_collateral_for_withdraw(junior_lp, junior_bal, lp_amount)
+            .ok_or(StakeError::Overflow)?
+    } else {
+        // Senior (default) withdrawal: valued against global pool
+        pool.calc_collateral_for_withdraw(lp_amount)
+            .ok_or(StakeError::Overflow)?
+    };
+    if withdrawal_amount == 0 {
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // Burn LP tokens from user
+    // Burn LP tokens from user (single burn)
     invoke(
         &spl_token::instruction::burn(
             token_program.key,
@@ -568,7 +601,7 @@ fn process_withdraw(
         ],
     )?;
 
-    // Transfer collateral: vault → user ATA
+    // Transfer collateral: vault → user ATA (single transfer)
     let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
@@ -579,7 +612,7 @@ fn process_withdraw(
             user_ata.key,
             vault_auth.key,
             &[],
-            collateral_amount,
+            withdrawal_amount,
         )?,
         &[
             vault.clone(),
@@ -590,81 +623,18 @@ fn process_withdraw(
         &[vault_auth_seeds],
     )?;
 
-    // PERC-303: Tranche-aware withdrawal
-    // If tranches are enabled, determine which tranche the user's LP belongs to.
-    // Default (non-junior) LP tokens are senior. Junior LP tokens are tracked
-    // in the deposit PDA's _reserved[8] flag.
-    let is_junior = {
-        let dep_ref = deposit_pda.try_borrow_data()?;
-        let dep: &StakeDeposit = bytemuck::from_bytes(&dep_ref[..STAKE_DEPOSIT_SIZE]);
-        dep._reserved[8] == 1
-    };
+    // Update pool totals
+    pool.total_withdrawn = pool
+        .total_withdrawn
+        .checked_add(withdrawal_amount)
+        .ok_or(StakeError::Overflow)?;
+    pool.total_lp_supply = pool
+        .total_lp_supply
+        .checked_sub(lp_amount)
+        .ok_or(StakeError::Overflow)?;
 
+    // Update tranche-specific state if junior
     if pool.tranche_enabled() && is_junior {
-        // Junior withdrawal: value from junior sub-pool
-        let junior_lp = pool.junior_total_lp();
-        let junior_bal = pool.junior_balance();
-        let junior_col =
-            crate::math::calc_junior_collateral_for_withdraw(junior_lp, junior_bal, lp_amount)
-                .ok_or(StakeError::Overflow)?;
-        if junior_col == 0 {
-            return Err(StakeError::ZeroAmount.into());
-        }
-        // Use junior_col instead of collateral_amount for junior withdrawals
-        // (junior may have taken losses, so their share price is lower)
-
-        // Burn LP tokens from user
-        invoke(
-            &spl_token::instruction::burn(
-                token_program.key,
-                user_lp_ata.key,
-                lp_mint.key,
-                user.key,
-                &[],
-                lp_amount,
-            )?,
-            &[
-                user_lp_ata.clone(),
-                lp_mint.clone(),
-                user.clone(),
-                token_program.clone(),
-            ],
-        )?;
-
-        // Transfer collateral: vault → user ATA
-        let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
-        let vault_auth_seeds: &[&[u8]] =
-            &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
-
-        invoke_signed(
-            &spl_token::instruction::transfer(
-                token_program.key,
-                vault.key,
-                user_ata.key,
-                vault_auth.key,
-                &[],
-                junior_col,
-            )?,
-            &[
-                vault.clone(),
-                user_ata.clone(),
-                vault_auth.clone(),
-                token_program.clone(),
-            ],
-            &[vault_auth_seeds],
-        )?;
-
-        // Update pool totals
-        pool.total_withdrawn = pool
-            .total_withdrawn
-            .checked_add(junior_col)
-            .ok_or(StakeError::Overflow)?;
-        pool.total_lp_supply = pool
-            .total_lp_supply
-            .checked_sub(lp_amount)
-            .ok_or(StakeError::Overflow)?;
-
-        // Update junior-specific state
         pool.set_junior_total_lp(
             pool.junior_total_lp()
                 .checked_sub(lp_amount)
@@ -672,90 +642,30 @@ fn process_withdraw(
         );
         pool.set_junior_balance(
             pool.junior_balance()
-                .checked_sub(junior_col)
+                .checked_sub(withdrawal_amount)
                 .ok_or(StakeError::Overflow)?,
         );
+    }
 
-        // Update deposit PDA
-        let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
-        let deposit_mut: &mut StakeDeposit =
-            bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
-        deposit_mut.lp_amount = deposit_mut
-            .lp_amount
-            .checked_sub(lp_amount)
-            .ok_or(StakeError::InsufficientLpTokens)?;
+    // Update deposit PDA
+    let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
+    let deposit_mut: &mut StakeDeposit =
+        bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
+    deposit_mut.lp_amount = deposit_mut
+        .lp_amount
+        .checked_sub(lp_amount)
+        .ok_or(StakeError::InsufficientLpTokens)?;
 
+    if pool.tranche_enabled() && is_junior {
         msg!(
             "Junior withdrew {} collateral, burned {} LP tokens",
-            junior_col,
+            withdrawal_amount,
             lp_amount
         );
     } else {
-        // Senior (default) withdrawal path
-
-        // Burn LP tokens from user
-        invoke(
-            &spl_token::instruction::burn(
-                token_program.key,
-                user_lp_ata.key,
-                lp_mint.key,
-                user.key,
-                &[],
-                lp_amount,
-            )?,
-            &[
-                user_lp_ata.clone(),
-                lp_mint.clone(),
-                user.clone(),
-                token_program.clone(),
-            ],
-        )?;
-
-        // Transfer collateral: vault → user ATA
-        let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
-        let vault_auth_seeds: &[&[u8]] =
-            &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
-
-        invoke_signed(
-            &spl_token::instruction::transfer(
-                token_program.key,
-                vault.key,
-                user_ata.key,
-                vault_auth.key,
-                &[],
-                collateral_amount,
-            )?,
-            &[
-                vault.clone(),
-                user_ata.clone(),
-                vault_auth.clone(),
-                token_program.clone(),
-            ],
-            &[vault_auth_seeds],
-        )?;
-
-        // Update pool totals
-        pool.total_withdrawn = pool
-            .total_withdrawn
-            .checked_add(collateral_amount)
-            .ok_or(StakeError::Overflow)?;
-        pool.total_lp_supply = pool
-            .total_lp_supply
-            .checked_sub(lp_amount)
-            .ok_or(StakeError::Overflow)?;
-
-        // Update deposit PDA
-        let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
-        let deposit_mut: &mut StakeDeposit =
-            bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
-        deposit_mut.lp_amount = deposit_mut
-            .lp_amount
-            .checked_sub(lp_amount)
-            .ok_or(StakeError::InsufficientLpTokens)?;
-
         msg!(
             "Withdrew {} collateral, burned {} LP tokens",
-            collateral_amount,
+            withdrawal_amount,
             lp_amount
         );
     }
@@ -1078,7 +988,7 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
     {
         let mut pool_data = pool_pda.try_borrow_mut_data()?;
         let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-        pool._reserved[0] = 1;
+        pool.set_market_resolved(true);
     }
 
     msg!("ResolveMarket forwarded via CPI");
@@ -1369,7 +1279,7 @@ fn process_deposit_junior(
         return Err(StakeError::AdminNotTransferred.into());
     }
     // Block deposits after market resolution
-    if pool._reserved[0] != 0 {
+    if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
 
@@ -1501,6 +1411,13 @@ fn process_deposit_junior(
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
     }
+
+    // PERC-303: Prevent mixing senior and junior LP in the same deposit PDA.
+    // If this deposit has existing senior LP (flag != 1 and amount > 0), reject.
+    if deposit._reserved[8] != 1 && deposit.lp_amount > 0 {
+        return Err(StakeError::WrongTranche.into());
+    }
+
     deposit.is_initialized = 1;
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
