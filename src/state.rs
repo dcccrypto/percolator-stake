@@ -176,6 +176,90 @@ impl StakePool {
         Pubkey::new_from_array(self.percolator_program)
     }
 
+    // ════════════════════════════════════════════════════════════
+    // PERC-303: Senior/Junior LP Tranche Accessors
+    // Layout in _reserved:
+    //   [0..8]   = discriminator (SPOOL_V1)
+    //   [8]      = version
+    //   [9]      = market_resolved (0=active, 1=resolved)
+    //   [10..32] = reserved for PERC-313 HWM
+    //   [32]     = tranche_enabled (0=disabled, 1=enabled)
+    //   [33..41] = junior_balance: u64 (LE)
+    //   [41..49] = junior_total_lp: u64 (LE)
+    //   [49..51] = junior_fee_mult_bps: u16 (LE, default 20000 = 2x)
+    //   [51..64] = free
+    // ════════════════════════════════════════════════════════════
+
+    /// Whether the market has been resolved (blocks new deposits).
+    /// Stored at _reserved[9] to avoid conflicting with the discriminator at [0..8].
+    pub fn market_resolved(&self) -> bool {
+        self._reserved[9] != 0
+    }
+
+    /// Set the market resolved flag.
+    pub fn set_market_resolved(&mut self, resolved: bool) {
+        self._reserved[9] = if resolved { 1 } else { 0 };
+    }
+
+    /// Whether senior/junior tranches are enabled on this pool.
+    pub fn tranche_enabled(&self) -> bool {
+        self._reserved[32] == 1
+    }
+
+    /// Set tranche enabled flag.
+    pub fn set_tranche_enabled(&mut self, enabled: bool) {
+        self._reserved[32] = if enabled { 1 } else { 0 };
+    }
+
+    /// Current junior tranche balance (collateral backing junior LP tokens).
+    pub fn junior_balance(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[33..41].try_into().unwrap())
+    }
+
+    /// Set junior tranche balance.
+    pub fn set_junior_balance(&mut self, val: u64) {
+        self._reserved[33..41].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Total junior LP tokens in circulation.
+    pub fn junior_total_lp(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[41..49].try_into().unwrap())
+    }
+
+    /// Set junior total LP supply.
+    pub fn set_junior_total_lp(&mut self, val: u64) {
+        self._reserved[41..49].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Junior fee multiplier in bps (20000 = 2x).
+    pub fn junior_fee_mult_bps(&self) -> u16 {
+        u16::from_le_bytes(self._reserved[49..51].try_into().unwrap())
+    }
+
+    /// Set junior fee multiplier.
+    pub fn set_junior_fee_mult_bps(&mut self, val: u16) {
+        self._reserved[49..51].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Derived: senior LP supply = total_lp_supply - junior_total_lp.
+    /// Panics if junior_total_lp exceeds total_lp_supply (accounting drift).
+    pub fn senior_total_lp(&self) -> u64 {
+        self.total_lp_supply
+            .checked_sub(self.junior_total_lp())
+            .unwrap_or_else(|| {
+                panic!(
+                    "LP accounting drift: total_lp_supply={} < junior_total_lp={}",
+                    self.total_lp_supply,
+                    self.junior_total_lp()
+                )
+            })
+    }
+
+    /// Derived: senior balance = total_pool_value - junior_balance.
+    pub fn senior_balance(&self) -> Option<u64> {
+        self.total_pool_value()?.checked_sub(self.junior_balance())
+    }
+
     /// Current struct version. Increment when layout changes.
     pub const CURRENT_VERSION: u8 = 1;
 
