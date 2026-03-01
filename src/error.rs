@@ -39,6 +39,12 @@ pub enum StakeError {
     InvalidAccount = 16,
     /// Pool mode mismatch (e.g., AccrueFees on insurance pool)
     InvalidPoolMode = 17,
+    /// Withdrawal blocked: would breach HWM floor
+    WithdrawalBelowHwmFloor = 18,
+    /// Tranches not enabled on this pool
+    TrancheNotEnabled = 19,
+    /// Junior tranche has insufficient balance for this operation
+    JuniorBalanceInsufficient = 20,
 }
 
 impl From<StakeError> for ProgramError {

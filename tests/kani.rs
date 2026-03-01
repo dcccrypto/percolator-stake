@@ -424,4 +424,79 @@ mod kani_proofs {
             assert!(lhs <= rhs, "Withdrawal rounding not pool-favoring");
         }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // PERC-303: Senior/Junior Tranche Safety
+    // ═══════════════════════════════════════════════════════════
+
+    /// PROOF: Senior tranche never takes losses while junior balance > 0.
+    /// For any loss amount ≤ junior_balance, distribute_loss returns senior_loss == 0.
+    #[kani::proof]
+    fn proof_senior_never_loses_while_junior_positive() {
+        use percolator_stake::math::distribute_loss;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let loss_amount: u64 = kani::any();
+
+        kani::assume(junior_balance > 0);
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance <= 1_000_000_000);
+        kani::assume(loss_amount <= junior_balance); // Loss within junior capacity
+
+        let (junior_loss, senior_loss) = distribute_loss(junior_balance, senior_balance, loss_amount);
+
+        // Senior MUST NOT take any loss
+        assert_eq!(senior_loss, 0, "Senior lost while junior was positive");
+        // Junior absorbs the full loss
+        assert_eq!(junior_loss, loss_amount, "Junior did not absorb full loss");
+    }
+
+    /// PROOF: Loss distribution is conservative — total loss never exceeds input.
+    #[kani::proof]
+    fn proof_loss_distribution_conservative() {
+        use percolator_stake::math::distribute_loss;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let loss_amount: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance <= 1_000_000_000);
+        kani::assume(loss_amount <= 1_000_000_000);
+
+        let (junior_loss, senior_loss) = distribute_loss(junior_balance, senior_balance, loss_amount);
+
+        // Total distributed ≤ loss_amount
+        let total = junior_loss as u128 + senior_loss as u128;
+        assert!(total <= loss_amount as u128, "Distributed more than loss");
+
+        // Junior never loses more than its balance
+        assert!(junior_loss <= junior_balance, "Junior lost more than balance");
+        // Senior never loses more than its balance
+        assert!(senior_loss <= senior_balance, "Senior lost more than balance");
+    }
+
+    /// PROOF: Fee distribution conserves total — junior_fee + senior_fee ≤ total_fee.
+    #[kani::proof]
+    fn proof_fee_distribution_conservative() {
+        use percolator_stake::math::distribute_fees;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let junior_fee_mult_bps: u16 = kani::any();
+        let total_fee: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance <= 1_000_000_000);
+        kani::assume(junior_fee_mult_bps >= 10_000 && junior_fee_mult_bps <= 50_000);
+        kani::assume(total_fee <= 1_000_000_000);
+
+        let (jf, sf) = distribute_fees(junior_balance, senior_balance, junior_fee_mult_bps, total_fee);
+
+        assert!(
+            jf as u128 + sf as u128 <= total_fee as u128,
+            "Fee distribution exceeds total"
+        );
+    }
 }

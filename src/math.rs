@@ -104,6 +104,139 @@ pub fn pool_value_with_fees(
         .checked_add(total_fees_earned)
 }
 
+// ═══════════════════════════════════════════════════════════════
+// PERC-303: Senior/Junior LP Tranche Math
+// ═══════════════════════════════════════════════════════════════
+
+/// Calculate LP tokens for a junior tranche deposit.
+///
+/// Junior tranche has its own sub-pool: junior_balance / junior_total_lp.
+/// First junior depositor gets 1:1, subsequent get pro-rata within junior pool.
+///
+/// # Returns
+/// * `Some(lp_tokens)` to mint
+/// * `None` on overflow or blocked state (orphaned value)
+pub fn calc_junior_lp_for_deposit(
+    junior_total_lp: u64,
+    junior_balance: u64,
+    deposit_amount: u64,
+) -> Option<u64> {
+    calc_lp_for_deposit(junior_total_lp, junior_balance, deposit_amount)
+}
+
+/// Calculate collateral for a junior LP token burn.
+///
+/// Junior withdrawals are valued against the junior sub-pool only.
+/// If junior_balance has been reduced by losses, junior LPs take the hit.
+///
+/// # Returns
+/// * `Some(collateral)` to return (rounds down)
+/// * `None` on overflow
+pub fn calc_junior_collateral_for_withdraw(
+    junior_total_lp: u64,
+    junior_balance: u64,
+    lp_amount: u64,
+) -> Option<u64> {
+    calc_collateral_for_withdraw(junior_total_lp, junior_balance, lp_amount)
+}
+
+/// Calculate collateral for a senior LP token burn.
+///
+/// Senior withdrawals are valued against the senior sub-pool only.
+/// senior_balance = total_pool_value - junior_balance.
+/// senior_total_lp = total_lp_supply - junior_total_lp.
+///
+/// Senior LPs only lose if junior_balance is fully wiped (== 0).
+///
+/// # Returns
+/// * `Some(collateral)` to return (rounds down)
+/// * `None` on overflow or zero senior supply
+pub fn calc_senior_collateral_for_withdraw(
+    senior_total_lp: u64,
+    senior_balance: u64,
+    lp_amount: u64,
+) -> Option<u64> {
+    calc_collateral_for_withdraw(senior_total_lp, senior_balance, lp_amount)
+}
+
+/// Distribute a loss across tranches. Junior absorbs first.
+///
+/// # Returns
+/// (junior_loss, senior_loss)
+/// Invariant: junior_loss + senior_loss == loss_amount (unless capped at total).
+pub fn distribute_loss(
+    junior_balance: u64,
+    senior_balance: u64,
+    loss_amount: u64,
+) -> (u64, u64) {
+    let total = junior_balance.saturating_add(senior_balance);
+    let capped_loss = loss_amount.min(total);
+
+    if capped_loss <= junior_balance {
+        // Junior absorbs all
+        (capped_loss, 0)
+    } else {
+        // Junior wiped, remainder hits senior
+        let senior_loss = capped_loss.saturating_sub(junior_balance);
+        (junior_balance, senior_loss)
+    }
+}
+
+/// Distribute fee income across tranches using junior multiplier.
+///
+/// Junior gets: fee * (junior_share * junior_mult_bps / 10_000) / weighted_total
+/// Senior gets: remainder
+///
+/// # Arguments
+/// * `junior_balance` - Junior tranche balance
+/// * `senior_balance` - Senior tranche balance
+/// * `junior_fee_mult_bps` - Junior fee multiplier (20000 = 2x)
+/// * `total_fee` - Total fee to distribute
+///
+/// # Returns
+/// (junior_fee, senior_fee) — guaranteed to sum to <= total_fee
+pub fn distribute_fees(
+    junior_balance: u64,
+    senior_balance: u64,
+    junior_fee_mult_bps: u16,
+    total_fee: u64,
+) -> (u64, u64) {
+    if total_fee == 0 {
+        return (0, 0);
+    }
+    let total_balance = junior_balance as u128 + senior_balance as u128;
+    if total_balance == 0 {
+        return (0, 0);
+    }
+
+    // Weighted shares: junior weight = junior_balance * mult, senior weight = senior_balance * 10_000
+    let junior_weight = (junior_balance as u128) * (junior_fee_mult_bps as u128);
+    let senior_weight = (senior_balance as u128) * 10_000u128;
+    let total_weight = junior_weight + senior_weight;
+
+    if total_weight == 0 {
+        return (0, 0);
+    }
+
+    let junior_fee = ((total_fee as u128) * junior_weight / total_weight) as u64;
+    let senior_fee = total_fee.saturating_sub(junior_fee); // remainder to senior
+
+    (junior_fee, senior_fee)
+}
+
+/// Check senior never loses while junior is positive.
+///
+/// Given initial senior balance and post-loss senior balance,
+/// returns true if senior is protected (no loss while junior > 0).
+pub fn senior_protected(
+    junior_balance: u64,
+    _senior_balance: u64,
+    loss_amount: u64,
+) -> bool {
+    // If loss <= junior_balance, senior takes zero loss
+    loss_amount <= junior_balance
+}
+
 /// Calculate available flush amount.
 ///
 /// `available = deposited - withdrawn - already_flushed`
@@ -383,6 +516,106 @@ mod tests {
     #[test]
     fn test_pool_value_with_fees_overflow() {
         assert_eq!(pool_value_with_fees(100, 200, 50), None);
+    }
+
+    // ── PERC-303: Tranche Tests ──
+
+    #[test]
+    fn test_junior_first_deposit_1_to_1() {
+        assert_eq!(calc_junior_lp_for_deposit(0, 0, 1000), Some(1000));
+    }
+
+    #[test]
+    fn test_junior_pro_rata() {
+        assert_eq!(calc_junior_lp_for_deposit(1000, 2000, 500), Some(250));
+    }
+
+    #[test]
+    fn test_junior_withdraw_proportional() {
+        assert_eq!(calc_junior_collateral_for_withdraw(1000, 2000, 500), Some(1000));
+    }
+
+    #[test]
+    fn test_junior_withdraw_after_loss() {
+        // Junior balance reduced from 1000 to 500 by losses
+        // 1000 LP tokens, 500 balance → each LP worth 0.5
+        assert_eq!(calc_junior_collateral_for_withdraw(1000, 500, 1000), Some(500));
+    }
+
+    #[test]
+    fn test_senior_withdraw_full_protection() {
+        // Senior balance untouched (1000), junior absorbed all losses
+        assert_eq!(calc_senior_collateral_for_withdraw(500, 1000, 500), Some(1000));
+    }
+
+    #[test]
+    fn test_distribute_loss_junior_absorbs_all() {
+        let (j, s) = distribute_loss(1000, 5000, 800);
+        assert_eq!(j, 800);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn test_distribute_loss_junior_wiped() {
+        let (j, s) = distribute_loss(1000, 5000, 1500);
+        assert_eq!(j, 1000);
+        assert_eq!(s, 500);
+    }
+
+    #[test]
+    fn test_distribute_loss_total_wipe() {
+        let (j, s) = distribute_loss(1000, 5000, 10000);
+        assert_eq!(j, 1000);
+        assert_eq!(s, 5000);
+    }
+
+    #[test]
+    fn test_distribute_loss_zero() {
+        let (j, s) = distribute_loss(1000, 5000, 0);
+        assert_eq!(j, 0);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn test_distribute_fees_2x_multiplier() {
+        // Junior: 1000 balance, 2x mult → weight = 1000 * 20000 = 20_000_000
+        // Senior: 4000 balance, 1x base → weight = 4000 * 10000 = 40_000_000
+        // Total weight = 60_000_000
+        // Fee = 600 → junior gets 600 * 20M/60M = 200, senior gets 400
+        let (jf, sf) = distribute_fees(1000, 4000, 20000, 600);
+        assert_eq!(jf, 200);
+        assert_eq!(sf, 400);
+    }
+
+    #[test]
+    fn test_distribute_fees_no_junior() {
+        let (jf, sf) = distribute_fees(0, 5000, 20000, 1000);
+        assert_eq!(jf, 0);
+        assert_eq!(sf, 1000);
+    }
+
+    #[test]
+    fn test_distribute_fees_no_senior() {
+        let (jf, sf) = distribute_fees(5000, 0, 20000, 1000);
+        assert_eq!(jf, 1000);
+        assert_eq!(sf, 0);
+    }
+
+    #[test]
+    fn test_distribute_fees_zero_fee() {
+        let (jf, sf) = distribute_fees(1000, 4000, 20000, 0);
+        assert_eq!(jf, 0);
+        assert_eq!(sf, 0);
+    }
+
+    #[test]
+    fn test_senior_protected_when_junior_covers() {
+        assert!(senior_protected(1000, 5000, 800));
+    }
+
+    #[test]
+    fn test_senior_not_protected_when_loss_exceeds_junior() {
+        assert!(!senior_protected(1000, 5000, 1500));
     }
 
     #[test]

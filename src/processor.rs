@@ -86,6 +86,12 @@ pub fn process(
             cooldown_slots,
             deposit_cap,
         } => process_init_trading_pool(program_id, accounts, cooldown_slots, deposit_cap),
+        StakeInstruction::AdminSetTrancheConfig {
+            junior_fee_mult_bps,
+        } => process_admin_set_tranche_config(program_id, accounts, junior_fee_mult_bps),
+        StakeInstruction::DepositJunior { amount } => {
+            process_deposit_junior(program_id, accounts, amount)
+        }
     }
 }
 
@@ -584,30 +590,177 @@ fn process_withdraw(
         &[vault_auth_seeds],
     )?;
 
-    // Update pool totals
-    pool.total_withdrawn = pool
-        .total_withdrawn
-        .checked_add(collateral_amount)
-        .ok_or(StakeError::Overflow)?;
-    pool.total_lp_supply = pool
-        .total_lp_supply
-        .checked_sub(lp_amount)
-        .ok_or(StakeError::Overflow)?;
+    // PERC-303: Tranche-aware withdrawal
+    // If tranches are enabled, determine which tranche the user's LP belongs to.
+    // Default (non-junior) LP tokens are senior. Junior LP tokens are tracked
+    // in the deposit PDA's _reserved[8] flag.
+    let is_junior = {
+        let dep_ref = deposit_pda.try_borrow_data()?;
+        let dep: &StakeDeposit = bytemuck::from_bytes(&dep_ref[..STAKE_DEPOSIT_SIZE]);
+        dep._reserved[8] == 1
+    };
 
-    // Update deposit PDA
-    let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
-    let deposit_mut: &mut StakeDeposit =
-        bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
-    deposit_mut.lp_amount = deposit_mut
-        .lp_amount
-        .checked_sub(lp_amount)
-        .ok_or(StakeError::InsufficientLpTokens)?;
+    if pool.tranche_enabled() && is_junior {
+        // Junior withdrawal: value from junior sub-pool
+        let junior_lp = pool.junior_total_lp();
+        let junior_bal = pool.junior_balance();
+        let junior_col = crate::math::calc_junior_collateral_for_withdraw(
+            junior_lp, junior_bal, lp_amount,
+        )
+        .ok_or(StakeError::Overflow)?;
+        if junior_col == 0 {
+            return Err(StakeError::ZeroAmount.into());
+        }
+        // Use junior_col instead of collateral_amount for junior withdrawals
+        // (junior may have taken losses, so their share price is lower)
 
-    msg!(
-        "Withdrew {} collateral, burned {} LP tokens",
-        collateral_amount,
-        lp_amount
-    );
+        // Burn LP tokens from user
+        invoke(
+            &spl_token::instruction::burn(
+                token_program.key,
+                user_lp_ata.key,
+                lp_mint.key,
+                user.key,
+                &[],
+                lp_amount,
+            )?,
+            &[
+                user_lp_ata.clone(),
+                lp_mint.clone(),
+                user.clone(),
+                token_program.clone(),
+            ],
+        )?;
+
+        // Transfer collateral: vault → user ATA
+        let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
+        let vault_auth_seeds: &[&[u8]] =
+            &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                vault.key,
+                user_ata.key,
+                vault_auth.key,
+                &[],
+                junior_col,
+            )?,
+            &[
+                vault.clone(),
+                user_ata.clone(),
+                vault_auth.clone(),
+                token_program.clone(),
+            ],
+            &[vault_auth_seeds],
+        )?;
+
+        // Update pool totals
+        pool.total_withdrawn = pool
+            .total_withdrawn
+            .checked_add(junior_col)
+            .ok_or(StakeError::Overflow)?;
+        pool.total_lp_supply = pool
+            .total_lp_supply
+            .checked_sub(lp_amount)
+            .ok_or(StakeError::Overflow)?;
+
+        // Update junior-specific state
+        pool.set_junior_total_lp(
+            pool.junior_total_lp()
+                .checked_sub(lp_amount)
+                .ok_or(StakeError::Overflow)?,
+        );
+        pool.set_junior_balance(
+            pool.junior_balance()
+                .checked_sub(junior_col)
+                .ok_or(StakeError::Overflow)?,
+        );
+
+        // Update deposit PDA
+        let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
+        let deposit_mut: &mut StakeDeposit =
+            bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
+        deposit_mut.lp_amount = deposit_mut
+            .lp_amount
+            .checked_sub(lp_amount)
+            .ok_or(StakeError::InsufficientLpTokens)?;
+
+        msg!(
+            "Junior withdrew {} collateral, burned {} LP tokens",
+            junior_col,
+            lp_amount
+        );
+    } else {
+        // Senior (default) withdrawal path
+
+        // Burn LP tokens from user
+        invoke(
+            &spl_token::instruction::burn(
+                token_program.key,
+                user_lp_ata.key,
+                lp_mint.key,
+                user.key,
+                &[],
+                lp_amount,
+            )?,
+            &[
+                user_lp_ata.clone(),
+                lp_mint.clone(),
+                user.clone(),
+                token_program.clone(),
+            ],
+        )?;
+
+        // Transfer collateral: vault → user ATA
+        let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
+        let vault_auth_seeds: &[&[u8]] =
+            &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                vault.key,
+                user_ata.key,
+                vault_auth.key,
+                &[],
+                collateral_amount,
+            )?,
+            &[
+                vault.clone(),
+                user_ata.clone(),
+                vault_auth.clone(),
+                token_program.clone(),
+            ],
+            &[vault_auth_seeds],
+        )?;
+
+        // Update pool totals
+        pool.total_withdrawn = pool
+            .total_withdrawn
+            .checked_add(collateral_amount)
+            .ok_or(StakeError::Overflow)?;
+        pool.total_lp_supply = pool
+            .total_lp_supply
+            .checked_sub(lp_amount)
+            .ok_or(StakeError::Overflow)?;
+
+        // Update deposit PDA
+        let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
+        let deposit_mut: &mut StakeDeposit =
+            bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
+        deposit_mut.lp_amount = deposit_mut
+            .lp_amount
+            .checked_sub(lp_amount)
+            .ok_or(StakeError::InsufficientLpTokens)?;
+
+        msg!(
+            "Withdrew {} collateral, burned {} LP tokens",
+            collateral_amount,
+            lp_amount
+        );
+    }
+
     Ok(())
 }
 
@@ -1116,6 +1269,256 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     pool.last_fee_accrual_slot = clock.slot;
     pool.last_vault_snapshot = current_balance;
 
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PERC-303: Senior/Junior LP Tranches
+// ═══════════════════════════════════════════════════════════════
+
+/// Admin enables/configures senior-junior tranches on a pool.
+fn process_admin_set_tranche_config(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    junior_fee_mult_bps: u16,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_ai = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut pool_data = pool_ai.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    // Validate multiplier: minimum 10000 (1x), maximum 50000 (5x)
+    if junior_fee_mult_bps < 10_000 || junior_fee_mult_bps > 50_000 {
+        msg!(
+            "AdminSetTrancheConfig: junior_fee_mult_bps must be 10000..50000, got {}",
+            junior_fee_mult_bps
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    pool.set_tranche_enabled(true);
+    pool.set_junior_fee_mult_bps(junior_fee_mult_bps);
+
+    msg!(
+        "Tranche config set: enabled=true, junior_fee_mult_bps={}",
+        junior_fee_mult_bps
+    );
+    Ok(())
+}
+
+/// Deposit into the junior (first-loss) tranche.
+/// Junior LP absorbs losses first but earns multiplied fee share.
+fn process_deposit_junior(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+) -> ProgramResult {
+    if amount == 0 {
+        return Err(StakeError::ZeroAmount.into());
+    }
+
+    let accounts_iter = &mut accounts.iter();
+
+    let user = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let user_ata = next_account_info(accounts_iter)?;
+    let vault = next_account_info(accounts_iter)?;
+    let lp_mint = next_account_info(accounts_iter)?;
+    let user_lp_ata = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let deposit_pda = next_account_info(accounts_iter)?;
+    let token_program = next_account_info(accounts_iter)?;
+    let clock_sysvar = next_account_info(accounts_iter)?;
+    let system_program = next_account_info(accounts_iter)?;
+
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if !pool.tranche_enabled() {
+        return Err(StakeError::TrancheNotEnabled.into());
+    }
+    if pool.lp_mint != lp_mint.key.to_bytes() {
+        return Err(StakeError::InvalidMint.into());
+    }
+    if pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool.admin_transferred != 1 {
+        return Err(StakeError::AdminNotTransferred.into());
+    }
+    // Block deposits after market resolution
+    if pool._reserved[0] != 0 {
+        return Err(StakeError::MarketResolved.into());
+    }
+
+    // Validate vault_auth PDA
+    let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    // Check deposit cap
+    if pool.deposit_cap > 0 {
+        let current_value = pool.total_pool_value().unwrap_or(0);
+        let new_value = current_value
+            .checked_add(amount)
+            .ok_or(StakeError::Overflow)?;
+        if new_value > pool.deposit_cap {
+            return Err(StakeError::DepositCapExceeded.into());
+        }
+    }
+
+    verify_token_program(token_program)?;
+
+    // Calculate LP tokens for junior tranche deposit
+    let junior_lp = pool.junior_total_lp();
+    let junior_bal = pool.junior_balance();
+    let lp_to_mint = crate::math::calc_junior_lp_for_deposit(junior_lp, junior_bal, amount)
+        .ok_or(StakeError::Overflow)?;
+    if lp_to_mint == 0 {
+        return Err(StakeError::ZeroAmount.into());
+    }
+
+    // Transfer collateral: user ATA → stake vault
+    invoke(
+        &spl_token::instruction::transfer(
+            token_program.key,
+            user_ata.key,
+            vault.key,
+            user.key,
+            &[],
+            amount,
+        )?,
+        &[
+            user_ata.clone(),
+            vault.clone(),
+            user.clone(),
+            token_program.clone(),
+        ],
+    )?;
+
+    // Mint LP tokens to user
+    let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+
+    invoke_signed(
+        &spl_token::instruction::mint_to(
+            token_program.key,
+            lp_mint.key,
+            user_lp_ata.key,
+            vault_auth.key,
+            &[],
+            lp_to_mint,
+        )?,
+        &[
+            lp_mint.clone(),
+            user_lp_ata.clone(),
+            vault_auth.clone(),
+            token_program.clone(),
+        ],
+        &[vault_auth_seeds],
+    )?;
+
+    // Update pool totals (both global and junior)
+    pool.total_deposited = pool
+        .total_deposited
+        .checked_add(amount)
+        .ok_or(StakeError::Overflow)?;
+    pool.total_lp_supply = pool
+        .total_lp_supply
+        .checked_add(lp_to_mint)
+        .ok_or(StakeError::Overflow)?;
+    pool.set_junior_total_lp(
+        pool.junior_total_lp()
+            .checked_add(lp_to_mint)
+            .ok_or(StakeError::Overflow)?,
+    );
+    pool.set_junior_balance(
+        pool.junior_balance()
+            .checked_add(amount)
+            .ok_or(StakeError::Overflow)?,
+    );
+
+    // Create or update per-user deposit PDA
+    let clock = Clock::from_account_info(clock_sysvar)?;
+    let (expected_deposit_pda, deposit_bump) =
+        state::derive_deposit_pda(program_id, pool_pda.key, user.key);
+    if *deposit_pda.key != expected_deposit_pda {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    if !deposit_pda.data_is_empty() && *deposit_pda.owner != *program_id {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    if deposit_pda.data_is_empty() {
+        let deposit_seeds: &[&[u8]] = &[
+            b"stake_deposit",
+            pool_pda.key.as_ref(),
+            user.key.as_ref(),
+            &[deposit_bump],
+        ];
+        let rent = Rent::get()?;
+        invoke_signed(
+            &system_instruction::create_account(
+                user.key,
+                deposit_pda.key,
+                rent.minimum_balance(STAKE_DEPOSIT_SIZE),
+                STAKE_DEPOSIT_SIZE as u64,
+                program_id,
+            ),
+            &[user.clone(), deposit_pda.clone(), system_program.clone()],
+            &[deposit_seeds],
+        )?;
+    }
+
+    let mut deposit_data = deposit_pda.try_borrow_mut_data()?;
+    let deposit: &mut StakeDeposit =
+        bytemuck::from_bytes_mut(&mut deposit_data[..STAKE_DEPOSIT_SIZE]);
+
+    if deposit.is_initialized != 1 {
+        deposit.set_discriminator();
+    }
+    deposit.is_initialized = 1;
+    deposit.bump = deposit_bump;
+    deposit.pool = pool_pda.key.to_bytes();
+    deposit.user = user.key.to_bytes();
+    deposit.last_deposit_slot = clock.slot;
+    deposit.lp_amount = deposit
+        .lp_amount
+        .checked_add(lp_to_mint)
+        .ok_or(StakeError::Overflow)?;
+    // Mark this deposit as junior tranche (_reserved[8] = 1)
+    deposit._reserved[8] = 1;
+
+    msg!(
+        "DepositJunior: {} collateral, minted {} LP tokens (junior tranche)",
+        amount,
+        lp_to_mint
+    );
     Ok(())
 }
 

@@ -182,6 +182,21 @@ pub enum StakeInstruction {
         cooldown_slots: u64,
         deposit_cap: u64,
     },
+
+    /// PERC-303: Enable/configure senior-junior LP tranches.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    AdminSetTrancheConfig {
+        junior_fee_mult_bps: u16,
+    },
+
+    /// PERC-303: Deposit into the junior (first-loss) tranche.
+    /// Junior LP absorbs losses first, earns multiplied fee share.
+    ///
+    /// Accounts: same as Deposit
+    DepositJunior { amount: u64 },
 }
 
 impl StakeInstruction {
@@ -296,6 +311,25 @@ impl StakeInstruction {
                     cooldown_slots,
                     deposit_cap,
                 })
+            }
+            // Tag 14 is reserved for PERC-313 AdminSetHwmConfig (PR #11)
+            15 => {
+                // PERC-303: AdminSetTrancheConfig: junior_fee_mult_bps(2)
+                if rest.len() < 2 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let junior_fee_mult_bps = u16::from_le_bytes(rest[0..2].try_into().unwrap());
+                Ok(Self::AdminSetTrancheConfig {
+                    junior_fee_mult_bps,
+                })
+            }
+            16 => {
+                // PERC-303: DepositJunior: amount(8)
+                if rest.len() < 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                Ok(Self::DepositJunior { amount })
             }
             _ => Err(ProgramError::InvalidInstructionData),
         }
@@ -482,6 +516,46 @@ mod tests {
     }
 
     // ── Invalid tag ──
+
+    // ── Tag 14: AdminSetTrancheConfig ──
+
+    #[test]
+    fn test_unpack_set_tranche_config() {
+        let mut data = vec![15u8]; // Tag 15 (14 reserved for PERC-313 HWM)
+        data.extend_from_slice(&20000u16.to_le_bytes()); // 2x multiplier
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminSetTrancheConfig {
+                junior_fee_mult_bps,
+            } => {
+                assert_eq!(junior_fee_mult_bps, 20000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_set_tranche_config_too_short() {
+        let data = vec![15u8, 1]; // only 1 byte
+        assert!(StakeInstruction::unpack(&data).is_err());
+    }
+
+    // ── Tag 16: DepositJunior ──
+
+    #[test]
+    fn test_unpack_deposit_junior() {
+        let mut data = vec![16u8];
+        data.extend_from_slice(&5000u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::DepositJunior { amount } => assert_eq!(amount, 5000),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_deposit_junior_too_short() {
+        let data = vec![16u8, 1, 2, 3]; // only 3 bytes
+        assert!(StakeInstruction::unpack(&data).is_err());
+    }
 
     #[test]
     fn test_unpack_invalid_tag() {
