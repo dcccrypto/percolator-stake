@@ -229,6 +229,42 @@ pub fn senior_protected(junior_balance: u64, _senior_balance: u64, loss_amount: 
     loss_amount <= junior_balance
 }
 
+// ═══════════════════════════════════════════════════════════════
+// PERC-313: High-Water Mark Protection Math
+// ═══════════════════════════════════════════════════════════════
+
+/// PERC-313: Calculate the high-water mark floor value.
+///
+/// `floor = epoch_high_water_tvl * hwm_floor_bps / 10_000`
+///
+/// Returns `Some(floor)` or `None` on overflow.
+/// Uses u128 intermediate to prevent overflow for large TVL values.
+pub fn hwm_floor(epoch_high_water_tvl: u64, hwm_floor_bps: u16) -> Option<u64> {
+    let floor = (epoch_high_water_tvl as u128)
+        .checked_mul(hwm_floor_bps as u128)?
+        .checked_div(10_000)?;
+    if floor > u64::MAX as u128 {
+        None
+    } else {
+        Some(floor as u64)
+    }
+}
+
+/// PERC-313: Check whether a withdrawal is allowed under HWM protection.
+///
+/// Returns `true` if the withdrawal is allowed (post-withdrawal TVL >= floor).
+/// Returns `false` if it would push TVL below the HWM floor.
+pub fn hwm_withdrawal_allowed(
+    post_withdrawal_tvl: u64,
+    epoch_high_water_tvl: u64,
+    hwm_floor_bps: u16,
+) -> bool {
+    match hwm_floor(epoch_high_water_tvl, hwm_floor_bps) {
+        Some(floor) => post_withdrawal_tvl >= floor,
+        None => false, // overflow → conservative deny
+    }
+}
+
 /// Calculate available flush amount.
 ///
 /// `available = deposited - withdrawn - already_flushed`
@@ -532,8 +568,6 @@ mod tests {
 
     #[test]
     fn test_junior_withdraw_after_loss() {
-        // Junior balance reduced from 1000 to 500 by losses
-        // 1000 LP tokens, 500 balance → each LP worth 0.5
         assert_eq!(
             calc_junior_collateral_for_withdraw(1000, 500, 1000),
             Some(500)
@@ -542,7 +576,6 @@ mod tests {
 
     #[test]
     fn test_senior_withdraw_full_protection() {
-        // Senior balance untouched (1000), junior absorbed all losses
         assert_eq!(
             calc_senior_collateral_for_withdraw(500, 1000, 500),
             Some(1000)
@@ -579,10 +612,6 @@ mod tests {
 
     #[test]
     fn test_distribute_fees_2x_multiplier() {
-        // Junior: 1000 balance, 2x mult → weight = 1000 * 20000 = 20_000_000
-        // Senior: 4000 balance, 1x base → weight = 4000 * 10000 = 40_000_000
-        // Total weight = 60_000_000
-        // Fee = 600 → junior gets 600 * 20M/60M = 200, senior gets 400
         let (jf, sf) = distribute_fees(1000, 4000, 20000, 600);
         assert_eq!(jf, 200);
         assert_eq!(sf, 400);
@@ -617,6 +646,66 @@ mod tests {
     #[test]
     fn test_senior_not_protected_when_loss_exceeds_junior() {
         assert!(!senior_protected(1000, 5000, 1500));
+    }
+
+    // ── PERC-313: HWM Floor ──
+
+    #[test]
+    fn test_hwm_floor_basic() {
+        assert_eq!(hwm_floor(1000, 5000), Some(500));
+    }
+
+    #[test]
+    fn test_hwm_floor_zero_tvl() {
+        assert_eq!(hwm_floor(0, 5000), Some(0));
+    }
+
+    #[test]
+    fn test_hwm_floor_zero_bps() {
+        assert_eq!(hwm_floor(1000, 0), Some(0));
+    }
+
+    #[test]
+    fn test_hwm_floor_100_percent() {
+        assert_eq!(hwm_floor(1000, 10_000), Some(1000));
+    }
+
+    #[test]
+    fn test_hwm_floor_rounds_down() {
+        assert_eq!(hwm_floor(999, 5000), Some(499));
+    }
+
+    #[test]
+    fn test_hwm_floor_large_values() {
+        let result = hwm_floor(u64::MAX, 5000);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), u64::MAX / 2);
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_above_floor() {
+        assert!(hwm_withdrawal_allowed(600, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_at_floor() {
+        assert!(hwm_withdrawal_allowed(500, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_blocked_below_floor() {
+        assert!(!hwm_withdrawal_allowed(499, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_zero_floor() {
+        assert!(hwm_withdrawal_allowed(0, 1000, 0));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_blocked_100_percent_floor() {
+        assert!(!hwm_withdrawal_allowed(999, 1000, 10_000));
+        assert!(hwm_withdrawal_allowed(1000, 1000, 10_000));
     }
 
     #[test]

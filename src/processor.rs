@@ -86,6 +86,10 @@ pub fn process(
             cooldown_slots,
             deposit_cap,
         } => process_init_trading_pool(program_id, accounts, cooldown_slots, deposit_cap),
+        StakeInstruction::AdminSetHwmConfig {
+            enabled,
+            hwm_floor_bps,
+        } => process_admin_set_hwm_config(program_id, accounts, enabled, hwm_floor_bps),
         StakeInstruction::AdminSetTrancheConfig {
             junior_fee_mult_bps,
         } => process_admin_set_tranche_config(program_id, accounts, junior_fee_mult_bps),
@@ -405,8 +409,14 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
 
-    // Create or update per-user deposit PDA (cooldown tracking)
+    // PERC-313: Refresh high-water mark after deposit (TVL increased)
     let clock = Clock::from_account_info(clock_sysvar)?;
+    if pool.hwm_enabled() {
+        let current_tvl = pool.total_pool_value().unwrap_or(0);
+        pool.refresh_hwm(clock.epoch, current_tvl);
+    }
+
+    // Create or update per-user deposit PDA (cooldown tracking)
     let (expected_deposit_pda, deposit_bump) =
         state::derive_deposit_pda(program_id, pool_pda.key, user.key);
     if *deposit_pda.key != expected_deposit_pda {
@@ -582,7 +592,25 @@ fn process_withdraw(
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // Burn LP tokens from user (single burn)
+    // PERC-313: High-water mark floor enforcement
+    if pool.hwm_enabled() {
+        let current_tvl = pool.total_pool_value().unwrap_or(0);
+        let hwm = pool.refresh_hwm(clock.epoch, current_tvl);
+        let post_tvl = current_tvl
+            .checked_sub(collateral_amount)
+            .ok_or(StakeError::Overflow)?;
+        if !crate::math::hwm_withdrawal_allowed(post_tvl, hwm, pool.hwm_floor_bps()) {
+            msg!(
+                "HWM block: post_tvl={} < floor(hwm={}, bps={})",
+                post_tvl,
+                hwm,
+                pool.hwm_floor_bps()
+            );
+            return Err(StakeError::WithdrawalBelowHwmFloor.into());
+        }
+    }
+
+    // Burn LP tokens from user
     invoke(
         &spl_token::instruction::burn(
             token_program.key,
@@ -1181,6 +1209,51 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 }
 
 // ═══════════════════════════════════════════════════════════════
+// 14: AdminSetHwmConfig — PERC-313
+// ═══════════════════════════════════════════════════════════════
+
+/// Admin sets high-water mark configuration for LP vault drain protection.
+fn process_admin_set_hwm_config(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    enabled: bool,
+    hwm_floor_bps: u16,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if hwm_floor_bps > 10_000 {
+        msg!("hwm_floor_bps {} exceeds 10000", hwm_floor_bps);
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    pool.set_hwm_enabled(enabled);
+    pool.set_hwm_floor_bps(hwm_floor_bps);
+
+    msg!(
+        "HWM config updated: enabled={}, floor_bps={}",
+        enabled,
+        hwm_floor_bps
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
 // PERC-303: Senior/Junior LP Tranches
 // ═══════════════════════════════════════════════════════════════
 
@@ -1228,7 +1301,6 @@ fn process_admin_set_tranche_config(
 }
 
 /// Deposit into the junior (first-loss) tranche.
-/// Junior LP absorbs losses first but earns multiplied fee share.
 fn process_deposit_junior(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1277,18 +1349,15 @@ fn process_deposit_junior(
     if pool.admin_transferred != 1 {
         return Err(StakeError::AdminNotTransferred.into());
     }
-    // Block deposits after market resolution
     if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
 
-    // Validate vault_auth PDA
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
         return Err(StakeError::InvalidAccount.into());
     }
 
-    // Check deposit cap
     if pool.deposit_cap > 0 {
         let current_value = pool.total_pool_value().unwrap_or(0);
         let new_value = current_value
@@ -1301,7 +1370,6 @@ fn process_deposit_junior(
 
     verify_token_program(token_program)?;
 
-    // Calculate LP tokens for junior tranche deposit
     let junior_lp = pool.junior_total_lp();
     let junior_bal = pool.junior_balance();
     let lp_to_mint = crate::math::calc_junior_lp_for_deposit(junior_lp, junior_bal, amount)
@@ -1310,7 +1378,6 @@ fn process_deposit_junior(
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // Transfer collateral: user ATA → stake vault
     invoke(
         &spl_token::instruction::transfer(
             token_program.key,
@@ -1328,7 +1395,6 @@ fn process_deposit_junior(
         ],
     )?;
 
-    // Mint LP tokens to user
     let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
@@ -1350,7 +1416,6 @@ fn process_deposit_junior(
         &[vault_auth_seeds],
     )?;
 
-    // Update pool totals (both global and junior)
     pool.total_deposited = pool
         .total_deposited
         .checked_add(amount)
@@ -1370,7 +1435,6 @@ fn process_deposit_junior(
             .ok_or(StakeError::Overflow)?,
     );
 
-    // Create or update per-user deposit PDA
     let clock = Clock::from_account_info(clock_sysvar)?;
     let (expected_deposit_pda, deposit_bump) =
         state::derive_deposit_pda(program_id, pool_pda.key, user.key);
@@ -1411,8 +1475,6 @@ fn process_deposit_junior(
         deposit.set_discriminator();
     }
 
-    // PERC-303: Prevent mixing senior and junior LP in the same deposit PDA.
-    // If this deposit has existing senior LP (flag != 1 and amount > 0), reject.
     if deposit._reserved[8] != 1 && deposit.lp_amount > 0 {
         return Err(StakeError::WrongTranche.into());
     }
@@ -1426,7 +1488,6 @@ fn process_deposit_junior(
         .lp_amount
         .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
-    // Mark this deposit as junior tranche (_reserved[8] = 1)
     deposit._reserved[8] = 1;
 
     msg!(
