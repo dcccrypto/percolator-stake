@@ -466,8 +466,14 @@ mod kani_proofs {
 
         let total = junior_loss as u128 + senior_loss as u128;
         assert!(total <= loss_amount as u128, "Distributed more than loss");
-        assert!(junior_loss <= junior_balance, "Junior lost more than balance");
-        assert!(senior_loss <= senior_balance, "Senior lost more than balance");
+        assert!(
+            junior_loss <= junior_balance,
+            "Junior lost more than balance"
+        );
+        assert!(
+            senior_loss <= senior_balance,
+            "Senior lost more than balance"
+        );
     }
 
     #[kani::proof]
@@ -517,9 +523,15 @@ mod kani_proofs {
 
         if let Some(floor_val) = hwm_floor(epoch_hwm, floor_bps) {
             if allowed {
-                assert!(post_tvl >= floor_val, "allowed withdrawal but post_tvl < floor");
+                assert!(
+                    post_tvl >= floor_val,
+                    "allowed withdrawal but post_tvl < floor"
+                );
             } else {
-                assert!(post_tvl < floor_val, "blocked withdrawal but post_tvl >= floor");
+                assert!(
+                    post_tvl < floor_val,
+                    "blocked withdrawal but post_tvl >= floor"
+                );
             }
         } else {
             assert!(!allowed, "overflow floor must block");
@@ -539,7 +551,10 @@ mod kani_proofs {
         kani::assume(tvl_b <= 1_000_000_000);
 
         if let (Some(floor_a), Some(floor_b)) = (hwm_floor(tvl_a, bps), hwm_floor(tvl_b, bps)) {
-            assert!(floor_b >= floor_a, "higher TVL must produce higher or equal floor");
+            assert!(
+                floor_b >= floor_a,
+                "higher TVL must produce higher or equal floor"
+            );
         }
     }
 
