@@ -466,8 +466,14 @@ mod kani_proofs {
 
         let total = junior_loss as u128 + senior_loss as u128;
         assert!(total <= loss_amount as u128, "Distributed more than loss");
-        assert!(junior_loss <= junior_balance, "Junior lost more than balance");
-        assert!(senior_loss <= senior_balance, "Senior lost more than balance");
+        assert!(
+            junior_loss <= junior_balance,
+            "Junior lost more than balance"
+        );
+        assert!(
+            senior_loss <= senior_balance,
+            "Senior lost more than balance"
+        );
     }
 
     #[kani::proof]
@@ -517,9 +523,15 @@ mod kani_proofs {
 
         if let Some(floor_val) = hwm_floor(epoch_hwm, floor_bps) {
             if allowed {
-                assert!(post_tvl >= floor_val, "allowed withdrawal but post_tvl < floor");
+                assert!(
+                    post_tvl >= floor_val,
+                    "allowed withdrawal but post_tvl < floor"
+                );
             } else {
-                assert!(post_tvl < floor_val, "blocked withdrawal but post_tvl >= floor");
+                assert!(
+                    post_tvl < floor_val,
+                    "blocked withdrawal but post_tvl >= floor"
+                );
             }
         } else {
             assert!(!allowed, "overflow floor must block");
@@ -539,7 +551,10 @@ mod kani_proofs {
         kani::assume(tvl_b <= 1_000_000_000);
 
         if let (Some(floor_a), Some(floor_b)) = (hwm_floor(tvl_a, bps), hwm_floor(tvl_b, bps)) {
-            assert!(floor_b >= floor_a, "higher TVL must produce higher or equal floor");
+            assert!(
+                floor_b >= floor_a,
+                "higher TVL must produce higher or equal floor"
+            );
         }
     }
 
@@ -555,6 +570,186 @@ mod kani_proofs {
 
         if let Some(floor) = hwm_floor(tvl, bps) {
             assert!(floor <= tvl, "floor must never exceed HWM TVL");
+        }
+    }
+
+    // =========================================================================
+    // PERC-320: Additional proofs to reach 30+ target
+    // =========================================================================
+
+    /// Prove: HWM withdrawal allowed returns true when TVL is above floor.
+    #[kani::proof]
+    fn proof_hwm_withdrawal_allowed_above_floor() {
+        use percolator_stake::math::hwm_withdrawal_allowed;
+
+        let current_tvl: u64 = kani::any();
+        let withdrawal_amount: u64 = kani::any();
+        let epoch_hwm: u64 = kani::any();
+        let floor_bps: u16 = kani::any();
+
+        kani::assume(current_tvl <= 1_000_000_000);
+        kani::assume(withdrawal_amount <= current_tvl);
+        kani::assume(epoch_hwm <= 1_000_000_000);
+        kani::assume(floor_bps <= 10_000);
+        kani::assume(floor_bps > 0);
+
+        // If after withdrawal TVL is still above epoch_hwm, must be allowed
+        let post_tvl = current_tvl - withdrawal_amount;
+        if post_tvl >= epoch_hwm {
+            let allowed =
+                hwm_withdrawal_allowed(current_tvl, withdrawal_amount, epoch_hwm, floor_bps);
+            assert!(
+                allowed,
+                "withdrawal keeping TVL >= epoch HWM must be allowed"
+            );
+        }
+    }
+
+    /// Prove: flush_available never exceeds total pool value.
+    #[kani::proof]
+    fn proof_flush_available_bounded_by_pool_value() {
+        use percolator_stake::math::{flush_available, pool_value};
+
+        let total_deposited: u64 = kani::any();
+        let total_withdrawn: u64 = kani::any();
+        let total_flushed: u64 = kani::any();
+
+        kani::assume(total_deposited <= 1_000_000_000);
+        kani::assume(total_withdrawn <= total_deposited);
+        kani::assume(total_flushed <= total_deposited);
+
+        let avail = flush_available(total_deposited, total_withdrawn, total_flushed);
+
+        if let Some(pv) = pool_value(total_deposited, total_withdrawn) {
+            assert!(avail <= pv, "flush available must not exceed pool value");
+        }
+    }
+
+    /// Prove: senior protected means senior never loses while junior has balance.
+    #[kani::proof]
+    fn proof_senior_protected_correctness() {
+        use percolator_stake::math::senior_protected;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let loss_amount: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance <= 1_000_000_000);
+        kani::assume(loss_amount <= junior_balance + senior_balance);
+
+        let protected = senior_protected(junior_balance, senior_balance, loss_amount);
+
+        // If loss <= junior, senior is protected
+        if loss_amount <= junior_balance {
+            assert!(
+                protected,
+                "senior must be protected when loss <= junior balance"
+            );
+        }
+    }
+
+    /// Prove: fee distribution is conservative (no fees created from nothing).
+    #[kani::proof]
+    fn proof_fee_distribution_total_bounded() {
+        use percolator_stake::math::distribute_fees;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let fee_amount: u64 = kani::any();
+        let junior_fee_bps: u16 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance <= 1_000_000_000);
+        kani::assume(fee_amount <= 1_000_000_000);
+        kani::assume(junior_fee_bps <= 10_000);
+
+        let (junior_fee, senior_fee) =
+            distribute_fees(junior_balance, senior_balance, fee_amount, junior_fee_bps);
+
+        assert!(
+            junior_fee + senior_fee <= fee_amount,
+            "distributed fees must not exceed total fee amount"
+        );
+    }
+
+    /// Prove: pool_value_with_fees never exceeds deposited + fees.
+    #[kani::proof]
+    fn proof_pool_value_with_fees_bounded() {
+        use percolator_stake::math::pool_value_with_fees;
+
+        let total_deposited: u64 = kani::any();
+        let total_withdrawn: u64 = kani::any();
+        let pending_fees: u64 = kani::any();
+
+        kani::assume(total_deposited <= 1_000_000_000);
+        kani::assume(total_withdrawn <= total_deposited);
+        kani::assume(pending_fees <= 1_000_000_000);
+
+        if let Some(pv) = pool_value_with_fees(total_deposited, total_withdrawn, pending_fees) {
+            let max =
+                (total_deposited as u128) - (total_withdrawn as u128) + (pending_fees as u128);
+            assert!(
+                pv as u128 <= max,
+                "pool value with fees must not exceed deposited - withdrawn + fees"
+            );
+        }
+    }
+
+    /// Prove: loss distribution is conservative (total loss absorbed <= loss_amount).
+    #[kani::proof]
+    fn proof_loss_distribution_total_bounded() {
+        use percolator_stake::math::distribute_loss;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let loss_amount: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance <= 1_000_000_000);
+        kani::assume(loss_amount <= junior_balance.saturating_add(senior_balance));
+
+        let (junior_loss, senior_loss) =
+            distribute_loss(junior_balance, senior_balance, loss_amount);
+
+        assert!(
+            junior_loss + senior_loss <= loss_amount,
+            "distributed losses must not exceed total loss"
+        );
+        assert!(
+            junior_loss <= junior_balance,
+            "junior loss must not exceed junior balance"
+        );
+        assert!(
+            senior_loss <= senior_balance,
+            "senior loss must not exceed senior balance"
+        );
+    }
+
+    /// Prove: junior tranche always absorbs loss before senior.
+    #[kani::proof]
+    fn proof_junior_absorbs_first() {
+        use percolator_stake::math::distribute_loss;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let loss_amount: u64 = kani::any();
+
+        kani::assume(junior_balance > 0 && junior_balance <= 1_000_000_000);
+        kani::assume(senior_balance > 0 && senior_balance <= 1_000_000_000);
+        kani::assume(
+            loss_amount > 0 && loss_amount <= junior_balance.saturating_add(senior_balance),
+        );
+
+        let (junior_loss, senior_loss) =
+            distribute_loss(junior_balance, senior_balance, loss_amount);
+
+        // Senior only takes loss if junior is fully depleted
+        if senior_loss > 0 {
+            assert!(
+                junior_loss >= junior_balance,
+                "senior must not absorb loss while junior has remaining balance"
+            );
         }
     }
 }
