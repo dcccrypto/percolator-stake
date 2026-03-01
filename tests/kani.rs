@@ -429,8 +429,6 @@ mod kani_proofs {
     // PERC-303: Senior/Junior Tranche Safety
     // ═══════════════════════════════════════════════════════════
 
-    /// PROOF: Senior tranche never takes losses while junior balance > 0.
-    /// For any loss amount ≤ junior_balance, distribute_loss returns senior_loss == 0.
     #[kani::proof]
     fn proof_senior_never_loses_while_junior_positive() {
         use percolator_stake::math::distribute_loss;
@@ -442,18 +440,15 @@ mod kani_proofs {
         kani::assume(junior_balance > 0);
         kani::assume(junior_balance <= 1_000_000_000);
         kani::assume(senior_balance <= 1_000_000_000);
-        kani::assume(loss_amount <= junior_balance); // Loss within junior capacity
+        kani::assume(loss_amount <= junior_balance);
 
         let (junior_loss, senior_loss) =
             distribute_loss(junior_balance, senior_balance, loss_amount);
 
-        // Senior MUST NOT take any loss
         assert_eq!(senior_loss, 0, "Senior lost while junior was positive");
-        // Junior absorbs the full loss
         assert_eq!(junior_loss, loss_amount, "Junior did not absorb full loss");
     }
 
-    /// PROOF: Loss distribution is conservative — total loss never exceeds input.
     #[kani::proof]
     fn proof_loss_distribution_conservative() {
         use percolator_stake::math::distribute_loss;
@@ -469,23 +464,12 @@ mod kani_proofs {
         let (junior_loss, senior_loss) =
             distribute_loss(junior_balance, senior_balance, loss_amount);
 
-        // Total distributed ≤ loss_amount
         let total = junior_loss as u128 + senior_loss as u128;
         assert!(total <= loss_amount as u128, "Distributed more than loss");
-
-        // Junior never loses more than its balance
-        assert!(
-            junior_loss <= junior_balance,
-            "Junior lost more than balance"
-        );
-        // Senior never loses more than its balance
-        assert!(
-            senior_loss <= senior_balance,
-            "Senior lost more than balance"
-        );
+        assert!(junior_loss <= junior_balance, "Junior lost more than balance");
+        assert!(senior_loss <= senior_balance, "Senior lost more than balance");
     }
 
-    /// PROOF: Fee distribution conserves total — junior_fee + senior_fee ≤ total_fee.
     #[kani::proof]
     fn proof_fee_distribution_conservative() {
         use percolator_stake::math::distribute_fees;
@@ -511,5 +495,66 @@ mod kani_proofs {
             jf as u128 + sf as u128 <= total_fee as u128,
             "Fee distribution exceeds total"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PERC-313: High-Water Mark Floor
+    // ═══════════════════════════════════════════════════════════
+
+    #[kani::proof]
+    fn proof_withdrawal_blocked_below_hwm_floor() {
+        use percolator_stake::math::{hwm_floor, hwm_withdrawal_allowed};
+
+        let post_tvl: u64 = kani::any();
+        let epoch_hwm: u64 = kani::any();
+        let floor_bps: u16 = kani::any();
+
+        kani::assume(floor_bps <= 10_000);
+        kani::assume(epoch_hwm <= 1_000_000_000);
+        kani::assume(post_tvl <= 1_000_000_000);
+
+        let allowed = hwm_withdrawal_allowed(post_tvl, epoch_hwm, floor_bps);
+
+        if let Some(floor_val) = hwm_floor(epoch_hwm, floor_bps) {
+            if allowed {
+                assert!(post_tvl >= floor_val, "allowed withdrawal but post_tvl < floor");
+            } else {
+                assert!(post_tvl < floor_val, "blocked withdrawal but post_tvl >= floor");
+            }
+        } else {
+            assert!(!allowed, "overflow floor must block");
+        }
+    }
+
+    #[kani::proof]
+    fn proof_hwm_floor_monotonic_in_tvl() {
+        use percolator_stake::math::hwm_floor;
+
+        let tvl_a: u64 = kani::any();
+        let tvl_b: u64 = kani::any();
+        let bps: u16 = kani::any();
+
+        kani::assume(bps <= 10_000);
+        kani::assume(tvl_a <= tvl_b);
+        kani::assume(tvl_b <= 1_000_000_000);
+
+        if let (Some(floor_a), Some(floor_b)) = (hwm_floor(tvl_a, bps), hwm_floor(tvl_b, bps)) {
+            assert!(floor_b >= floor_a, "higher TVL must produce higher or equal floor");
+        }
+    }
+
+    #[kani::proof]
+    fn proof_hwm_floor_bounded_by_tvl() {
+        use percolator_stake::math::hwm_floor;
+
+        let tvl: u64 = kani::any();
+        let bps: u16 = kani::any();
+
+        kani::assume(bps <= 10_000);
+        kani::assume(tvl <= 1_000_000_000);
+
+        if let Some(floor) = hwm_floor(tvl, bps) {
+            assert!(floor <= tvl, "floor must never exceed HWM TVL");
+        }
     }
 }

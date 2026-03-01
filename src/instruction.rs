@@ -183,6 +183,21 @@ pub enum StakeInstruction {
         deposit_cap: u64,
     },
 
+    /// PERC-313: Set high-water mark configuration.
+    /// Enables/disables HWM protection and sets the floor percentage.
+    /// When enabled, withdrawals that would push vault TVL below
+    /// `hwm_floor_bps%` of the epoch's high-water mark TVL are blocked.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    AdminSetHwmConfig {
+        /// Enable (true) or disable (false) HWM protection
+        enabled: bool,
+        /// Floor as basis points of epoch HWM TVL (e.g. 5000 = 50%)
+        hwm_floor_bps: u16,
+    },
+
     /// PERC-303: Enable/configure senior-junior LP tranches.
     ///
     /// Accounts:
@@ -310,7 +325,18 @@ impl StakeInstruction {
                     deposit_cap,
                 })
             }
-            // Tag 14 is reserved for PERC-313 AdminSetHwmConfig (PR #11)
+            14 => {
+                // PERC-313: AdminSetHwmConfig: enabled(1) + hwm_floor_bps(2)
+                if rest.len() < 3 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let enabled = rest[0] != 0;
+                let hwm_floor_bps = u16::from_le_bytes(rest[1..3].try_into().unwrap());
+                Ok(Self::AdminSetHwmConfig {
+                    enabled,
+                    hwm_floor_bps,
+                })
+            }
             15 => {
                 // PERC-303: AdminSetTrancheConfig: junior_fee_mult_bps(2)
                 if rest.len() < 2 {
@@ -564,6 +590,48 @@ mod tests {
     #[test]
     fn test_unpack_empty() {
         let data: Vec<u8> = vec![];
+        assert!(StakeInstruction::unpack(&data).is_err());
+    }
+
+    // ── Tag 14: AdminSetHwmConfig ──
+
+    #[test]
+    fn test_unpack_hwm_config_enabled() {
+        let mut data = vec![14u8];
+        data.push(1); // enabled = true
+        data.extend_from_slice(&5000u16.to_le_bytes()); // hwm_floor_bps
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminSetHwmConfig {
+                enabled,
+                hwm_floor_bps,
+            } => {
+                assert!(enabled);
+                assert_eq!(hwm_floor_bps, 5000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_hwm_config_disabled() {
+        let mut data = vec![14u8];
+        data.push(0); // enabled = false
+        data.extend_from_slice(&0u16.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::AdminSetHwmConfig {
+                enabled,
+                hwm_floor_bps,
+            } => {
+                assert!(!enabled);
+                assert_eq!(hwm_floor_bps, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_hwm_config_too_short() {
+        let data = vec![14u8, 1]; // only 1 byte of payload, need 3
         assert!(StakeInstruction::unpack(&data).is_err());
     }
 
