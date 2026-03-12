@@ -1,0 +1,35 @@
+name: Kani (Manual)
+
+# Kani is not run automatically on every PR.
+# This workflow allows manual on-demand runs from the Actions tab.
+# Run before merging any PR that touches math, proof logic, or invariant code.
+
+on:
+  workflow_dispatch:
+    inputs:
+      harness:
+        description: 'Harness prefix to run (or blank for all kani-proofs harnesses)'
+        required: false
+        default: ''
+
+concurrency:
+  group: kani-manual
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kani:
+    name: Kani Proofs (On-Demand)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Run Kani harnesses (kani-proofs crate)
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          working-directory: kani-proofs
+          args: --lib --output-format terse --jobs 4 ${{ github.event.inputs.harness && format('--harness {0}', github.event.inputs.harness) || '' }}
+        timeout-minutes: 175

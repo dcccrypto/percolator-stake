@@ -111,7 +111,8 @@ cargo build-sbf
 # Run tests
 cargo test
 
-# Run Kani proofs (requires cargo-kani)
+# Run Kani proofs (local-only — not run in CI; see .github/workflows/kani-manual.yml for on-demand runs)
+# One-time setup: cargo install --locked kani-verifier && cargo kani setup
 cd kani-proofs && cargo kani --lib
 ```
 
