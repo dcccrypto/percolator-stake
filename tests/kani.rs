@@ -1,5 +1,14 @@
 //! Kani formal verification proofs for percolator-stake LP math.
 //!
+//! ## DEPRECATION NOTICE (PERC-761 P2)
+//! This file is superseded by `kani-proofs/src/lib.rs`, which is the canonical
+//! location for all LP-math Kani proofs. `kani-proofs/` uses u32/u64 mirror
+//! types for CBMC tractability and now includes INDUCTIVE proofs (§14, PERC-760).
+//! New proofs should be added there, not here.
+//!
+//! This file is retained for CI compatibility until kani-proofs/ covers all
+//! harnesses present here. Tracked in PERC-761.
+//!
 //! Proves critical safety properties on the PURE MATH layer:
 //! 1. LP conservation: no value creation/destruction through deposit/withdraw
 //! 2. Arithmetic safety: no overflow/panic at any valid input
