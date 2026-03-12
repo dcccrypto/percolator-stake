@@ -26,6 +26,13 @@
 //! causing CI timeouts at full u32 width. Coverage improvement for the bounded
 //! conservation proofs vs prior <20 bound: 0xFFFF / 19 ≈ 3449×.
 //!
+//! HARDENING (PERC-783): All symbolic proofs now include `kani::cover!()` guards
+//! on their critical assertion paths. This ensures every proof has at least one
+//! reachable execution path that actually exercises the core invariant — proofs
+//! that only satisfy `kani::assume` constraints without reaching the `assert!`
+//! would be vacuously true and useless. The cover! check forces CBMC to confirm
+//! the interesting path is reachable under the given constraints.
+//!
 //! Run all:   cargo kani --lib
 //! Run one:   cargo kani --harness proof_deposit_withdraw_no_inflation_inductive
 
@@ -57,7 +64,9 @@ pub fn calc_lp_for_deposit(supply: u32, pool_value: u32, deposit: u32) -> Option
 
 /// Collateral for LP burn. floor(lp * pool_value / supply).
 pub fn calc_collateral_for_withdraw(supply: u32, pool_value: u32, lp: u32) -> Option<u32> {
-    if supply == 0 { return None; }
+    if supply == 0 {
+        return None;
+    }
     let col = (lp as u64)
         .checked_mul(pool_value as u64)?
         .checked_div(supply as u64)?;
@@ -69,7 +78,7 @@ pub fn calc_collateral_for_withdraw(supply: u32, pool_value: u32, lp: u32) -> Op
     }
 }
 
-/// Pool value = deposited - withdrawn + returned.
+/// Pool value = deposited - withdrawn.
 /// Mirrors StakePool::total_pool_value() after C4 fix.
 pub fn pool_value(deposited: u32, withdrawn: u32) -> Option<u32> {
     deposited.checked_sub(withdrawn)
@@ -77,8 +86,16 @@ pub fn pool_value(deposited: u32, withdrawn: u32) -> Option<u32> {
 
 /// Full pool value with flush tracking and insurance returns.
 /// Mirrors StakePool::total_pool_value(): deposited - withdrawn - flushed + returned.
-pub fn pool_value_with_flush(deposited: u32, withdrawn: u32, flushed: u32, returned: u32) -> Option<u32> {
-    deposited.checked_sub(withdrawn)?.checked_sub(flushed)?.checked_add(returned)
+pub fn pool_value_with_flush(
+    deposited: u32,
+    withdrawn: u32,
+    flushed: u32,
+    returned: u32,
+) -> Option<u32> {
+    deposited
+        .checked_sub(withdrawn)?
+        .checked_sub(flushed)?
+        .checked_add(returned)
 }
 
 /// Flush available = deposited - withdrawn - flushed (saturating).
@@ -94,7 +111,9 @@ pub fn cooldown_elapsed(current_slot: u32, deposit_slot: u32, cooldown_slots: u3
 /// Deposit cap check: returns true if deposit would exceed cap.
 /// Cap of 0 = uncapped.
 pub fn exceeds_cap(total_deposited: u32, new_deposit: u32, cap: u32) -> bool {
-    if cap == 0 { return false; }
+    if cap == 0 {
+        return false;
+    }
     match total_deposited.checked_add(new_deposit) {
         Some(total) => total > cap,
         None => true, // overflow = definitely exceeds
@@ -113,7 +132,9 @@ pub fn pool_inv(supply: u32, pv: u32) -> bool {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// KANI PROOFS — 45 harnesses (43 existing + 2 INDUCTIVE §14)
+// KANI PROOFS — 44 harnesses (42 bounded + 2 INDUCTIVE §14)
+// PERC-783: kani::cover!() added to all symbolic proofs to guard
+// against vacuous satisfaction of kani::assume constraints.
 // ═══════════════════════════════════════════════════════════════
 
 #[cfg(kani)]
@@ -146,8 +167,13 @@ mod proofs {
         let np = pv + deposit;
 
         let back = match calc_collateral_for_withdraw(ns, np, lp) {
-            Some(v) => v, None => return,
+            Some(v) => v,
+            None => return,
         };
+        kani::cover!(
+            back <= deposit,
+            "COVER: anti-inflation assertion path is reachable"
+        );
         assert!(back <= deposit);
     }
 
@@ -161,6 +187,10 @@ mod proofs {
         assert_eq!(lp, amount);
 
         let back = calc_collateral_for_withdraw(lp, amount, lp).unwrap();
+        kani::cover!(
+            back == amount,
+            "COVER: first-depositor full-roundtrip exact path is reachable"
+        );
         assert_eq!(back, amount);
     }
 
@@ -185,21 +215,30 @@ mod proofs {
 
         // B deposits at a different exchange rate (supply=a, value=a+appreciation)
         let b_lp = match calc_lp_for_deposit(a_lp, pv_after_appreciation, b) {
-            Some(lp) if lp > 0 => lp, _ => return,
+            Some(lp) if lp > 0 => lp,
+            _ => return,
         };
         let s2 = a_lp + b_lp;
         let pv2 = pv_after_appreciation + b;
 
         // A withdraws first
         let a_back = match calc_collateral_for_withdraw(s2, pv2, a_lp) {
-            Some(v) => v, None => return,
+            Some(v) => v,
+            None => return,
         };
         // B withdraws from remainder
         let b_back = match calc_collateral_for_withdraw(s2 - a_lp, pv2 - a_back, b_lp) {
-            Some(v) => v, None => return,
+            Some(v) => v,
+            None => return,
         };
+        let total_out = (a_back as u64) + (b_back as u64);
+        let total_in = (a as u64) + (b as u64) + (appreciation as u64);
+        kani::cover!(
+            total_out <= total_in,
+            "COVER: two-depositor conservation assertion path is reachable"
+        );
         // Conservation: total withdrawn ≤ total deposited + appreciation
-        assert!((a_back as u64) + (b_back as u64) <= (a as u64) + (b as u64) + (appreciation as u64));
+        assert!(total_out <= total_in);
     }
 
     /// Late depositor can't dilute early depositor's share (with non-unity exchange rate).
@@ -219,28 +258,36 @@ mod proofs {
 
         // A deposits into existing pool with arbitrary ratio
         let a_lp = match calc_lp_for_deposit(init_s, init_pv, a_dep) {
-            Some(lp) if lp > 0 => lp, _ => return,
+            Some(lp) if lp > 0 => lp,
+            _ => return,
         };
         let s_after_a = init_s + a_lp;
         let pv_after_a = init_pv + a_dep;
 
         // A's value before B deposits
         let a_value_before = match calc_collateral_for_withdraw(s_after_a, pv_after_a, a_lp) {
-            Some(v) => v, None => return,
+            Some(v) => v,
+            None => return,
         };
 
         // B deposits (changes the pool state)
         let b_lp = match calc_lp_for_deposit(s_after_a, pv_after_a, b_dep) {
-            Some(lp) if lp > 0 => lp, _ => return,
+            Some(lp) if lp > 0 => lp,
+            _ => return,
         };
         let s_after_b = s_after_a + b_lp;
         let pv_after_b = pv_after_a + b_dep;
 
         // A's value after B deposits
         let a_value_after = match calc_collateral_for_withdraw(s_after_b, pv_after_b, a_lp) {
-            Some(v) => v, None => return,
+            Some(v) => v,
+            None => return,
         };
 
+        kani::cover!(
+            a_value_after >= a_value_before,
+            "COVER: no-dilution assertion path is reachable"
+        );
         // A's share should not decrease after B joins
         assert!(a_value_after >= a_value_before);
     }
@@ -265,6 +312,10 @@ mod proofs {
 
         // Pool value after full return (all flushed tokens come back)
         let pv_after_return = pool_value_with_flush(dep, wd, flush, flush).unwrap();
+        kani::cover!(
+            pv_after_return == pv_original,
+            "COVER: flush full-return conservation path is reachable"
+        );
         assert_eq!(pv_after_return, pv_original);
     }
 
@@ -285,7 +336,9 @@ mod proofs {
         kani::assume(s <= 0xFFFF);
         kani::assume(pv <= 0xFFFF);
         kani::assume(dep <= 0xFFFF);
-        let _ = calc_lp_for_deposit(s, pv, dep);
+        let result = calc_lp_for_deposit(s, pv, dep);
+        kani::cover!(true, "COVER: lp_deposit_no_panic completed without panic");
+        let _ = result;
     }
 
     /// Overflow guard: when deposit * supply / pool_value would exceed u32::MAX, returns None.
@@ -312,6 +365,10 @@ mod proofs {
             assert!(lp <= u32::MAX);
             // Reverse: the u64 product was within bounds (lp * pv <= deposit * supply)
             if pv > 0 {
+                kani::cover!(
+                    (lp as u64) * (pv as u64) <= (deposit as u64) * (supply as u64),
+                    "COVER: overflow-guard rounding invariant path is reachable"
+                );
                 assert!((lp as u64) * (pv as u64) <= (deposit as u64) * (supply as u64));
             }
         }
@@ -342,17 +399,29 @@ mod proofs {
         kani::assume(s <= 0xFFFF);
         kani::assume(pv <= 0xFFFF);
         kani::assume(lp <= 0xFFFF);
-        let _ = calc_collateral_for_withdraw(s, pv, lp);
+        let result = calc_collateral_for_withdraw(s, pv, lp);
+        kani::cover!(
+            true,
+            "COVER: collateral_withdraw_no_panic completed without panic"
+        );
+        let _ = result;
     }
 
     #[kani::proof]
     fn proof_pool_value_no_panic() {
-        let _ = pool_value(kani::any(), kani::any());
+        let result = pool_value(kani::any(), kani::any());
+        kani::cover!(true, "COVER: pool_value_no_panic completed without panic");
+        let _ = result;
     }
 
     #[kani::proof]
     fn proof_flush_available_no_panic() {
-        let _ = flush_available(kani::any(), kani::any(), kani::any());
+        let result = flush_available(kani::any(), kani::any(), kani::any());
+        kani::cover!(
+            true,
+            "COVER: flush_available_no_panic completed without panic"
+        );
+        let _ = result;
     }
 
     // ════════════════════════════════════════════════════════════
@@ -373,6 +442,10 @@ mod proofs {
         if let Some(lp) = calc_lp_for_deposit(s, pv, dep) {
             // floor rounding: lp = floor(dep * s / pv)
             // Invariant: lp * pv <= dep * s (pool never overissues)
+            kani::cover!(
+                (lp as u64) * (pv as u64) <= (dep as u64) * (s as u64),
+                "COVER: LP rounding pool-favoring assertion path is reachable"
+            );
             assert!((lp as u64) * (pv as u64) <= (dep as u64) * (s as u64));
         }
     }
@@ -389,8 +462,17 @@ mod proofs {
         kani::assume(sm > 0 && sm < 50);
         kani::assume(lg > sm && lg < 100);
 
-        match (calc_lp_for_deposit(s, pv, sm), calc_lp_for_deposit(s, pv, lg)) {
-            (Some(ls), Some(ll)) => assert!(ll >= ls),
+        match (
+            calc_lp_for_deposit(s, pv, sm),
+            calc_lp_for_deposit(s, pv, lg),
+        ) {
+            (Some(ls), Some(ll)) => {
+                kani::cover!(
+                    ll >= ls,
+                    "COVER: larger-deposit-more-lp monotone path is reachable"
+                );
+                assert!(ll >= ls)
+            }
             _ => {}
         }
     }
@@ -407,8 +489,17 @@ mod proofs {
         kani::assume(sm > 0 && sm < 50);
         kani::assume(lg > sm && lg <= s);
 
-        match (calc_collateral_for_withdraw(s, pv, sm), calc_collateral_for_withdraw(s, pv, lg)) {
-            (Some(cs), Some(cl)) => assert!(cl >= cs),
+        match (
+            calc_collateral_for_withdraw(s, pv, sm),
+            calc_collateral_for_withdraw(s, pv, lg),
+        ) {
+            (Some(cs), Some(cl)) => {
+                kani::cover!(
+                    cl >= cs,
+                    "COVER: larger-burn-more-collateral monotone path is reachable"
+                );
+                assert!(cl >= cs)
+            }
             _ => {}
         }
     }
@@ -438,6 +529,10 @@ mod proofs {
 
         // Same amount deposited at the same ratio → same LP issued (no dilution, no inflation).
         // Kani proves this algebraic identity holds for ALL symbolic values of amount.
+        kani::cover!(
+            lp2 == lp1,
+            "COVER: equal-deposits-equal-lp determinism path is reachable"
+        );
         assert_eq!(lp2, lp1);
     }
 
@@ -453,6 +548,10 @@ mod proofs {
         kani::assume(s > 0 && s < 100);
         kani::assume(pv < 100);
         if let Some(col) = calc_collateral_for_withdraw(s, pv, s) {
+            kani::cover!(
+                col <= pv,
+                "COVER: full-burn-bounded assertion path is reachable"
+            );
             assert!(col <= pv);
         }
     }
@@ -467,8 +566,17 @@ mod proofs {
         kani::assume(pv > 0 && pv < 100);
         kani::assume(p > 0 && p < s);
 
-        match (calc_collateral_for_withdraw(s, pv, s), calc_collateral_for_withdraw(s, pv, p)) {
-            (Some(f), Some(pp)) => assert!(pp <= f),
+        match (
+            calc_collateral_for_withdraw(s, pv, s),
+            calc_collateral_for_withdraw(s, pv, p),
+        ) {
+            (Some(f), Some(pp)) => {
+                kani::cover!(
+                    pp <= f,
+                    "COVER: partial-less-than-full assertion path is reachable"
+                );
+                assert!(pp <= f)
+            }
             _ => {}
         }
     }
@@ -489,7 +597,9 @@ mod proofs {
         let flushed: u32 = kani::any();
         let returned: u32 = kani::any();
         let flush_amount: u32 = kani::any();
-        kani::assume(dep < 100 && wd < 100 && flushed < 100 && returned < 100 && flush_amount < 100);
+        kani::assume(
+            dep < 100 && wd < 100 && flushed < 100 && returned < 100 && flush_amount < 100,
+        );
         kani::assume(wd <= dep);
         kani::assume(flushed <= dep - wd);
         kani::assume(returned <= flushed);
@@ -505,6 +615,10 @@ mod proofs {
         };
 
         // Each token flushed reduces pool value by exactly 1 — no rounding, no leakage
+        kani::cover!(
+            pv_before - flush_amount == pv_after,
+            "COVER: flush-preserves-value exact-accounting path is reachable"
+        );
         assert_eq!(pv_before - flush_amount, pv_after);
     }
 
@@ -515,7 +629,12 @@ mod proofs {
         let w: u32 = kani::any();
         let f: u32 = kani::any();
         kani::assume(d < 100 && w < 100 && f < 100);
-        assert!(flush_available(d, w, f) <= d);
+        let avail = flush_available(d, w, f);
+        kani::cover!(
+            avail <= d,
+            "COVER: flush-bounded assertion path is reachable"
+        );
+        assert!(avail <= d);
     }
 
     /// After max flush → 0 available.
@@ -529,7 +648,12 @@ mod proofs {
         kani::assume(f <= d.saturating_sub(w));
 
         let avail = flush_available(d, w, f);
-        assert_eq!(flush_available(d, w, f + avail), 0);
+        let remaining = flush_available(d, w, f + avail);
+        kani::cover!(
+            remaining == 0,
+            "COVER: flush-max-then-zero path is reachable"
+        );
+        assert_eq!(remaining, 0);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -543,8 +667,15 @@ mod proofs {
         let w: u32 = kani::any();
         kani::assume(d < 100 && w < 100);
         let r = pool_value(d, w);
-        if w > d { assert!(r.is_none()); }
-        else { assert_eq!(r, Some(d - w)); }
+        if w > d {
+            assert!(r.is_none());
+        } else {
+            kani::cover!(
+                r == Some(d - w),
+                "COVER: pool-value-correctness non-overdrawn path is reachable"
+            );
+            assert_eq!(r, Some(d - w));
+        }
     }
 
     /// Deposit strictly increases pool value.
@@ -559,6 +690,10 @@ mod proofs {
         let old = pool_value(d, w).unwrap();
         if let Some(new_d) = d.checked_add(extra) {
             let new = pool_value(new_d, w).unwrap();
+            kani::cover!(
+                new > old,
+                "COVER: deposit-increases-value path is reachable"
+            );
             assert!(new > old);
         }
     }
@@ -581,10 +716,18 @@ mod proofs {
             assert!(pv <= d - w);
             // Full return: pv == deposited - withdrawn
             if r == f {
+                kani::cover!(
+                    pv == d - w,
+                    "COVER: flush-return-conservation full-return path is reachable"
+                );
                 assert_eq!(pv, d - w);
             }
             // Partial return: pv < deposited - withdrawn
             if r < f {
+                kani::cover!(
+                    pv < d - w,
+                    "COVER: flush-return-conservation partial-return path is reachable"
+                );
                 assert!(pv < d - w);
             }
         }
@@ -603,7 +746,10 @@ mod proofs {
         let before = pool_value_with_flush(d, w, f, r);
         let after = pool_value_with_flush(d, w, f, r + 1);
         match (before, after) {
-            (Some(b), Some(a)) => assert!(a > b),
+            (Some(b), Some(a)) => {
+                kani::cover!(a > b, "COVER: returns-increase-value path is reachable");
+                assert!(a > b)
+            }
             _ => {}
         }
     }
@@ -623,7 +769,13 @@ mod proofs {
         // Either Some(0) (valid: no deposit = no LP) or None (orphaned/valueless state)
         // NEVER Some(positive) — can't get LP for free
         match result {
-            Some(lp) => assert_eq!(lp, 0),
+            Some(lp) => {
+                kani::cover!(
+                    lp == 0,
+                    "COVER: zero-deposit-zero-lp Some(0) path is reachable"
+                );
+                assert_eq!(lp, 0)
+            }
             None => {} // orphaned state correctly blocks deposit
         }
     }
@@ -637,7 +789,13 @@ mod proofs {
         // No assumes on s > 0 — test ALL states including supply=0
         let result = calc_collateral_for_withdraw(s, pv, 0);
         match result {
-            Some(col) => assert_eq!(col, 0),
+            Some(col) => {
+                kani::cover!(
+                    col == 0,
+                    "COVER: zero-burn-zero-col Some(0) path is reachable"
+                );
+                assert_eq!(col, 0)
+            }
             None => {} // supply=0 correctly returns None
         }
     }
@@ -649,7 +807,9 @@ mod proofs {
     /// Cooldown never panics.
     #[kani::proof]
     fn proof_cooldown_no_panic() {
-        let _ = cooldown_elapsed(kani::any(), kani::any(), kani::any());
+        let result = cooldown_elapsed(kani::any(), kani::any(), kani::any());
+        kani::cover!(true, "COVER: cooldown_no_panic completed without panic");
+        let _ = result;
     }
 
     /// Cooldown: immediate check (same slot) with non-zero cooldown → not elapsed.
@@ -659,6 +819,10 @@ mod proofs {
         let cd: u32 = kani::any();
         kani::assume(cd > 0 && cd < 100);
         kani::assume(slot < u32::MAX - 100); // prevent saturating_add wrap
+        kani::cover!(
+            !cooldown_elapsed(slot, slot, cd),
+            "COVER: cooldown-not-immediate assertion path is reachable"
+        );
         assert!(!cooldown_elapsed(slot, slot, cd));
     }
 
@@ -671,6 +835,10 @@ mod proofs {
         kani::assume(dep_slot < u32::MAX - 100);
 
         let check_slot = dep_slot.saturating_add(cd);
+        kani::cover!(
+            cooldown_elapsed(check_slot, dep_slot, cd),
+            "COVER: cooldown-exact-boundary elapsed path is reachable"
+        );
         assert!(cooldown_elapsed(check_slot, dep_slot, cd));
     }
 
@@ -683,6 +851,10 @@ mod proofs {
     fn proof_cap_zero_uncapped() {
         let total: u32 = kani::any();
         let dep: u32 = kani::any();
+        kani::cover!(
+            !exceeds_cap(total, dep, 0),
+            "COVER: cap-zero-uncapped assertion path is reachable"
+        );
         assert!(!exceeds_cap(total, dep, 0));
     }
 
@@ -696,6 +868,10 @@ mod proofs {
 
         let dep = cap - existing;
         // total + dep == cap → should NOT exceed
+        kani::cover!(
+            !exceeds_cap(existing, dep, cap),
+            "COVER: cap-at-boundary not-exceeds path is reachable"
+        );
         assert!(!exceeds_cap(existing, dep, cap));
     }
 
@@ -708,6 +884,10 @@ mod proofs {
         kani::assume(existing < cap);
 
         let dep = cap - existing + 1; // one more than would fit
+        kani::cover!(
+            exceeds_cap(existing, dep, cap),
+            "COVER: cap-above-boundary exceeds path is reachable"
+        );
         assert!(exceeds_cap(existing, dep, cap));
     }
 
@@ -723,6 +903,10 @@ mod proofs {
         let dep: u32 = kani::any();
         kani::assume(pv > 0 && pv < 100);
         kani::assume(dep > 0 && dep < 100);
+        kani::cover!(
+            calc_lp_for_deposit(0, pv, dep).is_none(),
+            "COVER: c9-orphaned-value-blocked None path is reachable"
+        );
         assert!(calc_lp_for_deposit(0, pv, dep).is_none());
     }
 
@@ -734,6 +918,10 @@ mod proofs {
         let dep: u32 = kani::any();
         kani::assume(supply > 0 && supply < 100);
         kani::assume(dep > 0 && dep < 100);
+        kani::cover!(
+            calc_lp_for_deposit(supply, 0, dep).is_none(),
+            "COVER: c9-valueless-lp-blocked None path is reachable"
+        );
         assert!(calc_lp_for_deposit(supply, 0, dep).is_none());
     }
 
@@ -742,6 +930,10 @@ mod proofs {
     fn proof_c9_true_first_depositor() {
         let dep: u32 = kani::any();
         kani::assume(dep > 0 && dep < 100);
+        kani::cover!(
+            calc_lp_for_deposit(0, 0, dep) == Some(dep),
+            "COVER: c9-true-first-depositor 1:1 path is reachable"
+        );
         assert_eq!(calc_lp_for_deposit(0, 0, dep), Some(dep));
     }
 
@@ -762,6 +954,10 @@ mod proofs {
 
         let before = pool_value(dep, wd).unwrap();
         let after = pool_value_with_flush(dep, wd, flush, 0).unwrap();
+        kani::cover!(
+            before - after == flush,
+            "COVER: flush-reduces-value-exactly path is reachable"
+        );
         assert_eq!(before - after, flush);
     }
 
@@ -779,6 +975,10 @@ mod proofs {
         let lp2 = calc_lp_for_deposit(amount, amount, amount).unwrap();
 
         // Both paths should yield same result at 1:1 ratio
+        kani::cover!(
+            lp1 == lp2,
+            "COVER: determinism-across-states consistency path is reachable"
+        );
         assert_eq!(lp1, lp2);
     }
 
@@ -789,13 +989,20 @@ mod proofs {
     /// pool_value_with_flush never panics.
     #[kani::proof]
     fn proof_pool_value_with_flush_no_panic() {
-        let _ = pool_value_with_flush(kani::any(), kani::any(), kani::any(), kani::any());
+        let result = pool_value_with_flush(kani::any(), kani::any(), kani::any(), kani::any());
+        kani::cover!(
+            true,
+            "COVER: pool_value_with_flush_no_panic completed without panic"
+        );
+        let _ = result;
     }
 
     /// exceeds_cap never panics.
     #[kani::proof]
     fn proof_exceeds_cap_no_panic() {
-        let _ = exceeds_cap(kani::any(), kani::any(), kani::any());
+        let result = exceeds_cap(kani::any(), kani::any(), kani::any());
+        kani::cover!(true, "COVER: exceeds_cap_no_panic completed without panic");
+        let _ = result;
     }
 
     // ════════════════════════════════════════════════════════════
@@ -818,7 +1025,8 @@ mod proofs {
         kani::assume(pv_delta > -(0xFF as i32) && pv_delta < 0xFF);
 
         let lp = match calc_lp_for_deposit(supply, pv, deposit) {
-            Some(lp) if lp > 0 => lp, _ => return,
+            Some(lp) if lp > 0 => lp,
+            _ => return,
         };
         let new_supply = supply + lp;
         let new_pv_signed = (pv as i32) + (deposit as i32) + pv_delta;
@@ -826,9 +1034,16 @@ mod proofs {
         let new_pv = new_pv_signed as u32;
 
         let back = match calc_collateral_for_withdraw(new_supply, new_pv, lp) {
-            Some(v) => v, None => return,
+            Some(v) => v,
+            None => return,
         };
-        if pv_delta <= 0 { assert!(back <= deposit); }
+        if pv_delta <= 0 {
+            kani::cover!(
+                back <= deposit,
+                "COVER: roundtrip-under-pool-value-change loss path is reachable"
+            );
+            assert!(back <= deposit);
+        }
     }
 
     /// LP inflation attack resistance: victim always gets back > 0 for non-zero deposit.
@@ -853,6 +1068,10 @@ mod proofs {
                 let total_pv = inflated_pv + victim_deposit;
                 let victim_back = calc_collateral_for_withdraw(total_supply, total_pv, vlp);
                 if let Some(vb) = victim_back {
+                    kani::cover!(
+                        vb > 0 || victim_deposit == 0,
+                        "COVER: no-inflation-attack victim-recovery path is reachable"
+                    );
                     assert!(vb > 0 || victim_deposit == 0);
                 }
             }
@@ -870,8 +1089,19 @@ mod proofs {
 
         let deadline = deposit_slot + cooldown;
         let elapsed = cooldown_elapsed(check_slot, deposit_slot, cooldown);
-        if check_slot >= deadline { assert!(elapsed); }
-        else { assert!(!elapsed); }
+        if check_slot >= deadline {
+            kani::cover!(
+                elapsed,
+                "COVER: cooldown-boundary-iff elapsed path is reachable"
+            );
+            assert!(elapsed);
+        } else {
+            kani::cover!(
+                !elapsed,
+                "COVER: cooldown-boundary-iff not-elapsed path is reachable"
+            );
+            assert!(!elapsed);
+        }
     }
 
     /// Flush conservation on LP value: flushing reduces total claim by exactly flush amount.
@@ -896,7 +1126,13 @@ mod proofs {
         let total_claim_after = calc_collateral_for_withdraw(supply, pv_after, supply);
 
         match (total_claim_before, total_claim_after) {
-            (Some(before), Some(after)) => { assert_eq!(before - after, flush); }
+            (Some(before), Some(after)) => {
+                kani::cover!(
+                    before - after == flush,
+                    "COVER: flush-conservation-lp-value exact-accounting path is reachable"
+                );
+                assert_eq!(before - after, flush);
+            }
             _ => {}
         }
     }
@@ -941,7 +1177,7 @@ mod proofs {
         // Non-empty pool: both > 0. (Zero-zero first-depositor case is trivially 1:1.)
         kani::assume(supply > 0 && pv > 0);
         kani::assume(pool_inv(supply, pv)); // (supply==0)==(pv==0), already satisfied above
-        // SAT budget: u16 effective width (3449× wider than prior < 20 bound).
+                                            // SAT budget: u16 effective width (3449× wider than prior < 20 bound).
         kani::assume(supply <= 0xFFFF);
         kani::assume(pv <= 0xFFFF);
         kani::assume(deposit > 0 && deposit <= 0xFFFF);
@@ -962,7 +1198,10 @@ mod proofs {
 
         // INDUCTIVE POST-CONDITION 1: pool_inv preserved after deposit.
         assert!(ns > 0 && np > 0, "INV: pool non-empty after deposit");
-        assert!(pool_inv(ns, np), "INV: pool_inv preserved after deposit transition");
+        assert!(
+            pool_inv(ns, np),
+            "INV: pool_inv preserved after deposit transition"
+        );
 
         // TRANSITION step 2: immediately withdraw the LP just minted.
         let back = match calc_collateral_for_withdraw(ns, np, lp) {
@@ -971,7 +1210,14 @@ mod proofs {
         };
 
         // INDUCTIVE POST-CONDITION 2: anti-inflation — can't extract more than deposited.
-        assert!(back <= deposit, "INDUCTIVE: withdraw ≤ deposit (no inflation)");
+        kani::cover!(
+            back <= deposit,
+            "COVER: inductive-anti-inflation assertion path is reachable"
+        );
+        assert!(
+            back <= deposit,
+            "INDUCTIVE: withdraw ≤ deposit (no inflation)"
+        );
     }
 
     /// INDUCTIVE two-depositors conservation proof. (PERC-760)
@@ -1003,19 +1249,34 @@ mod proofs {
             Some(lp) if lp > 0 => lp,
             _ => return,
         };
-        let s1 = match supply.checked_add(a_lp) { Some(v) => v, None => return };
-        let pv1 = match pv.checked_add(a) { Some(v) => v, None => return };
+        let s1 = match supply.checked_add(a_lp) {
+            Some(v) => v,
+            None => return,
+        };
+        let pv1 = match pv.checked_add(a) {
+            Some(v) => v,
+            None => return,
+        };
 
         // Pool appreciates (simulates trading PnL between A and B deposits).
-        let pv_after_appreciation = match pv1.checked_add(appreciation) { Some(v) => v, None => return };
+        let pv_after_appreciation = match pv1.checked_add(appreciation) {
+            Some(v) => v,
+            None => return,
+        };
 
         // B deposits at the new exchange rate.
         let b_lp = match calc_lp_for_deposit(s1, pv_after_appreciation, b) {
             Some(lp) if lp > 0 => lp,
             _ => return,
         };
-        let s2 = match s1.checked_add(b_lp) { Some(v) => v, None => return };
-        let pv2 = match pv_after_appreciation.checked_add(b) { Some(v) => v, None => return };
+        let s2 = match s1.checked_add(b_lp) {
+            Some(v) => v,
+            None => return,
+        };
+        let pv2 = match pv_after_appreciation.checked_add(b) {
+            Some(v) => v,
+            None => return,
+        };
 
         // A withdraws first.
         let a_back = match calc_collateral_for_withdraw(s2, pv2, a_lp) {
@@ -1023,8 +1284,14 @@ mod proofs {
             None => return,
         };
         // B withdraws from the remainder.
-        let s_rem = match s2.checked_sub(a_lp) { Some(v) if v > 0 => v, _ => return };
-        let pv_rem = match pv2.checked_sub(a_back) { Some(v) => v, None => return };
+        let s_rem = match s2.checked_sub(a_lp) {
+            Some(v) if v > 0 => v,
+            _ => return,
+        };
+        let pv_rem = match pv2.checked_sub(a_back) {
+            Some(v) => v,
+            None => return,
+        };
         let b_back = match calc_collateral_for_withdraw(s_rem, pv_rem, b_lp) {
             Some(v) => v,
             None => return,
@@ -1032,9 +1299,22 @@ mod proofs {
 
         // POST-CONDITION: total withdrawn ≤ total deposited + appreciation (+ initial pool pv).
         // Note: initial depositors (supply, pv) are already in the pool; a and b are NEW deposits.
-        let total_new_in = match a.checked_add(b) { Some(v) => v, None => return };
-        let total_new_in_with_appr = match total_new_in.checked_add(appreciation) { Some(v) => v, None => return };
-        let total_out = match a_back.checked_add(b_back) { Some(v) => v, None => return };
+        let total_new_in = match a.checked_add(b) {
+            Some(v) => v,
+            None => return,
+        };
+        let total_new_in_with_appr = match total_new_in.checked_add(appreciation) {
+            Some(v) => v,
+            None => return,
+        };
+        let total_out = match a_back.checked_add(b_back) {
+            Some(v) => v,
+            None => return,
+        };
+        kani::cover!(
+            total_out <= total_new_in_with_appr,
+            "COVER: inductive-two-depositors-conservation assertion path is reachable"
+        );
         assert!(
             total_out <= total_new_in_with_appr,
             "INDUCTIVE: total withdrawn by A+B ≤ total deposited by A+B + appreciation"
