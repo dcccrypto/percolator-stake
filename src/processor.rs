@@ -15,14 +15,12 @@ use solana_program::{
 /// CRITICAL: Without this check, an attacker can pass a fake token program,
 /// receive PDA signer authority via invoke_signed, and drain the vault.
 fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
-    if *token_program.key != spl_token::id() {
+    if *token_program.key != crate::spl_token::program_id() {
         msg!("Error: invalid token program {}", token_program.key);
         return Err(ProgramError::IncorrectProgramId);
     }
     Ok(())
 }
-
-use solana_program::program_pack::Pack;
 
 use crate::cpi;
 use crate::error::StakeError;
@@ -212,25 +210,14 @@ fn process_init_pool(
     // Create LP mint (authority = vault_auth PDA)
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
     invoke_signed(
-        &spl_token::instruction::initialize_mint(
-            token_program.key,
-            lp_mint.key,
-            vault_auth.key,
-            Some(vault_auth.key),
-            6,
-        )?,
+        &crate::spl_token::initialize_mint(lp_mint.key, vault_auth.key, Some(vault_auth.key), 6)?,
         &[lp_mint.clone(), rent_sysvar.clone()],
         &[vault_auth_seeds],
     )?;
 
     // Initialize vault token account (authority = vault_auth PDA)
     invoke_signed(
-        &spl_token::instruction::initialize_account(
-            token_program.key,
-            vault.key,
-            collateral_mint.key,
-            vault_auth.key,
-        )?,
+        &crate::spl_token::initialize_account(vault.key, collateral_mint.key, vault_auth.key)?,
         &[
             vault.clone(),
             collateral_mint.clone(),
@@ -361,14 +348,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
 
     // Transfer collateral: user ATA → stake vault
     invoke(
-        &spl_token::instruction::transfer(
-            token_program.key,
-            user_ata.key,
-            vault.key,
-            user.key,
-            &[],
-            amount,
-        )?,
+        &crate::spl_token::transfer(user_ata.key, vault.key, user.key, amount)?,
         &[
             user_ata.clone(),
             vault.clone(),
@@ -382,14 +362,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     invoke_signed(
-        &spl_token::instruction::mint_to(
-            token_program.key,
-            lp_mint.key,
-            user_lp_ata.key,
-            vault_auth.key,
-            &[],
-            lp_to_mint,
-        )?,
+        &crate::spl_token::mint_to(lp_mint.key, user_lp_ata.key, vault_auth.key, lp_to_mint)?,
         &[
             lp_mint.clone(),
             user_lp_ata.clone(),
@@ -612,14 +585,7 @@ fn process_withdraw(
 
     // Burn LP tokens from user
     invoke(
-        &spl_token::instruction::burn(
-            token_program.key,
-            user_lp_ata.key,
-            lp_mint.key,
-            user.key,
-            &[],
-            lp_amount,
-        )?,
+        &crate::spl_token::burn(user_lp_ata.key, lp_mint.key, user.key, lp_amount)?,
         &[
             user_lp_ata.clone(),
             lp_mint.clone(),
@@ -633,14 +599,7 @@ fn process_withdraw(
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     invoke_signed(
-        &spl_token::instruction::transfer(
-            token_program.key,
-            vault.key,
-            user_ata.key,
-            vault_auth.key,
-            &[],
-            withdrawal_amount,
-        )?,
+        &crate::spl_token::transfer(vault.key, user_ata.key, vault_auth.key, withdrawal_amount)?,
         &[
             vault.clone(),
             user_ata.clone(),
@@ -1168,8 +1127,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     // Read vault token account balance
     let vault_data = vault_ai.try_borrow_data()?;
-    let vault_state = spl_token::state::Account::unpack(&vault_data)?;
-    let current_balance = vault_state.amount;
+    let current_balance = crate::spl_token::token_account_amount(&vault_data)?;
 
     // Verify vault matches pool
     if vault_ai.key.to_bytes() != pool.vault {
@@ -1379,14 +1337,7 @@ fn process_deposit_junior(
     }
 
     invoke(
-        &spl_token::instruction::transfer(
-            token_program.key,
-            user_ata.key,
-            vault.key,
-            user.key,
-            &[],
-            amount,
-        )?,
+        &crate::spl_token::transfer(user_ata.key, vault.key, user.key, amount)?,
         &[
             user_ata.clone(),
             vault.clone(),
@@ -1399,14 +1350,7 @@ fn process_deposit_junior(
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     invoke_signed(
-        &spl_token::instruction::mint_to(
-            token_program.key,
-            lp_mint.key,
-            user_lp_ata.key,
-            vault_auth.key,
-            &[],
-            lp_to_mint,
-        )?,
+        &crate::spl_token::mint_to(lp_mint.key, user_lp_ata.key, vault_auth.key, lp_to_mint)?,
         &[
             lp_mint.clone(),
             user_lp_ata.clone(),
