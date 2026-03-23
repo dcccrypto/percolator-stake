@@ -34,6 +34,7 @@ pub mod error;
 pub mod instruction;
 pub mod math;
 pub mod processor;
+pub mod spl_token;
 pub mod state;
 
 #[cfg(not(feature = "no-entrypoint"))]
