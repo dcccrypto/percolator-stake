@@ -58,6 +58,21 @@ fn validate_account_owner(account: &AccountInfo, expected_owner: &Pubkey) -> Pro
     Ok(())
 }
 
+/// Validate stake pool account version for forward compatibility.
+/// Currently enforces current version only. In future, can add migration logic.
+fn validate_pool_version(pool: &StakePool) -> ProgramResult {
+    let version = pool.version();
+    if version != StakePool::CURRENT_VERSION {
+        msg!(
+            "Error: pool version {} not supported (current: {})",
+            version,
+            StakePool::CURRENT_VERSION
+        );
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
 /// Validate that an account is writable.
 /// Returns InvalidAccount error if account is read-only.
 fn validate_account_writable(account: &AccountInfo) -> ProgramResult {
@@ -88,6 +103,7 @@ fn validate_account_empty(account: &AccountInfo) -> ProgramResult {
     }
     Ok(())
 }
+
 
 use crate::cpi;
 use crate::error::StakeError;
@@ -377,6 +393,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    validate_pool_version(&pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
