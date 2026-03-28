@@ -22,6 +22,21 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// Validate stake pool account version for forward compatibility.
+/// Currently enforces current version only. In future, can add migration logic.
+fn validate_pool_version(pool: &StakePool) -> ProgramResult {
+    let version = pool.version();
+    if version != StakePool::CURRENT_VERSION {
+        msg!(
+            "Error: pool version {} not supported (current: {})",
+            version,
+            StakePool::CURRENT_VERSION
+        );
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
 use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
@@ -305,6 +320,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    validate_pool_version(&pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
