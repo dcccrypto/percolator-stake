@@ -336,7 +336,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // the pool once lifetime deposits hit the cap, even if 99% was withdrawn.
     // (H6 fix)
     if pool.deposit_cap > 0 {
-        let current_value = pool.total_pool_value().unwrap_or(0);
+        let current_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
         let new_value = current_value
             .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
@@ -410,7 +410,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // PERC-313: Refresh high-water mark after deposit (TVL increased)
     let clock = Clock::from_account_info(clock_sysvar)?;
     if pool.hwm_enabled() {
-        let current_tvl = pool.total_pool_value().unwrap_or(0);
+        let current_tvl = pool.total_pool_value().ok_or(StakeError::Overflow)?;
         pool.refresh_hwm(clock.epoch, current_tvl);
     }
 
@@ -592,7 +592,7 @@ fn process_withdraw(
 
     // PERC-313: High-water mark floor enforcement
     if pool.hwm_enabled() {
-        let current_tvl = pool.total_pool_value().unwrap_or(0);
+        let current_tvl = pool.total_pool_value().ok_or(StakeError::Overflow)?;
         let hwm = pool.refresh_hwm(clock.epoch, current_tvl);
         let post_tvl = current_tvl
             .checked_sub(withdrawal_amount)
@@ -1357,7 +1357,7 @@ fn process_deposit_junior(
     }
 
     if pool.deposit_cap > 0 {
-        let current_value = pool.total_pool_value().unwrap_or(0);
+        let current_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
         let new_value = current_value
             .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
