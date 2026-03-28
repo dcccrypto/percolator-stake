@@ -22,6 +22,29 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// Validate cooldown_slots parameter: must be > 0 to enforce cooldown.
+fn validate_cooldown_slots(cooldown_slots: u64) -> ProgramResult {
+    if cooldown_slots == 0 {
+        msg!(
+            "Invalid cooldown_slots: cannot be 0 (would disable cooldown protection)"
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// Validate HWM floor basis points: must be in range [1, 10000].
+fn validate_hwm_floor_bps(hwm_floor_bps: u16) -> ProgramResult {
+    if hwm_floor_bps == 0 || hwm_floor_bps > 10_000 {
+        msg!(
+            "Invalid hwm_floor_bps: must be 1-10000, got {}",
+            hwm_floor_bps
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
 use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
@@ -830,9 +853,12 @@ fn process_update_config(
     }
 
     if let Some(cooldown) = new_cooldown_slots {
+        validate_cooldown_slots(cooldown)?;
         pool.cooldown_slots = cooldown;
     }
     if let Some(cap) = new_deposit_cap {
+        // deposit_cap can be 0 (unlimited) or any positive value
+        // no validation needed, u64 can't be negative
         pool.deposit_cap = cap;
     }
 
@@ -1225,9 +1251,9 @@ fn process_admin_set_hwm_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    if hwm_floor_bps > 10_000 {
-        msg!("hwm_floor_bps {} exceeds 10000", hwm_floor_bps);
-        return Err(ProgramError::InvalidInstructionData);
+    // Validate hwm_floor_bps before modifying state
+    if enabled {
+        validate_hwm_floor_bps(hwm_floor_bps)?;
     }
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
