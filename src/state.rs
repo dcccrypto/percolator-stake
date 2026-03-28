@@ -212,8 +212,11 @@ impl StakePool {
     }
 
     /// Current junior tranche balance (collateral backing junior LP tokens).
+    /// Safe read from _reserved[33..41] — panics only if array size changes structurally.
     pub fn junior_balance(&self) -> u64 {
-        u64::from_le_bytes(self._reserved[33..41].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[33..41]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Set junior tranche balance.
@@ -222,8 +225,11 @@ impl StakePool {
     }
 
     /// Total junior LP tokens in circulation.
+    /// Safe read from _reserved[41..49] — panics only if array size changes structurally.
     pub fn junior_total_lp(&self) -> u64 {
-        u64::from_le_bytes(self._reserved[41..49].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[41..49]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Set junior total LP supply.
@@ -232,8 +238,11 @@ impl StakePool {
     }
 
     /// Junior fee multiplier in bps (20000 = 2x).
+    /// Safe read from _reserved[49..51] — panics only if array size changes structurally.
     pub fn junior_fee_mult_bps(&self) -> u16 {
-        u16::from_le_bytes(self._reserved[49..51].try_into().unwrap())
+        let mut bytes = [0u8; 2];
+        bytes.copy_from_slice(&self._reserved[49..51]);
+        u16::from_le_bytes(bytes)
     }
 
     /// Set junior fee multiplier.
@@ -316,8 +325,11 @@ impl StakePool {
     }
 
     /// Epoch high-water mark TVL (max pool value seen in current epoch).
+    /// Safe read from _reserved[16..24] — panics only if array size changes structurally.
     pub fn epoch_high_water_tvl(&self) -> u64 {
-        u64::from_le_bytes(self._reserved[16..24].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[16..24]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Set epoch high-water mark TVL.
@@ -326,8 +338,11 @@ impl StakePool {
     }
 
     /// Last epoch when HWM was updated.
+    /// Safe read from _reserved[24..32] — panics only if array size changes structurally.
     pub fn hwm_last_epoch(&self) -> u64 {
-        u64::from_le_bytes(self._reserved[24..32].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[24..32]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Set last HWM epoch.
