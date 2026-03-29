@@ -25,9 +25,7 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
 /// Validate cooldown_slots parameter: must be > 0 to enforce cooldown.
 fn validate_cooldown_slots(cooldown_slots: u64) -> ProgramResult {
     if cooldown_slots == 0 {
-        msg!(
-            "Invalid cooldown_slots: cannot be 0 (would disable cooldown protection)"
-        );
+        msg!("Invalid cooldown_slots: cannot be 0 (would disable cooldown protection)");
         return Err(ProgramError::InvalidArgument);
     }
     Ok(())
@@ -41,6 +39,52 @@ fn validate_hwm_floor_bps(hwm_floor_bps: u16) -> ProgramResult {
             hwm_floor_bps
         );
         return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// Validate that an account is owned by the expected program.
+/// Returns InvalidAccount error if ownership doesn't match.
+fn validate_account_owner(account: &AccountInfo, expected_owner: &Pubkey) -> ProgramResult {
+    if *account.owner != *expected_owner {
+        msg!(
+            "Error: account {} owned by {}, expected {}",
+            account.key,
+            account.owner,
+            expected_owner
+        );
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
+/// Validate that an account is writable.
+/// Returns InvalidAccount error if account is read-only.
+fn validate_account_writable(account: &AccountInfo) -> ProgramResult {
+    if !account.is_writable {
+        msg!("Error: account {} must be writable", account.key);
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
+/// Validate that an account is NOT empty (has data or is initialized).
+/// Returns InvalidAccount error if account is empty and shouldn't be.
+fn validate_account_not_empty(account: &AccountInfo) -> ProgramResult {
+    if account.data_is_empty() {
+        msg!("Error: account {} is empty but expected data", account.key);
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
+/// Validate that an account is empty (no data, ready for creation).
+/// Returns AlreadyInitialized error if account already has data.
+#[allow(dead_code)]
+fn validate_account_empty(account: &AccountInfo) -> ProgramResult {
+    if !account.data_is_empty() {
+        msg!("Error: account {} already initialized", account.key);
+        return Err(StakeError::AlreadyInitialized.into());
     }
     Ok(())
 }
@@ -317,6 +361,11 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if !user.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // I4: Validate pool account exists and is owned by stake program
+    validate_account_not_empty(pool_pda)?;
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
 
     // Read and validate pool state
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
