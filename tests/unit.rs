@@ -622,6 +622,7 @@ fn test_multiple_cycles_conservation() {
 
 #[test]
 fn test_pool_ownership_validation() {
+    #[allow(unused_imports)]
     use percolator_stake::error::StakeError;
 
     let mut pool = new_pool();
@@ -658,8 +659,8 @@ fn test_vault_authority_derivation_uniqueness() {
     let pool_pda_a = Pubkey::new_unique();
     let pool_pda_b = Pubkey::new_unique();
 
-    let (auth_a, bump_a) = derive_vault_authority(&program_id, &pool_pda_a);
-    let (auth_b, bump_b) = derive_vault_authority(&program_id, &pool_pda_b);
+    let (auth_a, _bump_a) = derive_vault_authority(&program_id, &pool_pda_a);
+    let (auth_b, _bump_b) = derive_vault_authority(&program_id, &pool_pda_b);
 
     // Different pools must have different vault authorities
     assert_ne!(auth_a, auth_b);
@@ -691,6 +692,7 @@ fn test_deposit_pda_belongs_to_user() {
 #[test]
 fn test_pool_discriminator_validation() {
     use percolator_stake::state::{StakePool, STAKE_POOL_SIZE};
+    #[allow(unused_imports)]
     use bytemuck::{from_bytes_mut, Zeroable};
 
     let mut pool_data = vec![0u8; STAKE_POOL_SIZE];
@@ -740,6 +742,7 @@ fn test_tranche_enabled_flag() {
 #[test]
 fn test_wrong_tranche_mixed_deposit_detection() {
     use percolator_stake::state::{StakeDeposit, STAKE_DEPOSIT_SIZE};
+    #[allow(unused_imports)]
     use bytemuck::{from_bytes_mut, Zeroable};
 
     let mut dep_data = vec![0u8; STAKE_DEPOSIT_SIZE];
@@ -863,6 +866,7 @@ fn test_junior_fee_multiplier_bounds() {
 
 #[test]
 fn test_version_validation_possible() {
+    #[allow(unused_mut)]
     let mut pool = new_pool();
     
     // Pool has CURRENT_VERSION set
