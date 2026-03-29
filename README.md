@@ -29,6 +29,116 @@ PDA-admin design — the stake program's PDA **becomes** the wrapper admin, enab
 - `vault_auth` = `[b"vault_auth", pool_pda]` — token vault authority
 - `stake_deposit` = `[b"stake_deposit", pool_pda, user_pubkey]` — per-user LP position
 
+## PDA Reference
+
+This section details all Program Derived Addresses used by the stake program.
+
+### StakePool PDA
+
+The stake pool account holds all global state for a given slab (market).
+
+| Property | Value |
+|----------|-------|
+| **Seeds** | `[b"stake_pool", slab_pubkey]` |
+| **Program ID** | Stake program ID (passed in InitPool) |
+| **Owner** | Stake program (created via CPI in InitPool) |
+| **Size** | 472 bytes (STAKE_POOL_SIZE) |
+
+**Key Fields:**
+- `is_initialized` — 1 if pool is active, 0 otherwise
+- `admin` — Pool administrator (can call UpdateConfig, CPI admin functions)
+- `admin_transferred` — 1 after TransferAdmin (required before accepting deposits)
+- `slab` — The percolator market pubkey this pool manages
+- `vault` — Token account holding collateral buffer (owned by vault_auth PDA)
+- `lp_mint` — LP token mint (authority = vault_auth PDA)
+- `cooldown_slots` — Slot delay before withdrawals allowed (must be > 0)
+- `deposit_cap` — Max pool value (0 = unlimited)
+- `total_deposited`, `total_lp_supply`, `total_flushed`, `total_returned`, `total_withdrawn` — Accounting totals
+- `percolator_program` — Wrapper program ID (for CPI calls)
+
+**Example derivation (Typescript using @solana/web3.js):**
+
+```typescript
+import { PublicKey } from '@solana/web3.js';
+
+const programId = new PublicKey('...stake program...');
+const slabPubkey = new PublicKey('...market slab...');
+
+const [stakePoolPda, poolBump] = await PublicKey.findProgramAddress(
+  [Buffer.from('stake_pool'), slabPubkey.toBuffer()],
+  programId
+);
+```
+
+### VaultAuthority PDA
+
+The vault authority is a PDA that owns the LP mint and vault token account. It signs all vault operations.
+
+| Property | Value |
+|----------|-------|
+| **Seeds** | `[b"vault_auth", stake_pool_pda]` |
+| **Program ID** | Stake program ID |
+| **Owner** | System program (PDA has no account, just signing authority) |
+| **Used for** | Signing mint_to, burn, transfer via invoke_signed |
+
+**Example derivation:**
+
+```typescript
+const [vaultAuthPda, vaultAuthBump] = await PublicKey.findProgramAddress(
+  [Buffer.from('vault_auth'), stakePoolPda.toBuffer()],
+  programId
+);
+```
+
+### StakeDeposit PDA (Per-User)
+
+Each user has a deposit PDA per pool that tracks their cooldown and LP balance.
+
+| Property | Value |
+|----------|-------|
+| **Seeds** | `[b"stake_deposit", pool_pda, user_pubkey]` |
+| **Program ID** | Stake program ID |
+| **Owner** | Stake program (created via CPI in Deposit) |
+| **Size** | 120 bytes (STAKE_DEPOSIT_SIZE) |
+
+**Key Fields:**
+- `is_initialized` — 1 if deposit is active
+- `pool` — Back-reference to stake pool PDA
+- `user` — User pubkey
+- `last_deposit_slot` — Slot of most recent deposit (cooldown starts here)
+- `lp_amount` — Total LP tokens held by this user
+
+**Example derivation:**
+
+```typescript
+const [depositPda, depositBump] = await PublicKey.findProgramAddress(
+  [Buffer.from('stake_deposit'), stakePoolPda.toBuffer(), userPubkey.toBuffer()],
+  programId
+);
+```
+
+### Token Accounts (Standard SPL Token)
+
+**LP Mint Account:**
+- Mint authority: vault_auth PDA (signs all mint_to and burn operations)
+- Freeze authority: vault_auth PDA
+- Decimals: 6
+
+**Vault Token Account (Collateral Buffer):**
+- Owner: vault_auth PDA
+- Mint: collateral_mint (matches slab's collateral)
+- Purpose: Holds collateral awaiting flushes to wrapper insurance
+
+**User Collateral ATA:**
+- Owner: user pubkey
+- Mint: collateral_mint
+- Purpose: User's collateral source/destination
+
+**User LP ATA:**
+- Owner: user pubkey
+- Mint: lp_mint
+- Purpose: User's LP token balance
+
 ## Instructions
 
 | # | Instruction | Description |
