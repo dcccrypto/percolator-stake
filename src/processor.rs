@@ -393,7 +393,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
-    validate_pool_version(&pool)?;
+    validate_pool_version(pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
