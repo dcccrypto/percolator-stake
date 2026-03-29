@@ -869,8 +869,7 @@ fn test_junior_fee_multiplier_bounds() {
 
 #[test]
 fn test_version_validation_possible() {
-    #[allow(unused_mut)]
-    let mut pool = new_pool();
+    let pool = new_pool();
 
     // Pool has CURRENT_VERSION set
     // Future: add version field and validate on load
