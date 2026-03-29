@@ -54,3 +54,33 @@ impl From<StakeError> for ProgramError {
         ProgramError::Custom(e as u32)
     }
 }
+
+/// Get user-friendly hint text for an error code.
+/// Useful for off-chain clients and SDKs to provide actionable error guidance.
+pub fn error_hint(code: u32) -> &'static str {
+    match code {
+        0 => "Pool already initialized — use a different slab address or check if InitPool was already called",
+        1 => "Pool not initialized — call InitPool first to create the stake pool",
+        2 => "Unauthorized — you must be the pool admin to perform this action",
+        3 => "Cooldown not elapsed — wait for the cooldown period before withdrawing again",
+        4 => "Insufficient LP tokens — you don't have enough LP tokens to burn",
+        5 => "Zero amount — deposit and withdrawal amounts must be greater than zero",
+        6 => "Arithmetic overflow — pool values exceeded u64 bounds, operation blocked",
+        7 => "Invalid mint — LP mint doesn't match the pool's LP mint",
+        8 => "Market is resolved — no new deposits allowed after resolution",
+        9 => "Deposit cap exceeded — pool has reached its maximum deposit limit",
+        10 => "Invalid PDA — account is not a valid PDA for the expected seed",
+        11 => "Admin already transferred — transfer admin is a one-time operation",
+        12 => "Admin not yet transferred — call TransferAdmin before performing admin operations",
+        13 => "Insufficient vault balance — vault doesn't have enough collateral for this withdrawal",
+        14 => "Invalid percolator program — percolator program ID doesn't match",
+        15 => "CPI to percolator failed — the cross-program invoke to percolator failed",
+        16 => "Invalid account — account is not owned by the expected program or is not writable",
+        17 => "Pool mode mismatch — operation not valid for this pool's mode (e.g., AccrueFees on insurance pool)",
+        18 => "Withdrawal blocked — would breach high-water mark floor protection",
+        19 => "Tranches not enabled — senior/junior tranches are not enabled on this pool",
+        20 => "Junior balance insufficient — junior tranche doesn't have enough balance for this operation",
+        21 => "Wrong tranche — deposit already belongs to a different tranche",
+        _ => "Unknown error — check the error code and pool state",
+    }
+}
