@@ -104,7 +104,6 @@ fn validate_account_empty(account: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
-
 use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
