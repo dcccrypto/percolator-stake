@@ -82,6 +82,7 @@ fn validate_account_not_empty(account: &AccountInfo) -> ProgramResult {
 
 /// Validate that an account is empty (no data, ready for creation).
 /// Returns AlreadyInitialized error if account already has data.
+#[allow(dead_code)]
 fn validate_account_empty(account: &AccountInfo) -> ProgramResult {
     if !account.data_is_empty() {
         msg!("Error: account {} already initialized", account.key);
