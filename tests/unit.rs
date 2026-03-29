@@ -683,7 +683,10 @@ fn test_deposit_pda_belongs_to_user() {
     let (dep_b, _) = derive_deposit_pda(&program_id, &pool, &user_b);
 
     // Each user has a unique deposit PDA for the same pool
-    assert_ne!(dep_a, dep_b, "Different users must have different deposit PDAs");
+    assert_ne!(
+        dep_a, dep_b,
+        "Different users must have different deposit PDAs"
+    );
     // Verify PDAs are deterministic
     let (dep_a_again, _) = derive_deposit_pda(&program_id, &pool, &user_a);
     assert_eq!(dep_a, dep_a_again);
@@ -691,17 +694,17 @@ fn test_deposit_pda_belongs_to_user() {
 
 #[test]
 fn test_pool_discriminator_validation() {
-    use percolator_stake::state::{StakePool, STAKE_POOL_SIZE};
     #[allow(unused_imports)]
     use bytemuck::{from_bytes_mut, Zeroable};
+    use percolator_stake::state::{StakePool, STAKE_POOL_SIZE};
 
     let mut pool_data = vec![0u8; STAKE_POOL_SIZE];
     let pool: &mut StakePool = from_bytes_mut(&mut pool_data);
 
-    // Uninitialized pool fails discriminator check
-    assert!(!pool.validate_discriminator());
+    // Zeroed (pre-upgrade / legacy) pool passes discriminator check for backward compat
+    assert!(pool.validate_discriminator());
 
-    // Initialize and set discriminator
+    // Explicitly initialized pool also passes discriminator check
     pool.set_discriminator();
     assert!(pool.validate_discriminator());
 }
@@ -741,9 +744,9 @@ fn test_tranche_enabled_flag() {
 
 #[test]
 fn test_wrong_tranche_mixed_deposit_detection() {
-    use percolator_stake::state::{StakeDeposit, STAKE_DEPOSIT_SIZE};
     #[allow(unused_imports)]
     use bytemuck::{from_bytes_mut, Zeroable};
+    use percolator_stake::state::{StakeDeposit, STAKE_DEPOSIT_SIZE};
 
     let mut dep_data = vec![0u8; STAKE_DEPOSIT_SIZE];
     let deposit: &mut StakeDeposit = from_bytes_mut(&mut dep_data);
@@ -832,7 +835,7 @@ fn test_cooldown_slot_enforcement() {
 #[test]
 fn test_hwm_floor_bounds() {
     let mut pool = new_pool();
-    
+
     // HWM floor must be 0..=10000 bps
     pool.set_hwm_floor_bps(0);
     assert_eq!(pool.hwm_floor_bps(), 0);
@@ -850,7 +853,7 @@ fn test_hwm_floor_bounds() {
 #[test]
 fn test_junior_fee_multiplier_bounds() {
     let mut pool = new_pool();
-    
+
     // Valid range: 10000 (1x) to 50000 (5x)
     pool.set_junior_fee_mult_bps(10000);
     assert_eq!(pool.junior_fee_mult_bps(), 10000);
@@ -868,10 +871,9 @@ fn test_junior_fee_multiplier_bounds() {
 fn test_version_validation_possible() {
     #[allow(unused_mut)]
     let mut pool = new_pool();
-    
+
     // Pool has CURRENT_VERSION set
     // Future: add version field and validate on load
     // This test documents the pattern for version upgrades
     assert_eq!(pool.is_initialized, 1);
 }
-

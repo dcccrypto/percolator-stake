@@ -25,9 +25,7 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
 /// Validate cooldown_slots parameter: must be > 0 to enforce cooldown.
 fn validate_cooldown_slots(cooldown_slots: u64) -> ProgramResult {
     if cooldown_slots == 0 {
-        msg!(
-            "Invalid cooldown_slots: cannot be 0 (would disable cooldown protection)"
-        );
+        msg!("Invalid cooldown_slots: cannot be 0 (would disable cooldown protection)");
         return Err(ProgramError::InvalidArgument);
     }
     Ok(())
