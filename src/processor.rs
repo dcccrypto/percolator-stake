@@ -953,6 +953,7 @@ fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    validate_pool_version(pool)?;
     // M7: Verify caller is pool admin (defense-in-depth).
     // The wrapper CPI will also check, but we should reject early if the
     // caller isn't even our admin — prevents non-admin from triggering
@@ -1327,6 +1328,7 @@ fn process_admin_set_hwm_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -1366,6 +1368,7 @@ fn process_admin_set_tranche_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
