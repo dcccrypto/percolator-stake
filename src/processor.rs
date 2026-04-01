@@ -893,7 +893,7 @@ fn process_flush_to_insurance(
 // ═══════════════════════════════════════════════════════════════
 
 fn process_update_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     new_cooldown_slots: Option<u64>,
     new_deposit_cap: Option<u64>,
@@ -906,6 +906,10 @@ fn process_update_config(
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // Validate pool account ownership and writability
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
