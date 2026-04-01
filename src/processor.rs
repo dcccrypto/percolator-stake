@@ -840,6 +840,11 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
+    // Validate token program BEFORE CPI that exposes vault_auth PDA signer authority.
+    // While the wrapper also validates, defense-in-depth prevents PDA signer exposure
+    // to a fake token program in the CPI account list.
+    verify_token_program(token_program)?;
+
     // Verify vault balance — can't flush more than what's available in vault
     // Available = total_deposited - total_withdrawn - total_flushed
     // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
