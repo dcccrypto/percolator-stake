@@ -1348,7 +1348,7 @@ fn process_admin_set_hwm_config(
 
 /// Admin enables/configures senior-junior tranches on a pool.
 fn process_admin_set_tranche_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     junior_fee_mult_bps: u16,
 ) -> ProgramResult {
@@ -1359,6 +1359,11 @@ fn process_admin_set_tranche_config(
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // Validate pool account ownership and writability
+    validate_account_not_empty(pool_ai)?;
+    validate_account_owner(pool_ai, program_id)?;
+    validate_account_writable(pool_ai)?;
 
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
