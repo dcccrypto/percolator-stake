@@ -1098,14 +1098,17 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
-    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
-
-    // I7: Set resolved flag to block future deposits
+    // I7: Set resolved flag BEFORE the CPI so that any reentrant call into
+    // process_deposit (via a malicious percolator that CPIs back to this program
+    // during ResolveMarket) sees market_resolved == true and is rejected.
+    // If the CPI fails, the whole transaction reverts including this write.
     {
         let mut pool_data = pool_pda.try_borrow_mut_data()?;
         let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
         pool.set_market_resolved(true);
     }
+
+    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
 
     msg!("ResolveMarket forwarded via CPI");
     Ok(())
