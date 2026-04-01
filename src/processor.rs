@@ -1194,6 +1194,25 @@ fn process_admin_set_insurance_policy(
     max_withdraw_bps: u16,
     cooldown_slots: u64,
 ) -> ProgramResult {
+    // Validate parameters locally for defense-in-depth before forwarding via CPI.
+    //
+    // max_withdraw_bps > 10_000 means more than 100% of the insurance fund could be
+    // withdrawn per period — this is semantically impossible and likely a bug or attack.
+    if max_withdraw_bps > 10_000 {
+        msg!(
+            "AdminSetInsurancePolicy: max_withdraw_bps {} exceeds 10000 (100%)",
+            max_withdraw_bps
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+    // cooldown_slots == 0 disables rate-limiting, allowing an attacker or rogue
+    // authority to drain the entire insurance fund in a single transaction once
+    // the policy is active.
+    if cooldown_slots == 0 {
+        msg!("AdminSetInsurancePolicy: cooldown_slots must be > 0 to enforce rate limiting");
+        return Err(ProgramError::InvalidArgument);
+    }
+
     let accounts_iter = &mut accounts.iter();
 
     let admin = next_account_info(accounts_iter)?;
