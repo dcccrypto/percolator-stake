@@ -22,6 +22,12 @@ fn test_all_error_codes_unique() {
         StakeError::InsufficientVaultBalance as u32,
         StakeError::InvalidPercolatorProgram as u32,
         StakeError::CpiFailed as u32,
+        StakeError::InvalidAccount as u32,
+        StakeError::InvalidPoolMode as u32,
+        StakeError::WithdrawalBelowHwmFloor as u32,
+        StakeError::TrancheNotEnabled as u32,
+        StakeError::JuniorBalanceInsufficient as u32,
+        StakeError::WrongTranche as u32,
     ];
 
     // Check uniqueness
@@ -30,7 +36,7 @@ fn test_all_error_codes_unique() {
     sorted.dedup();
     assert_eq!(sorted.len(), codes.len(), "Duplicate error codes detected!");
 
-    // Check sequential (0..15)
+    // Check sequential (0..21)
     for (i, &code) in codes.iter().enumerate() {
         assert_eq!(
             code, i as u32,
@@ -68,6 +74,12 @@ fn test_all_errors_are_custom() {
         StakeError::InsufficientVaultBalance,
         StakeError::InvalidPercolatorProgram,
         StakeError::CpiFailed,
+        StakeError::InvalidAccount,
+        StakeError::InvalidPoolMode,
+        StakeError::WithdrawalBelowHwmFloor,
+        StakeError::TrancheNotEnabled,
+        StakeError::JuniorBalanceInsufficient,
+        StakeError::WrongTranche,
     ];
 
     for err in &errors {
