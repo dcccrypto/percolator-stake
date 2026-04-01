@@ -1137,6 +1137,18 @@ fn process_admin_withdraw_insurance(
     let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let _ = pool_bump; // pool_pda not signing this CPI
 
+    // Require market to be resolved locally before attempting CPI.
+    // The wrapper also enforces this, but checking locally provides
+    // a clear error message and saves compute budget on a doomed CPI.
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if !pool.market_resolved() {
+            msg!("AdminWithdrawInsurance: market not resolved");
+            return Err(StakeError::MarketResolved.into());
+        }
+    }
+
     // Derive vault_auth PDA and its seeds
     // vault_auth = PDA([b"vault_auth", pool_pda])
     let (expected_vault_auth, vault_auth_bump) =
