@@ -913,6 +913,9 @@ fn process_update_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
