@@ -259,6 +259,11 @@ fn process_init_pool(
         return Err(StakeError::InvalidPda.into());
     }
 
+    // Validate cooldown_slots — must be > 0 to enforce cooldown protection.
+    // UpdateConfig already enforces this, but InitPool must too to prevent
+    // creating pools that bypass cooldown from the start.
+    validate_cooldown_slots(cooldown_slots)?;
+
     if !pool_pda.data_is_empty() {
         return Err(StakeError::AlreadyInitialized.into());
     }
