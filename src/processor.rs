@@ -1145,6 +1145,22 @@ fn process_admin_withdraw_insurance(
         return Err(solana_program::program_error::ProgramError::InvalidArgument);
     }
 
+    // Validate stake_vault matches the pool's stored vault address.
+    // Without this, an attacker could pass a different token account as stake_vault,
+    // diverting returned insurance tokens away from the pool's vault.
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.vault != stake_vault.key.to_bytes() {
+            msg!(
+                "Error: stake_vault {} does not match pool vault {}",
+                stake_vault.key,
+                pool.vault_pubkey()
+            );
+            return Err(StakeError::InvalidAccount.into());
+        }
+    }
+
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     // CPI: WithdrawInsuranceLimited (wrapper Tag 31)
