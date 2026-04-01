@@ -1098,6 +1098,18 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
+    // Idempotency guard: if the pool already has the resolved flag set, the
+    // wrapper CPI would fail (market already resolved on-chain), wasting the
+    // call. Reject early with a clear error so callers get a deterministic
+    // response rather than a cryptic CPI failure from the wrapper.
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.market_resolved() {
+            return Err(StakeError::MarketResolved.into());
+        }
+    }
+
     cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
 
     // I7: Set resolved flag to block future deposits
