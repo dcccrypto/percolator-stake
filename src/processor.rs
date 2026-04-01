@@ -104,6 +104,21 @@ fn validate_account_empty(account: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// Validate that an account's data is large enough to hold a `StakePool`.
+/// Must be called before any `bytemuck::from_bytes_mut(&data[..STAKE_POOL_SIZE])` cast.
+fn validate_pool_data_len(pool_pda: &AccountInfo) -> ProgramResult {
+    use crate::state::STAKE_POOL_SIZE;
+    if pool_pda.data_len() < STAKE_POOL_SIZE {
+        msg!(
+            "Error: pool_pda data too short ({} < {})",
+            pool_pda.data_len(),
+            STAKE_POOL_SIZE
+        );
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
 use crate::cpi;
 use crate::error::StakeError;
 use crate::instruction::StakeInstruction;
@@ -1321,6 +1336,7 @@ fn process_admin_set_hwm_config(
         validate_hwm_floor_bps(hwm_floor_bps)?;
     }
 
+    validate_pool_data_len(pool_pda)?;
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -1360,6 +1376,7 @@ fn process_admin_set_tranche_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    validate_pool_data_len(pool_ai)?;
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
