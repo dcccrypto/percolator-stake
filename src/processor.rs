@@ -203,6 +203,10 @@ fn validate_admin_cpi(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
