@@ -1267,15 +1267,13 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     let clock = Clock::from_account_info(clock_ai)?;
 
-    // Compute fee delta: any balance increase beyond what was deposited (net of withdrawals)
-    // pool_value = total_deposited - total_withdrawn + total_fees_earned
-    // If current_balance > pool_value, the difference is new fees
-    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
+    // Compute fee delta: any vault balance increase beyond the accounting-derived
+    // pool value is new fee income. Use total_pool_value() which correctly handles
+    // deposited - withdrawn - flushed + returned + fees_earned. While FlushToInsurance
+    // is now blocked on mode-1 pools, using total_pool_value() ensures pre-existing
+    // pools and any future code paths are also handled correctly.
     let pool_value = pool
-        .total_deposited
-        .checked_sub(pool.total_withdrawn)
-        .ok_or(StakeError::Overflow)?
-        .checked_add(pool.total_fees_earned)
+        .total_pool_value()
         .ok_or(StakeError::Overflow)?;
 
     if current_balance > pool_value {
