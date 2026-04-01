@@ -270,6 +270,14 @@ fn process_init_pool(
         return Err(StakeError::InvalidPda.into());
     }
 
+    // Prevent circular LP minting: if collateral_mint == lp_mint, a deposit would
+    // accept LP tokens as collateral and mint more LP tokens in return, creating
+    // an infinite-value inflation loop. E.g., attacker deposits 1 LP → mints 1 LP → repeat.
+    if lp_mint.key == collateral_mint.key {
+        msg!("Error: lp_mint and collateral_mint must differ — circular minting not allowed");
+        return Err(StakeError::InvalidMint.into());
+    }
+
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
 
