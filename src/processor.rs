@@ -1278,7 +1278,13 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
         .checked_add(pool.total_fees_earned)
         .ok_or(StakeError::Overflow)?;
 
-    if current_balance > pool_value {
+    // Only accrue fees when there are active LP holders.
+    // If total_lp_supply == 0 and a balance surplus exists, accruing it would set
+    // total_fees_earned > 0 while total_lp_supply == 0.  The first depositor check in
+    // calc_lp_for_deposit (total_lp_supply==0 && pool_value==0) would then fail, blocking
+    // ALL future deposits and permanently locking the pool.  An attacker can trigger this
+    // by sending even 1 token directly to the vault before the first deposit.
+    if current_balance > pool_value && pool.total_lp_supply > 0 {
         let fee_delta = current_balance - pool_value;
         pool.total_fees_earned = pool
             .total_fees_earned
