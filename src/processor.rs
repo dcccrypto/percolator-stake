@@ -8,6 +8,7 @@ use solana_program::{
     pubkey::Pubkey,
     rent::Rent,
     system_instruction,
+    system_program,
     sysvar::{clock::Clock, Sysvar},
 };
 
@@ -17,6 +18,17 @@ use solana_program::{
 fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     if *token_program.key != crate::spl_token::id() {
         msg!("Error: invalid token program {}", token_program.key);
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+/// Verify the system program account is the real Solana System Program.
+/// Passing a fake system program to create_account CPIs can cause the runtime
+/// to invoke a rogue program instead of creating the intended PDA account.
+fn verify_system_program(system_program_ai: &AccountInfo) -> ProgramResult {
+    if !system_program::check_id(system_program_ai.key) {
+        msg!("Error: invalid system program {}", system_program_ai.key);
         return Err(ProgramError::IncorrectProgramId);
     }
     Ok(())
@@ -436,6 +448,8 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
     // Without this, attacker passes fake program → receives vault_auth signer → drains vault.
     verify_token_program(token_program)?;
+    // Validate system program to prevent fake program receiving PDA signer via create_account CPI.
+    verify_system_program(system_program)?;
 
     // Calculate LP tokens to mint
     let lp_to_mint = pool
@@ -1458,6 +1472,8 @@ fn process_deposit_junior(
     }
 
     verify_token_program(token_program)?;
+    // Validate system program to prevent fake program receiving PDA signer via create_account CPI.
+    verify_system_program(system_program)?;
 
     let junior_lp = pool.junior_total_lp();
     let junior_bal = pool.junior_balance();
