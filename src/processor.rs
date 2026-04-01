@@ -1120,6 +1120,10 @@ fn process_admin_withdraw_insurance(
     accounts: &[AccountInfo],
     amount: u64,
 ) -> ProgramResult {
+    if amount == 0 {
+        return Err(StakeError::ZeroAmount.into());
+    }
+
     let accounts_iter = &mut accounts.iter();
 
     let admin = next_account_info(accounts_iter)?;
