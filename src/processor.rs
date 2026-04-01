@@ -642,6 +642,9 @@ fn process_withdraw(
         let deposit_data_ref = deposit_pda.try_borrow_data()?;
         let deposit: &StakeDeposit = bytemuck::from_bytes(&deposit_data_ref[..STAKE_DEPOSIT_SIZE]);
 
+        if !deposit.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
         if deposit.is_initialized != 1
             || deposit.user != user.key.to_bytes()
             || deposit.pool != pool_pda.key.to_bytes()
