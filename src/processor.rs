@@ -830,6 +830,15 @@ fn process_flush_to_insurance(
         return Err(StakeError::Unauthorized.into());
     }
 
+    // Require admin transfer completed — the wrapper CPI (TopUpInsurance)
+    // needs the pool PDA to be the wrapper admin for the operation to be
+    // meaningful. Without this check, admin could flush before the stake
+    // program has control, and the funds leave the vault with no guarantee
+    // of recovery via AdminWithdrawInsurance.
+    if pool.admin_transferred != 1 {
+        return Err(StakeError::AdminNotTransferred.into());
+    }
+
     if pool.slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
