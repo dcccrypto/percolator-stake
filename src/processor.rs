@@ -1525,6 +1525,18 @@ fn process_deposit_junior(
     );
 
     let clock = Clock::from_account_info(clock_sysvar)?;
+
+    // PERC-313: Refresh high-water mark after junior deposit (TVL increased).
+    // process_deposit updates the HWM on every senior deposit, but process_deposit_junior
+    // was missing this call.  Without it, the HWM is stale-low after junior deposits,
+    // so the HWM floor (HWM * floor_bps%) is also low.  A subsequent senior withdrawal
+    // can then drain more of the pool than intended because the protective floor does not
+    // reflect the true epoch-peak TVL.  Mirror the pattern from process_deposit exactly.
+    if pool.hwm_enabled() {
+        let current_tvl = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+        pool.refresh_hwm(clock.epoch, current_tvl);
+    }
+
     let (expected_deposit_pda, deposit_bump) =
         state::derive_deposit_pda(program_id, pool_pda.key, user.key);
     if *deposit_pda.key != expected_deposit_pda {
