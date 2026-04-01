@@ -1255,6 +1255,17 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
         return Err(StakeError::InvalidPoolMode.into());
     }
 
+    // Validate vault account is owned by SPL Token program.
+    // Without this, an attacker could pass a crafted account with fake balance data,
+    // inflating total_fees_earned and manipulating LP share price.
+    if *vault_ai.owner != crate::spl_token::id() {
+        msg!(
+            "AccrueFees: vault {} not owned by SPL Token program",
+            vault_ai.key
+        );
+        return Err(StakeError::InvalidAccount.into());
+    }
+
     // Read vault token account balance
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
