@@ -616,6 +616,25 @@ fn process_withdraw(
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
     verify_token_program(token_program)?;
 
+    // Verify user_lp_ata is owned by the signer (not merely delegated).
+    // Delegation attack: if an attacker holds an Approve on a victim's LP ATA, they could
+    // pass the victim's LP ATA as user_lp_ata, burn the victim's LP tokens, and receive
+    // collateral from their OWN deposit record — effectively extracting double value while
+    // the victim's LP is destroyed.  SPL token account owner field is at bytes [32..64].
+    {
+        let lp_ata_data = user_lp_ata.try_borrow_data()?;
+        if lp_ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let owner_bytes: &[u8; 32] = lp_ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if owner_bytes != user.key.as_ref() {
+            msg!("Error: user_lp_ata is not owned by the signer — delegation attack blocked");
+            return Err(StakeError::Unauthorized.into());
+        }
+    }
+
     // I5: Validate vault_auth PDA derivation
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
