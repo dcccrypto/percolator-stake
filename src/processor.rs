@@ -1426,6 +1426,14 @@ fn process_deposit_junior(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    // Junior tranches are only valid on insurance LP pools (mode 0).
+    // Trading LP pools (mode 1) use fee-based accounting that is incompatible
+    // with tranche sub-pool math, and enabling them together could corrupt
+    // junior_balance vs total_fees_earned interactions.
+    if pool.pool_mode != 0 {
+        msg!("DepositJunior: tranches not supported on trading LP pools (mode 1)");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
     if !pool.tranche_enabled() {
         return Err(StakeError::TrancheNotEnabled.into());
     }
@@ -1445,6 +1453,14 @@ fn process_deposit_junior(
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
         return Err(StakeError::InvalidAccount.into());
+    }
+
+    // Verify pool_pda is the correctly-derived PDA for this slab.
+    // Without this check, any program-owned account whose admin/lp_mint
+    // fields match could be used as a "pool", bypassing PDA binding.
+    let (expected_pool_pda, _) = state::derive_pool_pda(program_id, &pool.slab_pubkey());
+    if *pool_pda.key != expected_pool_pda {
+        return Err(StakeError::InvalidPda.into());
     }
 
     if pool.deposit_cap > 0 {
