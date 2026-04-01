@@ -1284,6 +1284,31 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
             .total_fees_earned
             .checked_add(fee_delta)
             .ok_or(StakeError::Overflow)?;
+
+        // PERC-303: If tranches are active, distribute the fee delta between
+        // junior and senior sub-pools using the junior fee multiplier.
+        // Without this call, junior LPs receive ZERO benefit from junior_fee_mult_bps
+        // — all fees accrue to the global pool and senior LPs capture the entire yield.
+        // distribute_fees returns (junior_fee, senior_fee) that sum to <= fee_delta.
+        if pool.tranche_enabled() && pool.junior_total_lp() > 0 {
+            let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+            let (junior_fee, _) = crate::math::distribute_fees(
+                pool.junior_balance(),
+                senior_bal,
+                pool.junior_fee_mult_bps(),
+                fee_delta,
+            );
+            // Credit junior sub-pool with its share. Senior implicitly receives
+            // the remainder (fee_delta - junior_fee) since senior_balance is derived
+            // as total_pool_value() - junior_balance and total_fees_earned was already
+            // incremented by the full fee_delta above.
+            pool.set_junior_balance(
+                pool.junior_balance()
+                    .checked_add(junior_fee)
+                    .ok_or(StakeError::Overflow)?,
+            );
+        }
+
         msg!(
             "AccrueFees: accrued {} fees, total_fees_earned={}",
             fee_delta,
