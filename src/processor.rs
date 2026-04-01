@@ -437,6 +437,24 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // Without this, attacker passes fake program → receives vault_auth signer → drains vault.
     verify_token_program(token_program)?;
 
+    // Verify user_ata is owned by user (not just delegated).
+    // An attacker who holds a delegate approval on someone else's ATA could otherwise pass
+    // that victim ATA as user_ata and transfer the victim's tokens into the pool while
+    // receiving LP tokens for themselves.  SPL token account layout bytes [32..64] = owner.
+    {
+        let ata_data = user_ata.try_borrow_data()?;
+        if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let owner_bytes: &[u8; 32] = ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if owner_bytes != user.key.as_ref() {
+            msg!("Error: user_ata is not owned by the signer — delegation attack blocked");
+            return Err(StakeError::Unauthorized.into());
+        }
+    }
+
     // Calculate LP tokens to mint
     let lp_to_mint = pool
         .calc_lp_for_deposit(amount)
@@ -1458,6 +1476,23 @@ fn process_deposit_junior(
     }
 
     verify_token_program(token_program)?;
+
+    // Verify user_ata is owned by user, not merely delegated.
+    // Same delegation attack applies as in process_deposit — an approved delegate
+    // could drain a victim's tokens into the pool while claiming LP tokens.
+    {
+        let ata_data = user_ata.try_borrow_data()?;
+        if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let owner_bytes: &[u8; 32] = ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if owner_bytes != user.key.as_ref() {
+            msg!("Error: user_ata is not owned by the signer — delegation attack blocked");
+            return Err(StakeError::Unauthorized.into());
+        }
+    }
 
     let junior_lp = pool.junior_total_lp();
     let junior_bal = pool.junior_balance();
