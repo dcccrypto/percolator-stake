@@ -257,9 +257,30 @@ impl StakePool {
         self.total_lp_supply.saturating_sub(self.junior_total_lp())
     }
 
-    /// Derived: senior balance = total_pool_value - junior_balance.
+    /// Junior balance after absorbing insurance losses.
+    ///
+    /// When `total_flushed > total_returned` there is an outstanding loss.
+    /// Junior tranche absorbs that loss first (up to its full balance).
+    /// `distribute_loss` is the canonical implementation: junior absorbs first,
+    /// senior only loses once junior is wiped out.
+    pub fn effective_junior_balance(&self) -> u64 {
+        let jb = self.junior_balance();
+        let loss = self.total_flushed.saturating_sub(self.total_returned);
+        if loss == 0 {
+            return jb;
+        }
+        // senior_balance is the pool value not attributed to junior — used by
+        // distribute_loss to cap the allocation of loss to the junior tranche.
+        let pv = self.total_pool_value().unwrap_or(jb);
+        let sb = pv.saturating_sub(jb);
+        let (junior_loss, _) = crate::math::distribute_loss(jb, sb, loss);
+        jb.saturating_sub(junior_loss)
+    }
+
+    /// Derived: senior balance = total_pool_value - effective_junior_balance.
     pub fn senior_balance(&self) -> Option<u64> {
-        self.total_pool_value()?.checked_sub(self.junior_balance())
+        let pv = self.total_pool_value()?;
+        Some(pv.saturating_sub(self.effective_junior_balance()))
     }
 
     /// Current struct version. Increment when layout changes.

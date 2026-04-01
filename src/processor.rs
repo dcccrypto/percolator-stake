@@ -664,9 +664,11 @@ fn process_withdraw(
 
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
-        // Junior withdrawal: valued against junior sub-pool only
+        // Junior withdrawal: valued against junior sub-pool after loss absorption.
+        // effective_junior_balance() deducts insurance losses that junior absorbs first,
+        // so junior LP holders correctly receive a reduced payout when the pool lost funds.
         let junior_lp = pool.junior_total_lp();
-        let junior_bal = pool.junior_balance();
+        let junior_bal = pool.effective_junior_balance();
         crate::math::calc_junior_collateral_for_withdraw(junior_lp, junior_bal, lp_amount)
             .ok_or(StakeError::Overflow)?
     } else {
