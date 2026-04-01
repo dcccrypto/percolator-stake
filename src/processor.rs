@@ -1133,9 +1133,21 @@ fn process_admin_withdraw_insurance(
     let token_program = next_account_info(accounts_iter)?;
     let clock = next_account_info(accounts_iter)?;
 
+    // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
+    verify_token_program(token_program)?;
+
     // Validate admin authority
     let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let _ = pool_bump; // pool_pda not signing this CPI
+
+    // Validate stake_vault matches pool's vault
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.vault != stake_vault.key.to_bytes() {
+            return Err(StakeError::InvalidPda.into());
+        }
+    }
 
     // Derive vault_auth PDA and its seeds
     // vault_auth = PDA([b"vault_auth", pool_pda])
