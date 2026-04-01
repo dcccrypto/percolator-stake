@@ -1248,6 +1248,10 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     if pool.is_initialized != 1 {
         return Err(ProgramError::UninitializedAccount);
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
 
     // Only trading LP mode pools accrue fees
     if pool.pool_mode != 1 {
@@ -1255,15 +1259,17 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
         return Err(StakeError::InvalidPoolMode.into());
     }
 
+    // Verify vault matches pool BEFORE reading vault data (validate before use).
+    // An attacker could pass a different token account with a crafted balance;
+    // checking the key first ensures we only read the authoritative vault.
+    if vault_ai.key.to_bytes() != pool.vault {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     // Read vault token account balance
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
     let current_balance = vault_state.amount;
-
-    // Verify vault matches pool
-    if vault_ai.key.to_bytes() != pool.vault {
-        return Err(ProgramError::InvalidAccountData);
-    }
 
     let clock = Clock::from_account_info(clock_ai)?;
 
