@@ -288,33 +288,35 @@ impl StakePool {
     // ════════════════════════════════════════════════════════════
     // Bytes 0-7:   discriminator (STAKE_POOL_DISCRIMINATOR)
     // Byte  8:     version
-    // Byte  9:     hwm_enabled (0 = off, 1 = on)
-    // Bytes 10-11: hwm_floor_bps (u16 LE, default 5000 = 50%)
-    // Bytes 12-15: reserved padding
+    // Byte  9:     market_resolved (PERC-303) — DO NOT REUSE
+    // Byte  10:    hwm_enabled (0 = off, 1 = on)
+    // Bytes 11-12: hwm_floor_bps (u16 LE, default 5000 = 50%)
+    // Bytes 13-15: reserved padding
     // Bytes 16-23: epoch_high_water_tvl (u64 LE)
     // Bytes 24-31: hwm_last_epoch (u64 LE)
     // Bytes 32-63: free
 
     /// Whether high-water mark protection is enabled.
+    /// Stored at _reserved[10] to avoid colliding with market_resolved at [9].
     pub fn hwm_enabled(&self) -> bool {
-        self._reserved[9] == 1
+        self._reserved[10] == 1
     }
 
     /// Set high-water mark enabled flag.
     pub fn set_hwm_enabled(&mut self, enabled: bool) {
-        self._reserved[9] = if enabled { 1 } else { 0 };
+        self._reserved[10] = if enabled { 1 } else { 0 };
     }
 
     /// High-water mark floor in basis points (e.g. 5000 = 50%).
     pub fn hwm_floor_bps(&self) -> u16 {
-        u16::from_le_bytes([self._reserved[10], self._reserved[11]])
+        u16::from_le_bytes([self._reserved[11], self._reserved[12]])
     }
 
     /// Set high-water mark floor bps.
     pub fn set_hwm_floor_bps(&mut self, bps: u16) {
         let bytes = bps.to_le_bytes();
-        self._reserved[10] = bytes[0];
-        self._reserved[11] = bytes[1];
+        self._reserved[11] = bytes[0];
+        self._reserved[12] = bytes[1];
     }
 
     /// Epoch high-water mark TVL (max pool value seen in current epoch).
@@ -674,6 +676,40 @@ mod tests {
         // Same epoch, lower TVL — should NOT lower the mark
         let hwm = pool.refresh_hwm(5, 1500);
         assert_eq!(hwm, 2000);
+    }
+
+    #[test]
+    fn test_hwm_does_not_clobber_market_resolved() {
+        let mut pool = StakePool::zeroed();
+        // Enable HWM — must NOT set market_resolved
+        pool.set_hwm_enabled(true);
+        assert!(
+            !pool.market_resolved(),
+            "hwm_enabled must not set market_resolved"
+        );
+
+        // Set market_resolved — must NOT enable HWM
+        let mut pool2 = StakePool::zeroed();
+        pool2.set_market_resolved(true);
+        assert!(
+            !pool2.hwm_enabled(),
+            "market_resolved must not enable HWM"
+        );
+
+        // Both set independently
+        let mut pool3 = StakePool::zeroed();
+        pool3.set_hwm_enabled(true);
+        pool3.set_market_resolved(true);
+        assert!(pool3.hwm_enabled());
+        assert!(pool3.market_resolved());
+
+        // Disable HWM — must NOT clear market_resolved
+        pool3.set_hwm_enabled(false);
+        assert!(!pool3.hwm_enabled());
+        assert!(
+            pool3.market_resolved(),
+            "disabling HWM must not clear market_resolved"
+        );
     }
 
     #[test]
