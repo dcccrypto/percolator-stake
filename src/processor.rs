@@ -1599,7 +1599,7 @@ fn process_init_trading_pool(
     process_init_pool(program_id, accounts, cooldown_slots, deposit_cap)?;
 
     // Now update pool_mode to 1 (trading LP)
-    let pool_ai = &accounts[2]; // Pool PDA is account [2] in InitPool
+    let pool_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
