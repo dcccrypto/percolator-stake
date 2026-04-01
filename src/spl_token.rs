@@ -194,7 +194,8 @@ pub mod state {
             let state = match data[108] {
                 0 => AccountState::Uninitialized,
                 1 => AccountState::Initialized,
-                _ => AccountState::Frozen,
+                2 => AccountState::Frozen,
+                _ => return Err(ProgramError::InvalidAccountData),
             };
             Ok(Self { amount, state })
         }
