@@ -1303,7 +1303,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
 /// Admin sets high-water mark configuration for LP vault drain protection.
 fn process_admin_set_hwm_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     enabled: bool,
     hwm_floor_bps: u16,
@@ -1329,6 +1329,12 @@ fn process_admin_set_hwm_config(
     }
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
+    }
+
+    // Verify pool PDA derivation to prevent modifying a non-PDA account
+    let (expected_pool, _) = state::derive_pool_pda(program_id, &pool.slab_pubkey());
+    if *pool_pda.key != expected_pool {
+        return Err(StakeError::InvalidPda.into());
     }
 
     pool.set_hwm_enabled(enabled);
