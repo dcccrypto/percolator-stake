@@ -1348,7 +1348,7 @@ fn process_admin_set_hwm_config(
 
 /// Admin enables/configures senior-junior tranches on a pool.
 fn process_admin_set_tranche_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     junior_fee_mult_bps: u16,
 ) -> ProgramResult {
@@ -1368,6 +1368,12 @@ fn process_admin_set_tranche_config(
     }
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
+    }
+
+    // Verify pool PDA derivation to prevent modifying a non-PDA account
+    let (expected_pool, _) = state::derive_pool_pda(program_id, &pool.slab_pubkey());
+    if *pool_ai.key != expected_pool {
+        return Err(StakeError::InvalidPda.into());
     }
 
     // Validate multiplier: minimum 10000 (1x), maximum 50000 (5x)
