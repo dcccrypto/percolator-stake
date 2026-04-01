@@ -830,6 +830,14 @@ fn process_flush_to_insurance(
         return Err(StakeError::Unauthorized.into());
     }
 
+    // Block flush after market resolution. After resolution, the admin
+    // should be withdrawing insurance back (AdminWithdrawInsurance), not
+    // flushing more funds out. Flushing after resolution would move vault
+    // funds to a resolved wrapper, potentially locking them permanently.
+    if pool.market_resolved() {
+        return Err(StakeError::MarketResolved.into());
+    }
+
     if pool.slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
