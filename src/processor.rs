@@ -669,8 +669,17 @@ fn process_withdraw(
         let junior_bal = pool.junior_balance();
         crate::math::calc_junior_collateral_for_withdraw(junior_lp, junior_bal, lp_amount)
             .ok_or(StakeError::Overflow)?
+    } else if pool.tranche_enabled() {
+        // Senior withdrawal when tranches are active: valued against senior
+        // sub-pool only (senior_balance / senior_lp_supply), NOT the global pool.
+        // Using global pool formula would mix junior collateral into the senior
+        // valuation, allowing senior holders to extract junior-backed funds.
+        let senior_lp = pool.senior_total_lp();
+        let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+        crate::math::calc_senior_collateral_for_withdraw(senior_lp, senior_bal, lp_amount)
+            .ok_or(StakeError::Overflow)?
     } else {
-        // Senior (default) withdrawal: valued against global pool
+        // No tranches: valued against full global pool
         pool.calc_collateral_for_withdraw(lp_amount)
             .ok_or(StakeError::Overflow)?
     };
