@@ -1229,7 +1229,7 @@ fn process_admin_set_insurance_policy(
 /// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
 /// To keep it simple and trustless: we track the vault token account balance directly.
 /// Any increase in vault balance beyond deposits is fee revenue.
-fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
     if !caller.is_signer {
@@ -1239,6 +1239,12 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     let pool_ai = next_account_info(accounts_iter)?;
     let vault_ai = next_account_info(accounts_iter)?;
     let clock_ai = next_account_info(accounts_iter)?;
+
+    // Validate pool account ownership — without this, an attacker could pass
+    // a fake pool account they control, set pool_mode=1, and manipulate
+    // total_fees_earned on their crafted state.
+    validate_account_owner(pool_ai, program_id)?;
+    validate_account_writable(pool_ai)?;
 
     // Validate pool PDA
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
