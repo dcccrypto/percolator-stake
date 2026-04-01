@@ -606,6 +606,10 @@ fn process_withdraw(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    // Guard against processing a pool account whose layout changed in a future upgrade.
+    // process_withdraw modifies pool fields (total_withdrawn, total_lp_supply, tranche state);
+    // writing via stale field offsets silently corrupts pool accounting.
+    validate_pool_version(pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
@@ -1426,6 +1430,10 @@ fn process_deposit_junior(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    // Guard against processing a pool account whose layout changed in a future upgrade.
+    // process_deposit_junior modifies multiple pool fields; writing via stale field offsets
+    // silently corrupts junior balance, LP supply, and other tranche state.
+    validate_pool_version(pool)?;
     if !pool.tranche_enabled() {
         return Err(StakeError::TrancheNotEnabled.into());
     }
