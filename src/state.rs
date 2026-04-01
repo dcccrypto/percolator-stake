@@ -258,8 +258,14 @@ impl StakePool {
     }
 
     /// Derived: senior balance = total_pool_value - junior_balance.
+    ///
+    /// Uses saturating_sub so that when junior_balance >= total_pool_value
+    /// (junior absorbed all losses), this returns Some(0) rather than None.
+    /// Returning None would be misinterpreted as an arithmetic overflow
+    /// (StakeError::Overflow) by callers, masking the real economic state.
     pub fn senior_balance(&self) -> Option<u64> {
-        self.total_pool_value()?.checked_sub(self.junior_balance())
+        let pv = self.total_pool_value()?;
+        Some(pv.saturating_sub(self.junior_balance()))
     }
 
     /// Current struct version. Increment when layout changes.
