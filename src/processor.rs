@@ -1303,7 +1303,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
 /// Admin sets high-water mark configuration for LP vault drain protection.
 fn process_admin_set_hwm_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     enabled: bool,
     hwm_floor_bps: u16,
@@ -1315,6 +1315,11 @@ fn process_admin_set_hwm_config(
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // Validate pool account ownership and writability
+    validate_account_not_empty(pool_pda)?;
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
 
     // Validate hwm_floor_bps before modifying state
     if enabled {
