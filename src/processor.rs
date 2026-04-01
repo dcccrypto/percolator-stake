@@ -544,8 +544,11 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     }
 
     // PERC-303: Prevent mixing senior and junior LP in the same deposit PDA.
-    // If this deposit is flagged as junior and already has LP, reject senior deposits.
-    if deposit._reserved[8] == 1 && deposit.lp_amount > 0 {
+    // If this deposit is flagged as junior, reject senior deposits regardless
+    // of current LP balance. Without the lp_amount > 0 check bypass, an attacker
+    // could: deposit junior → withdraw all → deposit senior into same PDA →
+    // withdraw using junior rates (reserved[8] still set).
+    if deposit._reserved[8] == 1 {
         return Err(StakeError::WrongTranche.into());
     }
 
@@ -1564,7 +1567,10 @@ fn process_deposit_junior(
         deposit.set_discriminator();
     }
 
-    if deposit._reserved[8] != 1 && deposit.lp_amount > 0 {
+    // PERC-303: Prevent mixing. If deposit PDA is NOT flagged as junior
+    // and was previously used for senior deposits, reject. Check regardless
+    // of lp_amount to prevent bypass via full withdrawal then re-deposit.
+    if deposit._reserved[8] != 1 && deposit.is_initialized == 1 {
         return Err(StakeError::WrongTranche.into());
     }
 
