@@ -840,6 +840,17 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
+    // FlushToInsurance moves vault funds to the wrapper insurance fund.
+    // This operation is only meaningful on insurance LP pools (mode 0).
+    // Trading LP pools (mode 1) use fee-based accounting; flushing would
+    // undercount pool value in AccrueFees (total_deposited - total_withdrawn
+    // formula doesn't subtract total_flushed) and leave the vault
+    // permanently below the expected accounting balance.
+    if pool.pool_mode != 0 {
+        msg!("FlushToInsurance: not valid for trading LP pools (mode 1)");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+
     // Verify vault balance — can't flush more than what's available in vault
     // Available = total_deposited - total_withdrawn - total_flushed
     // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
