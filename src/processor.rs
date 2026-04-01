@@ -814,12 +814,19 @@ fn process_flush_to_insurance(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // Validate pool account before reading state
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
+
     // Read pool
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
     }
 
     // CRITICAL (C10): FlushToInsurance must be admin-only.
@@ -1303,7 +1310,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
 /// Admin sets high-water mark configuration for LP vault drain protection.
 fn process_admin_set_hwm_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     enabled: bool,
     hwm_floor_bps: u16,
@@ -1320,6 +1327,10 @@ fn process_admin_set_hwm_config(
     if enabled {
         validate_hwm_floor_bps(hwm_floor_bps)?;
     }
+
+    // Validate pool account ownership
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -1348,7 +1359,7 @@ fn process_admin_set_hwm_config(
 
 /// Admin enables/configures senior-junior tranches on a pool.
 fn process_admin_set_tranche_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     junior_fee_mult_bps: u16,
 ) -> ProgramResult {
@@ -1359,6 +1370,10 @@ fn process_admin_set_tranche_config(
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // Validate pool account ownership
+    validate_account_owner(pool_ai, program_id)?;
+    validate_account_writable(pool_ai)?;
 
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
