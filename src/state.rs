@@ -251,10 +251,11 @@ impl StakePool {
     }
 
     /// Derived: senior LP supply = total_lp_supply - junior_total_lp.
-    /// Uses saturating_sub to handle accounting drift gracefully without panicking.
-    /// If junior_total_lp exceeds total_lp_supply, returns 0 (senior has no LP).
-    pub fn senior_total_lp(&self) -> u64 {
-        self.total_lp_supply.saturating_sub(self.junior_total_lp())
+    /// Returns None if junior_total_lp > total_lp_supply (accounting invariant broken).
+    /// Using checked_sub instead of saturating_sub to surface accounting bugs
+    /// rather than silently returning 0 and allowing incorrect senior withdrawals.
+    pub fn senior_total_lp(&self) -> Option<u64> {
+        self.total_lp_supply.checked_sub(self.junior_total_lp())
     }
 
     /// Derived: senior balance = total_pool_value - junior_balance.
