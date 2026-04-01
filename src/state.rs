@@ -386,7 +386,12 @@ impl StakePool {
     /// Calculate LP tokens for a deposit amount.
     /// Delegates to pure math module (Kani-verified).
     pub fn calc_lp_for_deposit(&self, amount: u64) -> Option<u64> {
-        let pv = self.total_pool_value().unwrap_or(0);
+        // Use `?` to propagate None from total_pool_value() rather than
+        // masking overflow/underflow with unwrap_or(0). Both paths return
+        // None (blocking the deposit), but `?` surfaces the true root
+        // cause and prevents a future code path from accidentally treating
+        // overflow as "pool value is 0" in a way that misroutes errors.
+        let pv = self.total_pool_value()?;
         crate::math::calc_lp_for_deposit(self.total_lp_supply, pv, amount)
     }
 
