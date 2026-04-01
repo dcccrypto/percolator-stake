@@ -303,7 +303,7 @@ pub fn cpi_withdraw_insurance<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SetInsuranceWithdrawPolicy (Tag 21) — admin only, requires RESOLVED
+// SetInsuranceWithdrawPolicy (Tag 30) — admin only, requires RESOLVED
 // ═══════════════════════════════════════════════════════════════
 // Accounts: [admin(signer), slab(w)]
 // Data: tag(1) + authority(32) + min_withdraw_base(8) + max_withdraw_bps(2) + cooldown_slots(8)
@@ -338,7 +338,7 @@ pub fn cpi_set_insurance_withdraw_policy<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// WithdrawInsuranceLimited (Tag 22) — policy authority, requires RESOLVED
+// WithdrawInsuranceLimited (Tag 31) — policy authority, requires RESOLVED
 // ═══════════════════════════════════════════════════════════════
 // Accounts (7): [authority(signer), slab(w), authority_ata(w), vault(w),
 //                token_program, vault_pda, clock]
