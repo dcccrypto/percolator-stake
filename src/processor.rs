@@ -821,6 +821,10 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
 
     // CRITICAL (C10): FlushToInsurance must be admin-only.
     // Without this, ANY signer can drain the stake vault to wrapper insurance,
