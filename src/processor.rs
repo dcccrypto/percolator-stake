@@ -7,7 +7,7 @@ use solana_program::{
     program_error::ProgramError,
     pubkey::Pubkey,
     rent::Rent,
-    system_instruction,
+    system_instruction, system_program,
     sysvar::{clock::Clock, Sysvar},
 };
 
@@ -17,6 +17,18 @@ use solana_program::{
 fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     if *token_program.key != crate::spl_token::id() {
         msg!("Error: invalid token program {}", token_program.key);
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+/// Verify the system program is the real System program.
+/// CRITICAL: Without this check, an attacker can pass a fake system program,
+/// receive the new account (PDA) as a signer via invoke_signed, and use that
+/// signer authority to call any instruction on behalf of the PDA.
+fn verify_system_program(system_program_ai: &AccountInfo) -> ProgramResult {
+    if !system_program::check_id(system_program_ai.key) {
+        msg!("Error: invalid system program {}", system_program_ai.key);
         return Err(ProgramError::IncorrectProgramId);
     }
     Ok(())
@@ -272,6 +284,11 @@ fn process_init_pool(
 
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
+
+    // Validate system program BEFORE invoke_signed for create_account.
+    // Without this, a fake system program receives pool_pda as a PDA signer
+    // and can use that authority to call instructions on behalf of pool_pda.
+    verify_system_program(system_program)?;
 
     let rent = Rent::from_account_info(rent_sysvar)?;
 
