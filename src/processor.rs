@@ -1426,6 +1426,7 @@ fn process_deposit_junior(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    validate_pool_version(pool)?;
     if !pool.tranche_enabled() {
         return Err(StakeError::TrancheNotEnabled.into());
     }
