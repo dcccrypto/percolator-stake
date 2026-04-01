@@ -93,6 +93,20 @@ fn validate_account_not_empty(account: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// Validate that a pool PDA account is large enough for a safe bytemuck cast.
+/// Prevents panic from `&data[..STAKE_POOL_SIZE]` when data.len() < STAKE_POOL_SIZE.
+fn validate_pool_data_len(pool_pda: &AccountInfo) -> ProgramResult {
+    if pool_pda.data_len() < STAKE_POOL_SIZE {
+        msg!(
+            "Error: pool_pda data too short ({} < {})",
+            pool_pda.data_len(),
+            STAKE_POOL_SIZE
+        );
+        return Err(StakeError::InvalidAccount.into());
+    }
+    Ok(())
+}
+
 /// Validate that an account is empty (no data, ready for creation).
 /// Returns AlreadyInitialized error if account already has data.
 #[allow(dead_code)]
@@ -195,6 +209,18 @@ fn validate_admin_cpi(
 ) -> Result<u8, ProgramError> {
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Guard against panic in bytemuck::from_bytes if account is undersized.
+    // A program-owned account that is smaller than STAKE_POOL_SIZE would cause
+    // an out-of-bounds panic on the slice index [..STAKE_POOL_SIZE].
+    if pool_pda.data_len() < STAKE_POOL_SIZE {
+        msg!(
+            "Error: pool_pda data too short ({} < {})",
+            pool_pda.data_len(),
+            STAKE_POOL_SIZE
+        );
+        return Err(StakeError::InvalidAccount.into());
     }
 
     let pool_data = pool_pda.try_borrow_data()?;
@@ -381,6 +407,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     validate_account_not_empty(pool_pda)?;
     validate_account_owner(pool_pda, program_id)?;
     validate_account_writable(pool_pda)?;
+    validate_pool_data_len(pool_pda)?;
 
     // Read and validate pool state
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
@@ -597,6 +624,7 @@ fn process_withdraw(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    validate_pool_data_len(pool_pda)?;
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -815,6 +843,7 @@ fn process_flush_to_insurance(
     }
 
     // Read pool
+    validate_pool_data_len(pool_pda)?;
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -907,6 +936,7 @@ fn process_update_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    validate_pool_data_len(pool_pda)?;
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -947,6 +977,7 @@ fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    validate_pool_data_len(pool_pda)?;
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -1417,6 +1448,7 @@ fn process_deposit_junior(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    validate_pool_data_len(pool_pda)?;
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
