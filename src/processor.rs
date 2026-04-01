@@ -840,13 +840,19 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
-    // Verify vault balance — can't flush more than what's available in vault
-    // Available = total_deposited - total_withdrawn - total_flushed
-    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
+    // Verify vault balance — can't flush more than what's available in vault.
+    // Available = total_deposited - total_withdrawn - total_flushed + total_returned
+    //
+    // The original formula omitted `+ total_returned`.  After AdminWithdrawInsurance
+    // increases total_returned, the vault physically holds those tokens again, but the
+    // old formula still subtracted the full total_flushed, making the available amount
+    // appear lower (or underflow) even when real tokens exist.  Use the same formula as
+    // total_pool_value() — which already accounts for all four counters correctly.
     let available = pool
         .total_deposited
         .checked_sub(pool.total_withdrawn)
         .and_then(|v| v.checked_sub(pool.total_flushed))
+        .and_then(|v| v.checked_add(pool.total_returned))
         .ok_or(StakeError::Overflow)?;
     if amount > available {
         return Err(ProgramError::InsufficientFunds);
