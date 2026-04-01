@@ -1459,8 +1459,13 @@ fn process_deposit_junior(
 
     verify_token_program(token_program)?;
 
+    // Use effective_junior_balance() so that LP pricing reflects any insurance
+    // losses already absorbed by the junior tranche.  Pricing against the raw
+    // junior_balance() (stale, pre-loss) would charge new depositors a higher
+    // price than the sub-pool actually warrants, transferring value from incoming
+    // junior depositors to existing junior LP holders.
     let junior_lp = pool.junior_total_lp();
-    let junior_bal = pool.junior_balance();
+    let junior_bal = pool.effective_junior_balance();
     let lp_to_mint = crate::math::calc_junior_lp_for_deposit(junior_lp, junior_bal, amount)
         .ok_or(StakeError::Overflow)?;
     if lp_to_mint == 0 {
