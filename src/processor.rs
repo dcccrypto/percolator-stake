@@ -893,7 +893,7 @@ fn process_flush_to_insurance(
 // ═══════════════════════════════════════════════════════════════
 
 fn process_update_config(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     new_cooldown_slots: Option<u64>,
     new_deposit_cap: Option<u64>,
@@ -907,6 +907,11 @@ fn process_update_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // Validate pool account ownership and writability
+    validate_account_not_empty(pool_pda)?;
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
+
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -915,6 +920,12 @@ fn process_update_config(
     }
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
+    }
+
+    // Verify pool PDA derivation to prevent using a non-PDA account
+    let (expected_pool, _) = state::derive_pool_pda(program_id, &pool.slab_pubkey());
+    if *pool_pda.key != expected_pool {
+        return Err(StakeError::InvalidPda.into());
     }
 
     if let Some(cooldown) = new_cooldown_slots {
