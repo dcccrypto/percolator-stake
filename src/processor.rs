@@ -597,6 +597,13 @@ fn process_withdraw(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // Validate pool account ownership and state (mirrors process_deposit checks).
+    // Without owner validation, an attacker-controlled account with crafted data
+    // could manipulate withdrawal calculations.
+    validate_account_not_empty(pool_pda)?;
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_writable(pool_pda)?;
+
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
@@ -606,6 +613,7 @@ fn process_withdraw(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    validate_pool_version(pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
