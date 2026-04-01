@@ -268,11 +268,13 @@ pub fn hwm_withdrawal_allowed(
 /// Calculate available flush amount.
 ///
 /// `available = deposited - withdrawn - already_flushed`
-/// Uses saturating arithmetic (can't go negative).
-pub fn flush_available(total_deposited: u64, total_withdrawn: u64, total_flushed: u64) -> u64 {
+/// Returns `None` if accounting invariants are broken (withdrawn or flushed
+/// exceed deposited). Using checked_sub to match process_flush_to_insurance
+/// and surface accounting bugs rather than silently returning 0.
+pub fn flush_available(total_deposited: u64, total_withdrawn: u64, total_flushed: u64) -> Option<u64> {
     total_deposited
-        .saturating_sub(total_withdrawn)
-        .saturating_sub(total_flushed)
+        .checked_sub(total_withdrawn)?
+        .checked_sub(total_flushed)
 }
 
 #[cfg(test)]
@@ -442,24 +444,24 @@ mod tests {
 
     #[test]
     fn test_flush_available_normal() {
-        assert_eq!(flush_available(1000, 200, 300), 500);
+        assert_eq!(flush_available(1000, 200, 300), Some(500));
     }
 
     #[test]
     fn test_flush_available_overdrawn() {
-        // withdrawn > deposited → saturates to 0
-        assert_eq!(flush_available(100, 200, 0), 0);
+        // withdrawn > deposited → None (accounting broken)
+        assert_eq!(flush_available(100, 200, 0), None);
     }
 
     #[test]
     fn test_flush_available_fully_flushed() {
-        assert_eq!(flush_available(1000, 200, 800), 0);
+        assert_eq!(flush_available(1000, 200, 800), Some(0));
     }
 
     #[test]
     fn test_flush_available_over_flushed() {
-        // More flushed than available → saturates to 0
-        assert_eq!(flush_available(1000, 200, 900), 0);
+        // More flushed than available → None (accounting broken)
+        assert_eq!(flush_available(1000, 200, 900), None);
     }
 
     // ── Rounding Direction ──
