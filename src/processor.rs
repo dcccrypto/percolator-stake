@@ -913,6 +913,12 @@ fn process_update_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // Guard against processing a pool account whose layout changed in a future upgrade.
+    // If the pool version doesn't match CURRENT_VERSION, field offsets may differ and
+    // any write here could corrupt the account.  process_deposit already enforces this;
+    // UpdateConfig must be equally strict so an admin cannot unknowingly operate on a
+    // stale-layout pool after a program upgrade.
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
