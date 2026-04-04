@@ -214,7 +214,22 @@ pub fn distribute_fees(
         return (0, 0);
     }
 
-    let junior_fee = ((total_fee as u128) * junior_weight / total_weight) as u64;
+    // `total_fee as u128` is at most 2^64.
+    // `junior_weight` is at most u64::MAX * 50_000 ≈ 2^80 (junior_fee_mult_bps capped at 50_000).
+    // Their product can reach 2^144 which overflows u128 (max 2^128).
+    // Use checked_mul and fall back to a scaled calculation that preserves the ratio.
+    let junior_fee_u128 = if let Some(product) = (total_fee as u128).checked_mul(junior_weight) {
+        product / total_weight
+    } else {
+        // Scale both weights down by 24 bits — the ratio is preserved and the
+        // product `total_fee * (junior_weight >> 24)` is at most 2^64 * 2^56 = 2^120 < 2^128.
+        const SHIFT: u32 = 24;
+        let jw = junior_weight >> SHIFT;
+        let tw = (total_weight >> SHIFT).max(1);
+        (total_fee as u128) * jw / tw
+    };
+    // Clamp to total_fee (should always hold since junior_weight <= total_weight)
+    let junior_fee = junior_fee_u128.min(total_fee as u128) as u64;
     let senior_fee = total_fee.saturating_sub(junior_fee); // remainder to senior
 
     (junior_fee, senior_fee)
