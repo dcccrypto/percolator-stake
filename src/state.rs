@@ -288,33 +288,41 @@ impl StakePool {
     // ════════════════════════════════════════════════════════════
     // Bytes 0-7:   discriminator (STAKE_POOL_DISCRIMINATOR)
     // Byte  8:     version
-    // Byte  9:     hwm_enabled (0 = off, 1 = on)
-    // Bytes 10-11: hwm_floor_bps (u16 LE, default 5000 = 50%)
-    // Bytes 12-15: reserved padding
+    // Byte  9:     market_resolved  ← PERC-303 (DO NOT use for HWM)
+    // Byte  10:    hwm_enabled (0 = off, 1 = on)
+    // Bytes 11-12: hwm_floor_bps (u16 LE, default 5000 = 50%)
+    // Bytes 13-15: reserved padding
     // Bytes 16-23: epoch_high_water_tvl (u64 LE)
     // Bytes 24-31: hwm_last_epoch (u64 LE)
-    // Bytes 32-63: free
+    // Bytes 32-63: used by PERC-303 tranche state (see layout above)
+    //
+    // CRITICAL: hwm_enabled was previously at byte 9 — the same byte used by
+    // market_resolved (PERC-303).  That collision meant enabling HWM caused the
+    // pool to appear resolved (blocking deposits), and resolving the market
+    // caused HWM to appear enabled (applying withdrawal floor post-resolution).
+    // Moved to byte 10 which PERC-303 explicitly reserved for PERC-313 HWM use.
 
     /// Whether high-water mark protection is enabled.
+    /// Stored at _reserved[10] — byte 9 is owned by market_resolved (PERC-303).
     pub fn hwm_enabled(&self) -> bool {
-        self._reserved[9] == 1
+        self._reserved[10] == 1
     }
 
     /// Set high-water mark enabled flag.
     pub fn set_hwm_enabled(&mut self, enabled: bool) {
-        self._reserved[9] = if enabled { 1 } else { 0 };
+        self._reserved[10] = if enabled { 1 } else { 0 };
     }
 
     /// High-water mark floor in basis points (e.g. 5000 = 50%).
     pub fn hwm_floor_bps(&self) -> u16 {
-        u16::from_le_bytes([self._reserved[10], self._reserved[11]])
+        u16::from_le_bytes([self._reserved[11], self._reserved[12]])
     }
 
     /// Set high-water mark floor bps.
     pub fn set_hwm_floor_bps(&mut self, bps: u16) {
         let bytes = bps.to_le_bytes();
-        self._reserved[10] = bytes[0];
-        self._reserved[11] = bytes[1];
+        self._reserved[11] = bytes[0];
+        self._reserved[12] = bytes[1];
     }
 
     /// Epoch high-water mark TVL (max pool value seen in current epoch).
@@ -693,6 +701,57 @@ mod tests {
             "HWM must not clobber discriminator"
         );
         assert_eq!(pool.version(), 1, "HWM must not clobber version");
+    }
+
+    // ── PERC-8422: PR#94 State Collision Unit Tests ──
+
+    /// Verify hwm_enabled and market_resolved are at distinct byte offsets.
+    #[test]
+    fn test_hwm_and_market_resolved_independent() {
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        // Enable HWM → market_resolved must stay false
+        pool.set_hwm_enabled(true);
+        assert!(pool.hwm_enabled());
+        assert!(
+            !pool.market_resolved(),
+            "hwm_enabled clobbered market_resolved"
+        );
+
+        // Resolve market → hwm_enabled must stay true
+        pool.set_market_resolved(true);
+        assert!(pool.market_resolved());
+        assert!(pool.hwm_enabled(), "market_resolved clobbered hwm_enabled");
+
+        // Disable HWM → market_resolved must stay true
+        pool.set_hwm_enabled(false);
+        assert!(!pool.hwm_enabled());
+        assert!(
+            pool.market_resolved(),
+            "clearing hwm_enabled cleared market_resolved"
+        );
+
+        // Unresolve market → hwm_enabled must stay false
+        pool.set_market_resolved(false);
+        assert!(!pool.market_resolved());
+        assert!(!pool.hwm_enabled());
+    }
+
+    /// Verify byte offsets: market_resolved at [9], hwm_enabled at [10].
+    #[test]
+    fn test_state_layout_byte_offsets() {
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        pool.set_market_resolved(true);
+        assert_eq!(pool._reserved[9], 1, "market_resolved should be at byte 9");
+        assert_eq!(pool._reserved[10], 0, "byte 10 should be untouched");
+
+        pool.set_market_resolved(false);
+        pool.set_hwm_enabled(true);
+        assert_eq!(pool._reserved[9], 0, "byte 9 should be untouched");
+        assert_eq!(pool._reserved[10], 1, "hwm_enabled should be at byte 10");
     }
 
     #[test]

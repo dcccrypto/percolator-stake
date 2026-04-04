@@ -270,6 +270,14 @@ fn process_init_pool(
         return Err(StakeError::InvalidPda.into());
     }
 
+    // Prevent circular LP minting: if collateral_mint == lp_mint, a deposit would
+    // accept LP tokens as collateral and mint more LP tokens in return, creating
+    // an infinite-value inflation loop. E.g., attacker deposits 1 LP → mints 1 LP → repeat.
+    if lp_mint.key == collateral_mint.key {
+        msg!("Error: lp_mint and collateral_mint must differ — circular minting not allowed");
+        return Err(StakeError::InvalidMint.into());
+    }
+
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
 
@@ -436,6 +444,24 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
     // Without this, attacker passes fake program → receives vault_auth signer → drains vault.
     verify_token_program(token_program)?;
+
+    // Verify user_ata is owned by user (not just delegated).
+    // An attacker who holds a delegate approval on someone else's ATA could otherwise pass
+    // that victim ATA as user_ata and transfer the victim's tokens into the pool while
+    // receiving LP tokens for themselves.  SPL token account layout bytes [32..64] = owner.
+    {
+        let ata_data = user_ata.try_borrow_data()?;
+        if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let owner_bytes: &[u8; 32] = ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if owner_bytes != user.key.as_ref() {
+            msg!("Error: user_ata is not owned by the signer — delegation attack blocked");
+            return Err(StakeError::Unauthorized.into());
+        }
+    }
 
     // Calculate LP tokens to mint
     let lp_to_mint = pool
@@ -615,6 +641,25 @@ fn process_withdraw(
 
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
     verify_token_program(token_program)?;
+
+    // Verify user_lp_ata is owned by the signer (not merely delegated).
+    // Delegation attack: if an attacker holds an Approve on a victim's LP ATA, they could
+    // pass the victim's LP ATA as user_lp_ata, burn the victim's LP tokens, and receive
+    // collateral from their OWN deposit record — effectively extracting double value while
+    // the victim's LP is destroyed.  SPL token account owner field is at bytes [32..64].
+    {
+        let lp_ata_data = user_lp_ata.try_borrow_data()?;
+        if lp_ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let owner_bytes: &[u8; 32] = lp_ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if owner_bytes != user.key.as_ref() {
+            msg!("Error: user_lp_ata is not owned by the signer — delegation attack blocked");
+            return Err(StakeError::Unauthorized.into());
+        }
+    }
 
     // I5: Validate vault_auth PDA derivation
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
@@ -1098,14 +1143,17 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
-    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
-
-    // I7: Set resolved flag to block future deposits
+    // I7: Set resolved flag BEFORE the CPI so that any reentrant call into
+    // process_deposit (via a malicious percolator that CPIs back to this program
+    // during ResolveMarket) sees market_resolved == true and is rejected.
+    // If the CPI fails, the whole transaction reverts including this write.
     {
         let mut pool_data = pool_pda.try_borrow_mut_data()?;
         let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
         pool.set_market_resolved(true);
     }
+
+    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
 
     msg!("ResolveMarket forwarded via CPI");
     Ok(())
@@ -1458,6 +1506,23 @@ fn process_deposit_junior(
     }
 
     verify_token_program(token_program)?;
+
+    // Verify user_ata is owned by user, not merely delegated.
+    // Same delegation attack applies as in process_deposit — an approved delegate
+    // could drain a victim's tokens into the pool while claiming LP tokens.
+    {
+        let ata_data = user_ata.try_borrow_data()?;
+        if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let owner_bytes: &[u8; 32] = ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if owner_bytes != user.key.as_ref() {
+            msg!("Error: user_ata is not owned by the signer — delegation attack blocked");
+            return Err(StakeError::Unauthorized.into());
+        }
+    }
 
     let junior_lp = pool.junior_total_lp();
     let junior_bal = pool.junior_balance();

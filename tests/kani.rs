@@ -581,4 +581,218 @@ mod kani_proofs {
             assert!(floor <= tvl, "floor must never exceed HWM TVL");
         }
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // PERC-8422: Security Finding Proofs
+    // ═══════════════════════════════════════════════════════════
+
+    // ── PR#94 CRITICAL: State Collision Independence ──
+    // After the fix (hwm_enabled at byte 10, market_resolved at byte 9),
+    // these two flags must be fully independent.
+
+    /// PROOF: Enabling HWM does NOT set market_resolved.
+    /// Pre-fix this was the CRITICAL bug: both lived at _reserved[9].
+    #[kani::proof]
+    fn proof_hwm_enable_does_not_set_market_resolved() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        // Precondition: market is NOT resolved
+        assert!(!pool.market_resolved());
+
+        // Action: enable HWM
+        pool.set_hwm_enabled(true);
+
+        // Postcondition: market_resolved must still be false
+        assert!(
+            !pool.market_resolved(),
+            "CRITICAL: enabling HWM set market_resolved"
+        );
+        // And HWM must be true
+        assert!(pool.hwm_enabled());
+
+        // Non-vacuity: we actually tested something
+        kani::cover!(pool.hwm_enabled() && !pool.market_resolved());
+    }
+
+    /// PROOF: Resolving market does NOT enable HWM.
+    /// Pre-fix this was the reverse collision.
+    #[kani::proof]
+    fn proof_market_resolve_does_not_enable_hwm() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        // Precondition: HWM is NOT enabled
+        assert!(!pool.hwm_enabled());
+
+        // Action: resolve market
+        pool.set_market_resolved(true);
+
+        // Postcondition: hwm_enabled must still be false
+        assert!(
+            !pool.hwm_enabled(),
+            "CRITICAL: resolving market enabled HWM"
+        );
+        assert!(pool.market_resolved());
+
+        kani::cover!(pool.market_resolved() && !pool.hwm_enabled());
+    }
+
+    /// PROOF: Both flags can be set independently — all 4 combinations are reachable.
+    #[kani::proof]
+    fn proof_hwm_market_resolved_orthogonal() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let hwm_val: bool = kani::any();
+        let resolved_val: bool = kani::any();
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        pool.set_hwm_enabled(hwm_val);
+        pool.set_market_resolved(resolved_val);
+
+        // Read-back must match what was written
+        assert_eq!(pool.hwm_enabled(), hwm_val, "HWM read-back mismatch");
+        assert_eq!(
+            pool.market_resolved(),
+            resolved_val,
+            "market_resolved read-back mismatch"
+        );
+
+        // All 4 combinations reachable
+        kani::cover!(!pool.hwm_enabled() && !pool.market_resolved());
+        kani::cover!(!pool.hwm_enabled() && pool.market_resolved());
+        kani::cover!(pool.hwm_enabled() && !pool.market_resolved());
+        kani::cover!(pool.hwm_enabled() && pool.market_resolved());
+    }
+
+    /// PROOF: HWM config writes don't clobber tranche fields.
+    #[kani::proof]
+    fn proof_hwm_does_not_clobber_tranche() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let junior_balance: u64 = kani::any();
+        let junior_total_lp: u64 = kani::any();
+        let tranche_enabled: bool = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(junior_total_lp <= 1_000_000_000);
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        // Set tranche state first
+        pool.set_tranche_enabled(tranche_enabled);
+        pool.set_junior_balance(junior_balance);
+        pool.set_junior_total_lp(junior_total_lp);
+
+        // Now mutate HWM fields
+        pool.set_hwm_enabled(true);
+        pool.set_hwm_floor_bps(7500);
+        pool.set_epoch_high_water_tvl(999_999);
+        pool.set_hwm_last_epoch(42);
+
+        // Tranche state must be unchanged
+        assert_eq!(
+            pool.tranche_enabled(),
+            tranche_enabled,
+            "tranche_enabled clobbered by HWM"
+        );
+        assert_eq!(
+            pool.junior_balance(),
+            junior_balance,
+            "junior_balance clobbered by HWM"
+        );
+        assert_eq!(
+            pool.junior_total_lp(),
+            junior_total_lp,
+            "junior_total_lp clobbered by HWM"
+        );
+    }
+
+    // ── PR#83 HIGH: distribute_fees Overflow Safety ──
+
+    /// PROOF: distribute_fees never panics at full u64 range.
+    /// Pre-fix, the u128 product (total_fee * junior_weight) could reach 2^144,
+    /// silently wrapping. The checked_mul + shift fallback must prevent this.
+    #[kani::proof]
+    fn proof_distribute_fees_no_panic_full_range() {
+        use percolator_stake::math::distribute_fees;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let junior_fee_mult_bps: u16 = kani::any();
+        let total_fee: u64 = kani::any();
+
+        // Only constrain to valid BPS range — balances and fees are fully symbolic
+        kani::assume(junior_fee_mult_bps >= 10_000 && junior_fee_mult_bps <= 50_000);
+
+        let _ = distribute_fees(
+            junior_balance,
+            senior_balance,
+            junior_fee_mult_bps,
+            total_fee,
+        );
+        // If we reach here without panic, the proof passes.
+    }
+
+    /// PROOF: distribute_fees is conservative at full u64 range.
+    /// junior_fee + senior_fee <= total_fee for ALL inputs (no overflow inflation).
+    #[kani::proof]
+    fn proof_distribute_fees_conservative_full_range() {
+        use percolator_stake::math::distribute_fees;
+
+        let junior_balance: u64 = kani::any();
+        let senior_balance: u64 = kani::any();
+        let junior_fee_mult_bps: u16 = kani::any();
+        let total_fee: u64 = kani::any();
+
+        kani::assume(junior_fee_mult_bps >= 10_000 && junior_fee_mult_bps <= 50_000);
+
+        let (jf, sf) = distribute_fees(
+            junior_balance,
+            senior_balance,
+            junior_fee_mult_bps,
+            total_fee,
+        );
+
+        assert!(
+            jf as u128 + sf as u128 <= total_fee as u128,
+            "OVERFLOW INFLATION: fees exceed total"
+        );
+
+        // Non-vacuity: at least one non-trivial split occurred
+        kani::cover!(jf > 0 && sf > 0);
+    }
+
+    /// PROOF: distribute_fees at extreme inputs (max u64 balances + max fee)
+    /// does not silently wrap and remains conservative.
+    #[kani::proof]
+    fn proof_distribute_fees_extreme_inputs() {
+        use percolator_stake::math::distribute_fees;
+
+        // Worst case: both balances at u64::MAX, fee at u64::MAX, mult at 50_000
+        // junior_weight = u64::MAX * 50_000 ≈ 2^80
+        // product = u64::MAX * 2^80 ≈ 2^144 — must not silently wrap
+        let (jf, sf) = distribute_fees(u64::MAX, u64::MAX, 50_000, u64::MAX);
+
+        assert!(
+            jf as u128 + sf as u128 <= u64::MAX as u128,
+            "extreme inputs: overflow inflation"
+        );
+
+        // At equal balances with 5x multiplier, junior should get more than senior
+        // (junior_weight = MAX * 50_000 vs senior_weight = MAX * 10_000)
+        // Ratio should be 50_000 : 10_000 = 5:1
+        kani::cover!(jf > sf);
+    }
 }
