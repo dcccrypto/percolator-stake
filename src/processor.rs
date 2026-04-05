@@ -910,6 +910,24 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPoolMode.into());
     }
 
+    // Validate wrapper_vault holds the correct collateral mint (defense-in-depth).
+    // The percolator CPI also validates this, but an explicit check here gives a clear
+    // error and prevents tokens of the wrong type from being routed to the insurance vault.
+    // SPL token account layout: bytes [0..32] = mint.
+    {
+        let wv_data = wrapper_vault.try_borrow_data()?;
+        if wv_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let wv_mint: &[u8; 32] = wv_data[0..32]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if wv_mint != &pool.collateral_mint {
+            msg!("Error: wrapper_vault mint does not match pool collateral_mint");
+            return Err(StakeError::InvalidMint.into());
+        }
+    }
+
     // Verify vault balance — can't flush more than what's available in vault.
     // Available = total_deposited - total_withdrawn - total_flushed + total_returned
     //
