@@ -570,8 +570,11 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     }
 
     // PERC-303: Prevent mixing senior and junior LP in the same deposit PDA.
-    // If this deposit is flagged as junior and already has LP, reject senior deposits.
-    if deposit._reserved[8] == 1 && deposit.lp_amount > 0 {
+    // If this deposit is flagged as junior, reject senior deposits regardless
+    // of current LP balance. Without the lp_amount > 0 check bypass, an attacker
+    // could: deposit junior → withdraw all → deposit senior into same PDA →
+    // withdraw using junior rates (reserved[8] still set).
+    if deposit._reserved[8] == 1 {
         return Err(StakeError::WrongTranche.into());
     }
 
@@ -709,13 +712,24 @@ fn process_withdraw(
 
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
-        // Junior withdrawal: valued against junior sub-pool only
+        // Junior withdrawal: valued against junior sub-pool after loss absorption.
+        // effective_junior_balance() deducts insurance losses that junior absorbs first,
+        // so junior LP holders correctly receive a reduced payout when the pool lost funds.
         let junior_lp = pool.junior_total_lp();
-        let junior_bal = pool.junior_balance();
+        let junior_bal = pool.effective_junior_balance();
         crate::math::calc_junior_collateral_for_withdraw(junior_lp, junior_bal, lp_amount)
             .ok_or(StakeError::Overflow)?
+    } else if pool.tranche_enabled() {
+        // Senior withdrawal when tranches are active: valued against senior
+        // sub-pool only (senior_balance / senior_lp_supply), NOT the global pool.
+        // Using global pool formula would mix junior collateral into the senior
+        // valuation, allowing senior holders to extract junior-backed funds.
+        let senior_lp = pool.senior_total_lp();
+        let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+        crate::math::calc_senior_collateral_for_withdraw(senior_lp, senior_bal, lp_amount)
+            .ok_or(StakeError::Overflow)?
     } else {
-        // Senior (default) withdrawal: valued against global pool
+        // No tranches: valued against full global pool
         pool.calc_collateral_for_withdraw(lp_amount)
             .ok_or(StakeError::Overflow)?
     };
@@ -885,13 +899,30 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
-    // Verify vault balance — can't flush more than what's available in vault
-    // Available = total_deposited - total_withdrawn - total_flushed
-    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
+    // FlushToInsurance moves vault funds to the wrapper insurance fund.
+    // This operation is only meaningful on insurance LP pools (mode 0).
+    // Trading LP pools (mode 1) use fee-based accounting; flushing would
+    // undercount pool value in AccrueFees (total_deposited - total_withdrawn
+    // formula doesn't subtract total_flushed) and leave the vault
+    // permanently below the expected accounting balance.
+    if pool.pool_mode != 0 {
+        msg!("FlushToInsurance: not valid for trading LP pools (mode 1)");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+
+    // Verify vault balance — can't flush more than what's available in vault.
+    // Available = total_deposited - total_withdrawn - total_flushed + total_returned
+    //
+    // The original formula omitted `+ total_returned`.  After AdminWithdrawInsurance
+    // increases total_returned, the vault physically holds those tokens again, but the
+    // old formula still subtracted the full total_flushed, making the available amount
+    // appear lower (or underflow) even when real tokens exist.  Use the same formula as
+    // total_pool_value() — which already accounts for all four counters correctly.
     let available = pool
         .total_deposited
         .checked_sub(pool.total_withdrawn)
         .and_then(|v| v.checked_sub(pool.total_flushed))
+        .and_then(|v| v.checked_add(pool.total_returned))
         .ok_or(StakeError::Overflow)?;
     if amount > available {
         return Err(ProgramError::InsufficientFunds);
@@ -1193,6 +1224,22 @@ fn process_admin_withdraw_insurance(
         return Err(solana_program::program_error::ProgramError::InvalidArgument);
     }
 
+    // Validate stake_vault matches the pool's stored vault address.
+    // Without this, an attacker could pass a different token account as stake_vault,
+    // diverting returned insurance tokens away from the pool's vault.
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.vault != stake_vault.key.to_bytes() {
+            msg!(
+                "Error: stake_vault {} does not match pool vault {}",
+                stake_vault.key,
+                pool.vault_pubkey()
+            );
+            return Err(StakeError::InvalidAccount.into());
+        }
+    }
+
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     // CPI: WithdrawInsuranceLimited (wrapper Tag 31)
@@ -1326,12 +1373,43 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
         .checked_add(pool.total_fees_earned)
         .ok_or(StakeError::Overflow)?;
 
-    if current_balance > pool_value {
+    // Only accrue fees when there are active LP holders.
+    // If total_lp_supply == 0 and a balance surplus exists, accruing it would set
+    // total_fees_earned > 0 while total_lp_supply == 0.  The first depositor check in
+    // calc_lp_for_deposit (total_lp_supply==0 && pool_value==0) would then fail, blocking
+    // ALL future deposits and permanently locking the pool.  An attacker can trigger this
+    // by sending even 1 token directly to the vault before the first deposit.
+    if current_balance > pool_value && pool.total_lp_supply > 0 {
         let fee_delta = current_balance - pool_value;
         pool.total_fees_earned = pool
             .total_fees_earned
             .checked_add(fee_delta)
             .ok_or(StakeError::Overflow)?;
+
+        // PERC-303: If tranches are active, distribute the fee delta between
+        // junior and senior sub-pools using the junior fee multiplier.
+        // Without this call, junior LPs receive ZERO benefit from junior_fee_mult_bps
+        // — all fees accrue to the global pool and senior LPs capture the entire yield.
+        // distribute_fees returns (junior_fee, senior_fee) that sum to <= fee_delta.
+        if pool.tranche_enabled() && pool.junior_total_lp() > 0 {
+            let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+            let (junior_fee, _) = crate::math::distribute_fees(
+                pool.junior_balance(),
+                senior_bal,
+                pool.junior_fee_mult_bps(),
+                fee_delta,
+            );
+            // Credit junior sub-pool with its share. Senior implicitly receives
+            // the remainder (fee_delta - junior_fee) since senior_balance is derived
+            // as total_pool_value() - junior_balance and total_fees_earned was already
+            // incremented by the full fee_delta above.
+            pool.set_junior_balance(
+                pool.junior_balance()
+                    .checked_add(junior_fee)
+                    .ok_or(StakeError::Overflow)?,
+            );
+        }
+
         msg!(
             "AccrueFees: accrued {} fees, total_fees_earned={}",
             fee_delta,
@@ -1524,8 +1602,13 @@ fn process_deposit_junior(
         }
     }
 
+    // Use effective_junior_balance() so that LP pricing reflects any insurance
+    // losses already absorbed by the junior tranche.  Pricing against the raw
+    // junior_balance() (stale, pre-loss) would charge new depositors a higher
+    // price than the sub-pool actually warrants, transferring value from incoming
+    // junior depositors to existing junior LP holders.
     let junior_lp = pool.junior_total_lp();
-    let junior_bal = pool.junior_balance();
+    let junior_bal = pool.effective_junior_balance();
     let lp_to_mint = crate::math::calc_junior_lp_for_deposit(junior_lp, junior_bal, amount)
         .ok_or(StakeError::Overflow)?;
     if lp_to_mint == 0 {
@@ -1629,7 +1712,10 @@ fn process_deposit_junior(
         deposit.set_discriminator();
     }
 
-    if deposit._reserved[8] != 1 && deposit.lp_amount > 0 {
+    // PERC-303: Prevent mixing. If deposit PDA is NOT flagged as junior
+    // and was previously used for senior deposits, reject. Check regardless
+    // of lp_amount to prevent bypass via full withdrawal then re-deposit.
+    if deposit._reserved[8] != 1 && deposit.is_initialized == 1 {
         return Err(StakeError::WrongTranche.into());
     }
 
