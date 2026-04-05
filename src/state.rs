@@ -284,8 +284,25 @@ impl StakePool {
     }
 
     /// Derived: senior balance = total_pool_value - effective_junior_balance.
+    ///
+    /// Returns `None` in two cases:
+    /// 1. `total_pool_value()` underflows (accounting is broken).
+    /// 2. `effective_junior_balance > total_pool_value` — tranche invariant violated.
+    ///    Logged explicitly so the violation appears in transaction logs and is not
+    ///    silently confused with a healthy zero-balance pool.
     pub fn senior_balance(&self) -> Option<u64> {
-        self.total_pool_value()?.checked_sub(self.effective_junior_balance())
+        let pv = self.total_pool_value()?;
+        let ejb = self.effective_junior_balance();
+        if ejb > pv {
+            solana_program::msg!(
+                "Error: senior_balance invariant violated — \
+                 effective_junior_balance ({}) exceeds total_pool_value ({})",
+                ejb,
+                pv
+            );
+            return None;
+        }
+        Some(pv - ejb)
     }
 
     /// Current struct version. Increment when layout changes.
@@ -550,6 +567,37 @@ mod tests {
         pool.total_lp_supply = 1000;
         // deposit 500 → 500 * 1000 / 2000 = 250
         assert_eq!(pool.calc_lp_for_deposit(500), Some(250));
+    }
+
+    #[test]
+    fn test_senior_balance_healthy() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.set_junior_balance(300);
+        // senior = 1000 - 300 = 700
+        assert_eq!(pool.senior_balance(), Some(700));
+    }
+
+    #[test]
+    fn test_senior_balance_invariant_violation_returns_none() {
+        // junior_balance > total_pool_value — tranche invariant violated.
+        // senior_balance() must return None (not panic, not silently succeed).
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 500;
+        pool.total_withdrawn = 0;
+        pool.set_junior_balance(800); // 800 > 500
+        assert_eq!(pool.senior_balance(), None);
+    }
+
+    #[test]
+    fn test_senior_balance_broken_accounting_returns_none() {
+        // total_pool_value() itself underflows — both None paths exercised.
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 100;
+        pool.total_withdrawn = 500; // underflow in total_pool_value
+        pool.set_junior_balance(0);
+        assert_eq!(pool.senior_balance(), None);
     }
 
     #[test]
