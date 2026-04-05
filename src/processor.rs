@@ -253,6 +253,11 @@ fn process_init_pool(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // Validate cooldown_slots > 0. A zero cooldown would allow deposit+withdraw
+    // in the same slot, enabling flash-loan-style attacks. This check already
+    // exists in process_update_config but was missing here at pool creation.
+    validate_cooldown_slots(cooldown_slots)?;
+
     // Derive and verify pool PDA
     let (expected_pool, pool_bump) = state::derive_pool_pda(program_id, slab.key);
     if *pool_pda.key != expected_pool {
