@@ -445,14 +445,22 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // Without this, attacker passes fake program → receives vault_auth signer → drains vault.
     verify_token_program(token_program)?;
 
-    // Verify user_ata is owned by user (not just delegated).
-    // An attacker who holds a delegate approval on someone else's ATA could otherwise pass
-    // that victim ATA as user_ata and transfer the victim's tokens into the pool while
-    // receiving LP tokens for themselves.  SPL token account layout bytes [32..64] = owner.
+    // Verify user_ata is owned by user (not just delegated) and holds the correct mint.
+    // SPL token account layout: bytes [0..32] = mint, bytes [32..64] = owner.
     {
         let ata_data = user_ata.try_borrow_data()?;
         if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
             return Err(StakeError::InvalidAccount.into());
+        }
+        // Mint check: reject ATAs for wrong token (defense-in-depth; SPL would also catch
+        // this on transfer, but an explicit check here gives a clear error and prevents
+        // amount/balance reads from being made against the wrong token type).
+        let mint_bytes: &[u8; 32] = ata_data[0..32]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if mint_bytes != &pool.collateral_mint {
+            msg!("Error: user_ata mint does not match pool collateral_mint");
+            return Err(StakeError::InvalidMint.into());
         }
         let owner_bytes: &[u8; 32] = ata_data[32..64]
             .try_into()
@@ -645,16 +653,25 @@ fn process_withdraw(
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
     verify_token_program(token_program)?;
 
-    // Verify user_lp_ata is owned by the signer (not merely delegated).
-    // Delegation attack: if an attacker holds an Approve on a victim's LP ATA, they could
-    // pass the victim's LP ATA as user_lp_ata, burn the victim's LP tokens, and receive
-    // collateral from their OWN deposit record — effectively extracting double value while
-    // the victim's LP is destroyed.  SPL token account owner field is at bytes [32..64].
+    // Verify user_lp_ata is owned by the signer (not merely delegated) and holds the LP mint.
+    // SPL token account layout: bytes [0..32] = mint, bytes [32..64] = owner.
     {
         let lp_ata_data = user_lp_ata.try_borrow_data()?;
         if lp_ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
             return Err(StakeError::InvalidAccount.into());
         }
+        // Mint check: reject LP ATAs for a different mint (defense-in-depth).
+        let mint_bytes: &[u8; 32] = lp_ata_data[0..32]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if mint_bytes != &pool.lp_mint {
+            msg!("Error: user_lp_ata mint does not match pool lp_mint");
+            return Err(StakeError::InvalidMint.into());
+        }
+        // Delegation attack: if an attacker holds an Approve on a victim's LP ATA, they could
+        // pass the victim's LP ATA as user_lp_ata, burn the victim's LP tokens, and receive
+        // collateral from their OWN deposit record — effectively extracting double value while
+        // the victim's LP is destroyed.
         let owner_bytes: &[u8; 32] = lp_ata_data[32..64]
             .try_into()
             .map_err(|_| StakeError::InvalidAccount)?;
