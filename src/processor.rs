@@ -1324,7 +1324,7 @@ fn process_admin_set_insurance_policy(
 /// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
 /// To keep it simple and trustless: we track the vault token account balance directly.
 /// Any increase in vault balance beyond deposits is fee revenue.
-fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
     if !caller.is_signer {
@@ -1335,14 +1335,24 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     let vault_ai = next_account_info(accounts_iter)?;
     let clock_ai = next_account_info(accounts_iter)?;
 
-    // Validate pool PDA
+    // Validate pool PDA ownership and writability before touching its data.
+    // Without these checks an attacker could pass any program-owned account of the
+    // right size (e.g. a StakeDeposit PDA) and corrupt it via the fee-accrual write.
+    validate_account_not_empty(pool_ai)?;
+    validate_account_owner(pool_ai, program_id)?;
+    validate_account_writable(pool_ai)?;
+
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     if pool.is_initialized != 1 {
-        return Err(ProgramError::UninitializedAccount);
+        return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
 
     // Only trading LP mode pools accrue fees
     if pool.pool_mode != 1 {
@@ -1350,15 +1360,15 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
         return Err(StakeError::InvalidPoolMode.into());
     }
 
+    // Verify vault matches pool before reading its data.
+    if vault_ai.key.to_bytes() != pool.vault {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     // Read vault token account balance
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
     let current_balance = vault_state.amount;
-
-    // Verify vault matches pool
-    if vault_ai.key.to_bytes() != pool.vault {
-        return Err(ProgramError::InvalidAccountData);
-    }
 
     let clock = Clock::from_account_info(clock_ai)?;
 
