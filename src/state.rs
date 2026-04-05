@@ -257,9 +257,35 @@ impl StakePool {
         self.total_lp_supply.saturating_sub(self.junior_total_lp())
     }
 
-    /// Derived: senior balance = total_pool_value - junior_balance.
+    /// Loss-adjusted junior tranche balance.
+    ///
+    /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
+    /// but is NOT reduced when `total_flushed` increases (insurance loss).  Using the
+    /// raw value prices new deposits against a stale, inflated sub-pool, causing new
+    /// junior depositors to receive fewer LP tokens than their proportional share —
+    /// effectively overcharging them when prior losses have already reduced pool value.
+    ///
+    /// This method applies `distribute_loss` to compute the amount of outstanding
+    /// insurance losses that the junior tranche must absorb first, returning the
+    /// true collateral backing junior LP tokens.
+    pub fn effective_junior_balance(&self) -> u64 {
+        let jb = self.junior_balance();
+        // net_loss = total_flushed - total_returned (tokens sent to insurance but not yet returned)
+        let net_loss = self
+            .total_flushed
+            .saturating_sub(self.total_returned);
+        if net_loss == 0 {
+            return jb;
+        }
+        // Compute how much of the net loss the junior tranche absorbs.
+        let senior_bal = self.total_pool_value().unwrap_or(0).saturating_sub(jb);
+        let (junior_loss, _) = crate::math::distribute_loss(jb, senior_bal, net_loss);
+        jb.saturating_sub(junior_loss)
+    }
+
+    /// Derived: senior balance = total_pool_value - effective_junior_balance.
     pub fn senior_balance(&self) -> Option<u64> {
-        self.total_pool_value()?.checked_sub(self.junior_balance())
+        self.total_pool_value()?.checked_sub(self.effective_junior_balance())
     }
 
     /// Current struct version. Increment when layout changes.
