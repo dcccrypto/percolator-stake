@@ -925,7 +925,7 @@ fn process_flush_to_insurance(
         .and_then(|v| v.checked_add(pool.total_returned))
         .ok_or(StakeError::Overflow)?;
     if amount > available {
-        return Err(ProgramError::InsufficientFunds);
+        return Err(StakeError::InsufficientVaultBalance.into());
     }
 
     // Derive vault authority for signing
