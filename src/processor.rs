@@ -1221,7 +1221,7 @@ fn process_admin_withdraw_insurance(
     let (expected_vault_auth, vault_auth_bump) =
         Pubkey::find_program_address(&[b"vault_auth", pool_pda.key.as_ref()], program_id);
     if vault_auth.key != &expected_vault_auth {
-        return Err(solana_program::program_error::ProgramError::InvalidArgument);
+        return Err(StakeError::InvalidPda.into());
     }
 
     // Validate stake_vault matches the pool's stored vault address.
