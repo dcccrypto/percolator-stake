@@ -807,16 +807,36 @@ fn process_withdraw(
 
     // Update tranche-specific state if junior
     if pool.tranche_enabled() && is_junior {
-        pool.set_junior_total_lp(
-            pool.junior_total_lp()
-                .checked_sub(lp_amount)
-                .ok_or(StakeError::Overflow)?,
-        );
-        pool.set_junior_balance(
-            pool.junior_balance()
-                .checked_sub(withdrawal_amount)
-                .ok_or(StakeError::Overflow)?,
-        );
+        let junior_lp_before = pool.junior_total_lp();
+        let new_junior_lp = junior_lp_before
+            .checked_sub(lp_amount)
+            .ok_or(StakeError::Overflow)?;
+        pool.set_junior_total_lp(new_junior_lp);
+
+        if new_junior_lp == 0 {
+            // All junior LP withdrawn — zero out the raw balance.
+            // withdrawal_amount is derived from effective_junior_balance (loss-adjusted)
+            // but junior_balance stores the raw (non-adjusted) value.  Subtracting
+            // the loss-adjusted amount from the raw balance leaves a residual that
+            // grows with each withdrawal during a loss period.  When insurance is
+            // later returned, this orphaned balance blocks new junior deposits
+            // (supply=0 but value>0) and locks tokens permanently in the vault.
+            pool.set_junior_balance(0);
+        } else {
+            // Proportional decrease of the RAW junior_balance based on LP share,
+            // not the loss-adjusted withdrawal_amount.  This keeps the raw balance
+            // in sync with the remaining LP holders' proportional claim.
+            let jb = pool.junior_balance();
+            let raw_decrease = (lp_amount as u128)
+                .checked_mul(jb as u128)
+                .and_then(|v| v.checked_div(junior_lp_before as u128))
+                .map(|v| v as u64)
+                .ok_or(StakeError::Overflow)?;
+            pool.set_junior_balance(
+                jb.checked_sub(raw_decrease)
+                    .ok_or(StakeError::Overflow)?,
+            );
+        }
     }
 
     // Update deposit PDA
