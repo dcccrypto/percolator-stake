@@ -635,6 +635,7 @@ fn process_withdraw(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    validate_pool_version(pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
@@ -880,6 +881,7 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    validate_pool_version(pool)?;
 
     // CRITICAL (C10): FlushToInsurance must be admin-only.
     // Without this, ANY signer can drain the stake vault to wrapper insurance,
@@ -1343,6 +1345,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     if pool.is_initialized != 1 {
         return Err(ProgramError::UninitializedAccount);
     }
+    validate_pool_version(pool)?;
 
     // Only trading LP mode pools accrue fees
     if pool.pool_mode != 1 {
@@ -1552,6 +1555,7 @@ fn process_deposit_junior(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    validate_pool_version(pool)?;
     if !pool.tranche_enabled() {
         return Err(StakeError::TrancheNotEnabled.into());
     }
