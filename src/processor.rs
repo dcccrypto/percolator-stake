@@ -1341,7 +1341,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     if pool.is_initialized != 1 {
-        return Err(ProgramError::UninitializedAccount);
+        return Err(StakeError::NotInitialized.into());
     }
 
     // Only trading LP mode pools accrue fees
@@ -1357,7 +1357,7 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     // Verify vault matches pool
     if vault_ai.key.to_bytes() != pool.vault {
-        return Err(ProgramError::InvalidAccountData);
+        return Err(StakeError::InvalidPda.into());
     }
 
     let clock = Clock::from_account_info(clock_ai)?;
