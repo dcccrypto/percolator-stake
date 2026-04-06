@@ -1296,6 +1296,17 @@ fn process_admin_set_insurance_policy(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
+    // Validate max_withdraw_bps before CPI — basis points must be <= 10000 (100%).
+    // hwm_floor_bps and junior_fee_mult_bps are validated locally; this parameter
+    // was the only bps field forwarded to the wrapper without a range check.
+    if max_withdraw_bps > 10_000 {
+        msg!(
+            "max_withdraw_bps must be <= 10000, got {}",
+            max_withdraw_bps
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
