@@ -195,14 +195,19 @@ mod kani_proofs {
     // ═══════════════════════════════════════════════════════════
 
     /// PROOF: Equal deposits get equal LP tokens (deterministic).
+    ///
+    /// Previous version allowed supply=0, pv=0, amount=0 which made the proof
+    /// vacuously pass (None == None) without exercising any pro-rata arithmetic.
+    /// Now requires supply > 0, pv > 0, and amount > 0 so CBMC must verify the
+    /// actual proportional calculation path, not just the None-return early exits.
     #[kani::proof]
     fn proof_equal_deposits_equal_lp() {
         let supply: u64 = kani::any();
         let pv: u64 = kani::any();
         let amount: u64 = kani::any();
-        kani::assume(supply <= 1_000_000_000);
-        kani::assume(pv <= 1_000_000_000);
-        kani::assume(amount <= 1_000_000_000);
+        kani::assume(supply > 0 && supply <= 1_000_000_000);
+        kani::assume(pv > 0 && pv <= 1_000_000_000);
+        kani::assume(amount > 0 && amount <= 1_000_000_000);
 
         let lp1 = calc_lp_for_deposit(supply, pv, amount);
         let lp2 = calc_lp_for_deposit(supply, pv, amount);
