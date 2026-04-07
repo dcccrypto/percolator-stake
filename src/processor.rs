@@ -253,9 +253,10 @@ fn process_init_pool(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Validate cooldown_slots > 0. A zero cooldown would allow deposit+withdraw
-    // in the same slot, enabling flash-loan-style attacks. This check already
-    // exists in process_update_config but was missing here at pool creation.
+    // BUG-13: Validate cooldown_slots at InitPool time, consistent with UpdateConfig.
+    // UpdateConfig already calls validate_cooldown_slots(), so allowing cooldown_slots=0
+    // at init creates an inconsistency: a pool created with cooldown=0 could never be
+    // updated to any non-zero value without a race window where it had no cooldown.
     validate_cooldown_slots(cooldown_slots)?;
 
     // Derive and verify pool PDA
@@ -595,6 +596,11 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
     deposit.user = user.key.to_bytes();
+    // BUG-8 (design note): Any deposit by a user resets last_deposit_slot for their ENTIRE
+    // position, restarting the cooldown clock for all LP tokens they hold — not just the
+    // newly minted ones.  This is intentional: it prevents users from avoiding cooldown by
+    // making tiny "top-up" deposits while their main stake sits uncooled.  The trade-off is
+    // that adding to an existing position extends the withdrawal wait for the whole balance.
     deposit.last_deposit_slot = clock.slot;
     deposit.lp_amount = deposit
         .lp_amount
@@ -639,6 +645,9 @@ fn process_withdraw(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // BUG-1: Validate pool account exists, is owned by the stake program, and is writable
+    // (matching the same guards in process_deposit lines 389-391).
+    validate_account_not_empty(pool_pda)?;
     validate_account_owner(pool_pda, program_id)?;
     validate_account_writable(pool_pda)?;
 
@@ -651,6 +660,8 @@ fn process_withdraw(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    // BUG-2: Validate pool version, matching process_deposit line 403.
+    validate_pool_version(pool)?;
     if pool.lp_mint != lp_mint.key.to_bytes() {
         return Err(StakeError::InvalidMint.into());
     }
@@ -799,7 +810,19 @@ fn process_withdraw(
     )?;
 
     // Transfer collateral: vault → user ATA (single transfer)
-    let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
+    // BUG-10: Use the vault_authority_bump stored in pool state rather than calling
+    // find_program_address, which is a compute-intensive PDA search (iterates until
+    // it finds a valid bump).  The bump is stored at InitPool time and never changes.
+    // We add a debug assertion to catch any drift between stored and derived values.
+    let vault_auth_bump = pool.vault_authority_bump;
+    #[cfg(debug_assertions)]
+    {
+        let (_, derived_bump) = state::derive_vault_authority(program_id, pool_pda.key);
+        debug_assert_eq!(
+            vault_auth_bump, derived_bump,
+            "Stored vault_authority_bump does not match derived bump — state corruption"
+        );
+    }
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     invoke_signed(
@@ -1046,7 +1069,11 @@ fn process_update_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // BUG-5: Validate pool account is owned by this program before reading it.
+    // Without this, an attacker could pass a crafted account and manipulate config
+    // without an authentic pool PDA.
     validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -1296,6 +1323,11 @@ fn process_admin_withdraw_insurance(
     // Validate stake_vault matches the pool's stored vault address.
     // Without this, an attacker could pass a different token account as stake_vault,
     // diverting returned insurance tokens away from the pool's vault.
+    //
+    // BUG-12: Also pre-check that amount does not exceed the outstanding insurance balance
+    // (total_flushed - total_returned).  Without this, we trust the wrapper to enforce
+    // the limit, but our own accounting could overflow or be manipulated if total_returned
+    // is incremented beyond total_flushed (creating phantom insurance returns).
     {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
@@ -1306,6 +1338,18 @@ fn process_admin_withdraw_insurance(
                 pool.vault_pubkey()
             );
             return Err(StakeError::InvalidAccount.into());
+        }
+        let outstanding = pool
+            .total_flushed
+            .checked_sub(pool.total_returned)
+            .ok_or(StakeError::Overflow)?;
+        if amount > outstanding {
+            msg!(
+                "Error: withdraw amount {} exceeds outstanding insurance balance {}",
+                amount,
+                outstanding
+            );
+            return Err(ProgramError::InsufficientFunds);
         }
     }
 
@@ -1415,13 +1459,15 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     let vault_ai = next_account_info(accounts_iter)?;
     let clock_ai = next_account_info(accounts_iter)?;
 
-    // Validate pool PDA ownership and writability before touching its data.
-    // Without these checks an attacker could pass any program-owned account of the
-    // right size (e.g. a StakeDeposit PDA) and corrupt it via the fee-accrual write.
+    // BUG-3: Validate pool account ownership and non-emptiness before reading it.
+    // Without these guards, an attacker can pass an arbitrary account as pool_ai;
+    // bytemuck::try_from_bytes_mut would reinterpret foreign data as StakePool state.
+    // Also validate writability since AccrueFees modifies pool state.
     validate_account_not_empty(pool_ai)?;
     validate_account_owner(pool_ai, program_id)?;
     validate_account_writable(pool_ai)?;
 
+    // Validate pool PDA
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
@@ -1433,6 +1479,17 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         return Err(StakeError::InvalidAccount.into());
     }
     validate_pool_version(pool)?;
+
+    // BUG-3 (continued): Verify the pool PDA is correctly derived from its stored slab key.
+    // Prevents a crafted pool account at a different address from being accepted.
+    {
+        let slab_key = pool.slab_pubkey();
+        let (expected_pool, _) = state::derive_pool_pda(program_id, &slab_key);
+        if *pool_ai.key != expected_pool {
+            msg!("AccrueFees: pool PDA does not match derived address");
+            return Err(StakeError::InvalidPda.into());
+        }
+    }
 
     // Only trading LP mode pools accrue fees
     if pool.pool_mode != 1 {
@@ -1452,16 +1509,16 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
 
     let clock = Clock::from_account_info(clock_ai)?;
 
-    // Compute fee delta: any balance increase beyond what was deposited (net of withdrawals)
-    // pool_value = total_deposited - total_withdrawn + total_fees_earned
-    // If current_balance > pool_value, the difference is new fees
-    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
-    let pool_value = pool
-        .total_deposited
-        .checked_sub(pool.total_withdrawn)
-        .ok_or(StakeError::Overflow)?
-        .checked_add(pool.total_fees_earned)
-        .ok_or(StakeError::Overflow)?;
+    // BUG-7: Compute the expected vault balance using total_pool_value() rather than
+    // manually reconstructing it.  The manual formula
+    //   pool_value = total_deposited - total_withdrawn + total_fees_earned
+    // omits total_flushed and total_returned.  For trading LP pools (mode 1), flush
+    // operations should not occur (guarded in FlushToInsurance), but if total_flushed
+    // or total_returned are ever non-zero the stale formula produces an incorrect
+    // fee_delta, potentially double-counting or missing fees.
+    // total_pool_value() = deposited - withdrawn - flushed + returned + fees_earned (mode 1)
+    // which is the authoritative expected balance.
+    let pool_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
 
     // Only accrue fees when there are active LP holders.
     // If total_lp_supply == 0 and a balance surplus exists, accruing it would set
@@ -1548,7 +1605,9 @@ fn process_admin_set_hwm_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // BUG-4: Validate pool account ownership and non-emptiness before reading it.
     validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
 
     // Validate hwm_floor_bps before modifying state
     if enabled {
@@ -1594,7 +1653,9 @@ fn process_admin_set_tranche_config(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // BUG-4: Validate pool account ownership and non-emptiness before reading it.
     validate_account_owner(pool_ai, program_id)?;
+    validate_account_not_empty(pool_ai)?;
 
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -1835,6 +1896,14 @@ fn process_deposit_junior(
         return Err(StakeError::WrongTranche.into());
     }
 
+    // BUG-9: Set the junior flag BEFORE setting is_initialized = 1 so both writes
+    // are committed together in the same account data mutation.  If we set
+    // is_initialized = 1 first and the transaction aborts between the two writes
+    // (e.g., compute budget exceeded), the PDA would appear initialized but lack
+    // the junior flag, permanently bricking it: any future DepositJunior would
+    // reject it (wrong tranche) and process_deposit would also reject it (senior
+    // PDA already initialized without junior flag).
+    deposit._reserved[8] = 1;
     deposit.is_initialized = 1;
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
@@ -1844,7 +1913,6 @@ fn process_deposit_junior(
         .lp_amount
         .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
-    deposit._reserved[8] = 1;
 
     msg!(
         "DepositJunior: {} collateral, minted {} LP tokens (junior tranche)",

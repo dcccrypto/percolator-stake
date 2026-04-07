@@ -141,10 +141,10 @@ proptest! {
         pv in 1u64..1_000_000_000,
         sm in 1u64..500_000_000u64,
     ) {
+        // BUG-11: Replace single-arm match with if let to satisfy clippy::match_single_binding.
         let lg = sm + 1;
-        match (calc_lp_for_deposit(supply, pv, sm), calc_lp_for_deposit(supply, pv, lg)) {
-            (Some(ls), Some(ll)) => prop_assert!(ll >= ls),
-            _ => {}
+        if let (Some(ls), Some(ll)) = (calc_lp_for_deposit(supply, pv, sm), calc_lp_for_deposit(supply, pv, lg)) {
+            prop_assert!(ll >= ls);
         }
     }
 
@@ -156,9 +156,9 @@ proptest! {
     ) {
         let lg = sm + 1;
         prop_assume!(lg <= supply);
-        match (calc_collateral_for_withdraw(supply, pv, sm), calc_collateral_for_withdraw(supply, pv, lg)) {
-            (Some(cs), Some(cl)) => prop_assert!(cl >= cs),
-            _ => {}
+        // BUG-11: Replace single-arm match with if let to satisfy clippy::match_single_binding.
+        if let (Some(cs), Some(cl)) = (calc_collateral_for_withdraw(supply, pv, sm), calc_collateral_for_withdraw(supply, pv, lg)) {
+            prop_assert!(cl >= cs);
         }
     }
 

@@ -323,8 +323,11 @@ fn test_three_depositors_fairness() {
 
 #[test]
 fn test_stake_pool_size() {
-    // Verify the struct is a known size and bytemuck-compatible
-    assert!(STAKE_POOL_SIZE > 0);
+    // Verify the struct is a known size and bytemuck-compatible.
+    // BUG-11: The original assert!(STAKE_POOL_SIZE > 0) is a constant-evaluated
+    // assertion that clippy rejects as assertions_on_constants.  The correct fix
+    // for a compile-time invariant is a const assert block.
+    const { assert!(STAKE_POOL_SIZE > 0) };
     assert_eq!(STAKE_POOL_SIZE, core::mem::size_of::<StakePool>());
     // Verify Pod alignment
     let _pool = StakePool::zeroed();
@@ -332,7 +335,7 @@ fn test_stake_pool_size() {
 
 #[test]
 fn test_stake_deposit_size() {
-    assert!(STAKE_DEPOSIT_SIZE > 0);
+    const { assert!(STAKE_DEPOSIT_SIZE > 0) };
     assert_eq!(STAKE_DEPOSIT_SIZE, core::mem::size_of::<StakeDeposit>());
     let _deposit = StakeDeposit::zeroed();
 }

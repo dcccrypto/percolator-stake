@@ -14,6 +14,19 @@ use solana_program::{
 
 // ═══════════════════════════════════════════════════════════════
 // Wrapper instruction tags (from percolator-prog/src/percolator.rs)
+//
+// BUG-14: These tag constants have no compile-time binding to the wrapper crate.
+// They must be manually kept in sync with percolator-prog/src/percolator.rs.
+//
+// VERSION BINDING:
+//   Corresponds to percolator-prog instruction layout as of PERC-110 / PERC-112.
+//   Last verified against percolator-prog commit that introduced:
+//     - Tag 30: SetInsuranceWithdrawPolicy (PERC-110)
+//     - Tag 31: WithdrawInsuranceLimited (PERC-110)
+//     - Tag 29: AcceptAdmin two-step transfer (PERC-112)
+//
+// If the wrapper ever renumbers instructions, update these constants AND increment
+// the expected values in the unit test `test_cpi_tag_constants` below.
 // ═══════════════════════════════════════════════════════════════
 
 const TAG_TOP_UP_INSURANCE: u8 = 9;
@@ -390,4 +403,38 @@ pub fn cpi_withdraw_insurance_limited<'a>(
         ],
         &[vault_auth_seeds],
     )
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BUG-14: Unit test that freezes the expected tag values.
+// If any tag is accidentally changed, this test will fail and
+// catch the mismatch before deployment.
+// ═══════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    #[test]
+    fn test_cpi_tag_constants() {
+        // These values must match percolator-prog/src/percolator.rs exactly.
+        // If the wrapper renumbers instructions, update both the constants above
+        // and the expected values here — never silently change one without the other.
+        assert_eq!(TAG_TOP_UP_INSURANCE, 9, "TAG_TOP_UP_INSURANCE mismatch");
+        assert_eq!(TAG_SET_RISK_THRESHOLD, 11, "TAG_SET_RISK_THRESHOLD mismatch");
+        assert_eq!(TAG_UPDATE_ADMIN, 12, "TAG_UPDATE_ADMIN mismatch");
+        assert_eq!(TAG_SET_MAINTENANCE_FEE, 15, "TAG_SET_MAINTENANCE_FEE mismatch");
+        assert_eq!(TAG_SET_ORACLE_AUTHORITY, 16, "TAG_SET_ORACLE_AUTHORITY mismatch");
+        assert_eq!(TAG_SET_ORACLE_PRICE_CAP, 18, "TAG_SET_ORACLE_PRICE_CAP mismatch");
+        assert_eq!(TAG_RESOLVE_MARKET, 19, "TAG_RESOLVE_MARKET mismatch");
+        assert_eq!(TAG_WITHDRAW_INSURANCE, 20, "TAG_WITHDRAW_INSURANCE mismatch");
+        assert_eq!(
+            TAG_SET_INSURANCE_WITHDRAW_POLICY, 30,
+            "TAG_SET_INSURANCE_WITHDRAW_POLICY mismatch — added in PERC-110"
+        );
+        assert_eq!(
+            TAG_WITHDRAW_INSURANCE_LIMITED, 31,
+            "TAG_WITHDRAW_INSURANCE_LIMITED mismatch — added in PERC-110"
+        );
+    }
 }

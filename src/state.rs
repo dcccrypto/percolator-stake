@@ -277,9 +277,23 @@ impl StakePool {
         if net_loss == 0 {
             return jb;
         }
-        // Compute how much of the net loss the junior tranche absorbs.
-        let senior_bal = self.total_pool_value().unwrap_or(0).saturating_sub(jb);
-        let (junior_loss, _) = crate::math::distribute_loss(jb, senior_bal, net_loss);
+        // BUG-6: Must distribute loss against the GROSS (pre-loss) balances, not the
+        // loss-adjusted pool value that total_pool_value() already returns.
+        //
+        // total_pool_value() = deposited - withdrawn - flushed + returned
+        //                    = gross_pool - net_loss
+        //
+        // If we used total_pool_value() - jb as senior_bal here, the senior_bal would
+        // already be net_loss lower than its true gross value.  Calling distribute_loss
+        // with that deflated senior_bal causes junior to absorb MORE loss than it
+        // should — i.e., the loss is applied twice against the junior side.
+        //
+        // Fix: derive gross balances as if no loss occurred yet, then apply the loss once.
+        // gross_pool = total_deposited - total_withdrawn (the monotonic principal, no flush/return)
+        let gross_pool = self.total_deposited.saturating_sub(self.total_withdrawn);
+        // gross_senior = gross_pool - jb (the stored junior_balance() is the gross junior)
+        let gross_senior = gross_pool.saturating_sub(jb);
+        let (junior_loss, _) = crate::math::distribute_loss(jb, gross_senior, net_loss);
         jb.saturating_sub(junior_loss)
     }
 
