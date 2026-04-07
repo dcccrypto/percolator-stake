@@ -203,6 +203,11 @@ fn validate_admin_cpi(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // FINDING-5: Validate pool version in all admin CPI paths.
+    // This covers process_admin_set_oracle_authority, process_admin_set_risk_threshold,
+    // process_admin_set_maintenance_fee, process_admin_resolve_market,
+    // process_admin_set_insurance_policy, and process_admin_withdraw_insurance.
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -214,6 +219,17 @@ fn validate_admin_cpi(
     }
     if pool.percolator_program != percolator_program.key.to_bytes() {
         return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // FINDING-8: Verify slab is owned by the percolator program before CPI.
+    // Without this, an attacker can pass a crafted account as slab, bypassing the
+    // ownership invariant and potentially calling the wrong program's handler.
+    // Also verify percolator_program is executable to prevent a data account being
+    // passed as the CPI target.
+    validate_account_owner(slab, percolator_program.key)?;
+    if !percolator_program.executable {
+        msg!("Error: percolator_program account is not executable");
+        return Err(StakeError::InvalidAccount.into());
     }
 
     // Verify pool PDA derivation
@@ -303,14 +319,18 @@ fn process_init_pool(
         &[pool_seeds],
     )?;
 
-    // Create LP mint (authority = vault_auth PDA)
+    // Create LP mint (mint authority = vault_auth PDA, freeze authority = None).
+    // FINDING-4: Passing Some(vault_auth.key) as freeze authority would allow the
+    // admin (who controls vault_auth) to freeze any LP holder's token account,
+    // permanently preventing withdrawals. LP tokens must be freely transferable
+    // and withdrawable — freeze authority must not be retained.
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
     invoke_signed(
         &crate::spl_token::initialize_mint(
             token_program.key,
             lp_mint.key,
             vault_auth.key,
-            Some(vault_auth.key),
+            None, // freeze_authority: None — LP tokens must not be freezable
             6,
         )?,
         &[lp_mint.clone(), rent_sysvar.clone()],
@@ -344,6 +364,11 @@ fn process_init_pool(
     pool.admin_transferred = 0; // Not yet — must call TransferAdmin
     pool.slab = slab.key.to_bytes();
     pool.admin = admin.key.to_bytes();
+    // FINDING-6 (SECURITY NOTE): collateral_mint is admin-provided and NOT verified
+    // against slab on-chain data. We cannot read the slab's internal data layout from
+    // this program without a hard dependency on percolator-prog. This is an admin-trust
+    // assumption tracked in the threat model: the admin is responsible for passing the
+    // correct collateral_mint that matches the slab's configured collateral token.
     pool.collateral_mint = collateral_mint.key.to_bytes();
     pool.lp_mint = lp_mint.key.to_bytes();
     pool.vault = vault.key.to_bytes();
@@ -815,13 +840,21 @@ fn process_withdraw(
     // it finds a valid bump).  The bump is stored at InitPool time and never changes.
     // We add a debug assertion to catch any drift between stored and derived values.
     let vault_auth_bump = pool.vault_authority_bump;
-    #[cfg(debug_assertions)]
+    // FINDING-11: Always verify vault_authority_bump matches the derived value.
+    // Previously this was gated on #[cfg(debug_assertions)] so production builds
+    // would silently use a corrupted bump and produce an invalid PDA seed, causing
+    // the invoke_signed to fail with an opaque error rather than a clear security check.
+    // The cost of one find_program_address call per withdrawal is acceptable for security.
     {
         let (_, derived_bump) = state::derive_vault_authority(program_id, pool_pda.key);
-        debug_assert_eq!(
-            vault_auth_bump, derived_bump,
-            "Stored vault_authority_bump does not match derived bump — state corruption"
-        );
+        if vault_auth_bump != derived_bump {
+            msg!(
+                "Error: stored vault_authority_bump ({}) does not match derived bump ({}) — state corruption",
+                vault_auth_bump,
+                derived_bump
+            );
+            return Err(StakeError::InvalidPda.into());
+        }
     }
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
@@ -941,6 +974,18 @@ fn process_flush_to_insurance(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // FINDING-2: Validate pool account ownership and non-emptiness before reading it.
+    // Without these guards an attacker can pass a crafted account; bytemuck would
+    // reinterpret foreign data as StakePool state and all subsequent field checks
+    // operate on attacker-controlled bytes.
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    // FINDING-2: Verify token program before the CPI call that grants PDA signer authority.
+    // Without this check an attacker can pass a fake token program, receive the PDA
+    // signer authority via invoke_signed, and drain the vault.
+    verify_token_program(token_program)?;
+
     // Read pool
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -948,6 +993,8 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // FINDING-5: Validate pool version on FlushToInsurance.
+    validate_pool_version(pool)?;
 
     // CRITICAL (C10): FlushToInsurance must be admin-only.
     // Without this, ANY signer can drain the stake vault to wrapper insurance,
@@ -1081,6 +1128,8 @@ fn process_update_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // FINDING-5: Validate pool version on UpdateConfig.
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -1478,6 +1527,7 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    // FINDING-5: Validate pool version on AccrueFees.
     validate_pool_version(pool)?;
 
     // BUG-3 (continued): Verify the pool PDA is correctly derived from its stored slab key.
@@ -1497,12 +1547,16 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         return Err(StakeError::InvalidPoolMode.into());
     }
 
-    // Verify vault matches pool before reading its data.
+    // FINDING-3: Verify vault key BEFORE reading vault data.
+    // Reading the vault token account before verifying the key allows an attacker to
+    // pass an arbitrary token account whose balance then drives fee accounting.
+    // The key check must be the first thing done with vault_ai.
     if vault_ai.key.to_bytes() != pool.vault {
+        msg!("AccrueFees: vault account does not match pool.vault");
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Read vault token account balance
+    // Read vault token account balance (key already verified above)
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
     let current_balance = vault_state.amount;
@@ -1620,6 +1674,8 @@ fn process_admin_set_hwm_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // FINDING-5: Validate pool version on AdminSetHwmConfig.
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -1663,6 +1719,8 @@ fn process_admin_set_tranche_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // FINDING-5: Validate pool version on AdminSetTrancheConfig.
+    validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -1729,6 +1787,8 @@ fn process_deposit_junior(
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
+    // FINDING-9: Validate pool version on DepositJunior, matching process_deposit.
+    validate_pool_version(pool)?;
     if !pool.tranche_enabled() {
         return Err(StakeError::TrancheNotEnabled.into());
     }

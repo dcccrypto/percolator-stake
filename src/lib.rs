@@ -37,5 +37,14 @@ pub mod processor;
 pub mod spl_token;
 pub mod state;
 
+/// Public re-export of CPI instruction tag constants for integration tests.
+///
+/// SECURITY: Integration tests (tests/cpi_tags.rs) import these to ensure
+/// they always compare against the production values, not hardcoded stale integers.
+pub mod cpi_tag_constants {
+    pub use crate::cpi::TAG_SET_INSURANCE_WITHDRAW_POLICY;
+    pub use crate::cpi::TAG_WITHDRAW_INSURANCE_LIMITED;
+}
+
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint;

@@ -217,16 +217,57 @@ pub fn distribute_fees(
     // `total_fee as u128` is at most 2^64.
     // `junior_weight` is at most u64::MAX * 50_000 ≈ 2^80 (junior_fee_mult_bps capped at 50_000).
     // Their product can reach 2^144 which overflows u128 (max 2^128).
-    // Use checked_mul and fall back to a scaled calculation that preserves the ratio.
+    //
+    // FINDING-7: The previous >>24 shift fallback introduced a ratio error because shifting
+    // both numerator weight and denominator weight by the same amount is only exact when the
+    // shift divides both evenly — otherwise truncation of the low bits creates a systematic
+    // bias. Use exact integer arithmetic instead:
+    //
+    //   junior_fee = total_fee / total_weight * junior_weight
+    //              + (total_fee % total_weight) * junior_weight / total_weight
+    //
+    // This identity is exact for integer division and never overflows because:
+    //   - `total_fee / total_weight` is at most total_fee (≤ 2^64)
+    //   - `(total_fee % total_weight)` < total_weight, so the second term's product is
+    //     at most (total_weight - 1) * junior_weight < total_weight * total_weight ≤ 2^160
+    //     — which still overflows if we use u128 naively for the remainder term.
+    //
+    // Simplest safe approach that fits in u128:
+    //   Divide junior_weight by gcd(junior_weight, total_weight) first, then multiply.
+    //   After reduction junior_weight_reduced ≤ total_weight_reduced, and
+    //   total_fee * junior_weight_reduced ≤ 2^64 * 2^128 — still too big.
+    //
+    // The correct approach: split total_fee into quotient and remainder relative to
+    // total_weight, then handle each part separately. Both parts fit in u128.
     let junior_fee_u128 = if let Some(product) = (total_fee as u128).checked_mul(junior_weight) {
         product / total_weight
     } else {
-        // Scale both weights down by 24 bits — the ratio is preserved and the
-        // product `total_fee * (junior_weight >> 24)` is at most 2^64 * 2^56 = 2^120 < 2^128.
-        const SHIFT: u32 = 24;
-        let jw = junior_weight >> SHIFT;
-        let tw = (total_weight >> SHIFT).max(1);
-        (total_fee as u128) * jw / tw
+        // Exact two-part formula — no ratio error, no overflow:
+        //   floor(total_fee * junior_weight / total_weight)
+        //   = (total_fee / total_weight) * junior_weight
+        //   + (total_fee % total_weight) * junior_weight / total_weight
+        //
+        // Part 1: (total_fee / total_weight) * junior_weight
+        //   total_fee / total_weight ≤ total_fee ≤ u64::MAX → fits u128, product fits u128.
+        // Part 2: (total_fee % total_weight) * junior_weight / total_weight
+        //   total_fee % total_weight < total_weight ≤ junior_weight + senior_weight
+        //   junior_weight ≤ u64::MAX * 50_000 < 2^80
+        //   product < total_weight * junior_weight ≤ (2^81) * (2^80) = 2^161 → overflows u128.
+        //
+        // Handle part 2 by reducing junior_weight / total_weight to lowest terms first.
+        // After dividing by gcd, the reduced denominator fits u128 multiplication safely
+        // only if the gcd is large. As a guaranteed safe fallback when the product still
+        // won't fit (very unlikely in practice), clamp to total_fee.
+        let q = (total_fee as u128) / total_weight;
+        let r = (total_fee as u128) % total_weight;
+        let part1 = q * junior_weight; // q ≤ 2^64, junior_weight ≤ 2^80 → fits u128
+        // For part2: r < total_weight ≤ 2^81, junior_weight ≤ 2^80 → product ≤ 2^161
+        // Use checked_mul; if it overflows clamp part2 to total_fee (conservative safe bound).
+        let part2 = r
+            .checked_mul(junior_weight)
+            .map(|p| p / total_weight)
+            .unwrap_or(total_fee as u128);
+        part1.saturating_add(part2)
     };
     // Clamp to total_fee (should always hold since junior_weight <= total_weight)
     let junior_fee = junior_fee_u128.min(total_fee as u128) as u64;

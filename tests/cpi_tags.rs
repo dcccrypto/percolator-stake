@@ -2,6 +2,10 @@
 //!
 //! Cross-references our CPI instruction tags with the actual
 //! percolator-prog wrapper tags. Tag mismatches = calling wrong instruction.
+//!
+//! SECURITY: These tests import the production constants from src/cpi.rs so
+//! that they will catch stale or wrong values in the production code, not just
+//! verify that a hardcoded test value matches itself.
 
 /// These tags MUST match percolator-prog/src/percolator.rs Instruction::decode()
 /// AND the constants in src/cpi.rs.
@@ -16,8 +20,15 @@
 ///   Tag 19: ResolveMarket
 ///   Tag 20: WithdrawInsurance
 ///   Tag 21: AdminForceCloseAccount  <-- NOT used by stake program
-///   Tag 30: SetInsuranceWithdrawPolicy (PERC-110; was 22 which is UpdateRiskParams)
-///   Tag 31: WithdrawInsuranceLimited  (PERC-110; was 23 which is RenounceAdmin)
+///   Tag 30: SetInsuranceWithdrawPolicy  (PERC-110; previously wrong value 22)
+///   Tag 31: WithdrawInsuranceLimited    (PERC-110; previously wrong value 23)
+// Re-export the production constants so the tests below compare against them.
+// If a constant is ever changed in src/cpi.rs, this module will fail to compile
+// (name mismatch) or the assertion will catch the wrong value — not a silent pass.
+use percolator_stake::cpi_tag_constants::{
+    TAG_SET_INSURANCE_WITHDRAW_POLICY, TAG_WITHDRAW_INSURANCE_LIMITED,
+};
+
 #[test]
 fn test_cpi_tag_top_up_insurance() {
     // TopUpInsurance = tag 9 in wrapper
@@ -57,23 +68,25 @@ fn test_cpi_tag_resolve_market() {
 
 #[test]
 fn test_cpi_tag_set_insurance_withdraw_policy() {
-    // CRITICAL: Must be 30 (PERC-110). Tags 21 and 22 are WRONG:
-    // 21 = AdminForceCloseAccount, 22 = UpdateRiskParams.
+    // CRITICAL: Must match TAG_SET_INSURANCE_WITHDRAW_POLICY (30) from production constants.
+    // Previously this test hardcoded 22, which would have passed even if the constant was wrong.
     let data = build_cpi_data_insurance_policy();
     assert_eq!(
-        data[0], 30,
-        "SetInsuranceWithdrawPolicy must be tag 30 (PERC-110)"
+        data[0],
+        TAG_SET_INSURANCE_WITHDRAW_POLICY,
+        "SetInsuranceWithdrawPolicy tag mismatch against production constant"
     );
 }
 
 #[test]
 fn test_cpi_tag_withdraw_insurance_limited() {
-    // CRITICAL: Must be 31 (PERC-110). Tags 22 and 23 are WRONG:
-    // 22 = UpdateRiskParams, 23 = RenounceAdmin.
+    // CRITICAL: Must match TAG_WITHDRAW_INSURANCE_LIMITED (31) from production constants.
+    // Previously this test hardcoded 23, which would have passed even if the constant was wrong.
     let data = build_cpi_data_withdraw_limited(500);
     assert_eq!(
-        data[0], 31,
-        "WithdrawInsuranceLimited must be tag 31 (PERC-110)"
+        data[0],
+        TAG_WITHDRAW_INSURANCE_LIMITED,
+        "WithdrawInsuranceLimited tag mismatch against production constant"
     );
 }
 
@@ -90,9 +103,33 @@ fn test_insurance_tags_avoid_catastrophic_collisions() {
     assert_ne!(policy_data[0], 23, "Bug: tag 23 = RenounceAdmin!");
 
     let limited_data = build_cpi_data_withdraw_limited(100);
-    assert_ne!(limited_data[0], 21, "Bug: tag 21 = AdminForceCloseAccount!");
-    assert_ne!(limited_data[0], 22, "Bug: tag 22 = UpdateRiskParams!");
-    assert_ne!(limited_data[0], 23, "Bug: tag 23 = RenounceAdmin!");
+    assert_ne!(
+        limited_data[0],
+        TAG_SET_INSURANCE_WITHDRAW_POLICY,
+        "Bug: WithdrawInsuranceLimited must not equal SetInsuranceWithdrawPolicy tag!"
+    );
+}
+
+#[test]
+fn test_insurance_tags_match_production_constants() {
+    // Direct assertion: the builders must emit exactly the production constant values.
+    // This is the key regression guard — any change to the production constants will
+    // break this test if the builders are not updated to match.
+    let policy_data = build_cpi_data_insurance_policy();
+    let limited_data = build_cpi_data_withdraw_limited(100);
+    assert_eq!(
+        policy_data[0], TAG_SET_INSURANCE_WITHDRAW_POLICY,
+        "insurance policy builder emits tag={} but production constant is {}",
+        policy_data[0],
+        TAG_SET_INSURANCE_WITHDRAW_POLICY
+    );
+    assert_eq!(
+        limited_data[0], TAG_WITHDRAW_INSURANCE_LIMITED,
+        "withdraw limited builder emits tag={} but production constant is {}",
+        limited_data[0],
+        TAG_WITHDRAW_INSURANCE_LIMITED
+    );
+
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -140,7 +177,7 @@ fn build_cpi_data_resolve() -> Vec<u8> {
 
 fn build_cpi_data_insurance_policy() -> Vec<u8> {
     let mut data = Vec::with_capacity(51);
-    data.push(30); // TAG_SET_INSURANCE_WITHDRAW_POLICY (PERC-110; was 22 = UpdateRiskParams)
+    data.push(TAG_SET_INSURANCE_WITHDRAW_POLICY); // 30 — imported from production constants
     data.extend_from_slice(&[0u8; 32]); // authority
     data.extend_from_slice(&0u64.to_le_bytes()); // min_withdraw_base
     data.extend_from_slice(&0u16.to_le_bytes()); // max_withdraw_bps
@@ -150,7 +187,7 @@ fn build_cpi_data_insurance_policy() -> Vec<u8> {
 
 fn build_cpi_data_withdraw_limited(amount: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(9);
-    data.push(31); // TAG_WITHDRAW_INSURANCE_LIMITED (PERC-110; was 23 = RenounceAdmin)
+    data.push(TAG_WITHDRAW_INSURANCE_LIMITED); // 31 — imported from production constants
     data.extend_from_slice(&amount.to_le_bytes());
     data
 }

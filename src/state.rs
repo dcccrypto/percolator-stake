@@ -144,10 +144,16 @@ impl StakeDeposit {
         self._reserved[..8].copy_from_slice(&STAKE_DEPOSIT_DISCRIMINATOR);
     }
 
-    /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
+    /// Validate discriminator. Only accepts the correct discriminator bytes.
+    ///
+    /// FINDING-10: The zeroed-data branch was removed. Accepting all-zero discriminators
+    /// allows uninitialized or zeroed accounts to pass validation, enabling an attacker to
+    /// pass a freshly-allocated account as a valid deposit record. All real StakeDeposit
+    /// accounts must have been initialized via set_discriminator() and will have the correct
+    /// STAKE_DEPOSIT_DISCRIMINATOR bytes set.
     pub fn validate_discriminator(&self) -> bool {
         let disc = &self._reserved[..8];
-        disc == [0u8; 8] || disc == STAKE_DEPOSIT_DISCRIMINATOR
+        disc == STAKE_DEPOSIT_DISCRIMINATOR
     }
 }
 
@@ -317,10 +323,16 @@ impl StakePool {
         self._reserved[8]
     }
 
-    /// Validate discriminator. Accepts zeroed (pre-upgrade accounts) or correct value.
+    /// Validate discriminator. Only accepts the correct discriminator bytes.
+    ///
+    /// FINDING-10: The zeroed-data branch was removed. Accepting all-zero discriminators
+    /// allows uninitialized or zeroed accounts to pass validation, enabling an attacker to
+    /// pass a freshly-allocated account as a valid pool. All real StakePool accounts must
+    /// have been initialized via set_discriminator() and will have the correct
+    /// STAKE_POOL_DISCRIMINATOR bytes set.
     pub fn validate_discriminator(&self) -> bool {
         let disc = &self._reserved[..8];
-        disc == [0u8; 8] || disc == STAKE_POOL_DISCRIMINATOR
+        disc == STAKE_POOL_DISCRIMINATOR
     }
 
     // ════════════════════════════════════════════════════════════

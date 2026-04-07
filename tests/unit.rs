@@ -704,12 +704,27 @@ fn test_pool_discriminator_validation() {
     let mut pool_data = vec![0u8; STAKE_POOL_SIZE];
     let pool: &mut StakePool = from_bytes_mut(&mut pool_data);
 
-    // Zeroed (pre-upgrade / legacy) pool passes discriminator check for backward compat
-    assert!(pool.validate_discriminator());
+    // FINDING-10: Zeroed / uninitialized data must NOT pass discriminator check.
+    // Accepting zeroed discriminators would allow an attacker to pass a freshly-allocated
+    // account as a valid pool, bypassing all pool-state invariants.
+    assert!(
+        !pool.validate_discriminator(),
+        "Zeroed account must not pass discriminator validation"
+    );
 
-    // Explicitly initialized pool also passes discriminator check
+    // Only explicitly initialized pools pass the discriminator check
     pool.set_discriminator();
-    assert!(pool.validate_discriminator());
+    assert!(
+        pool.validate_discriminator(),
+        "Properly initialized pool must pass discriminator validation"
+    );
+
+    // Corrupted discriminator must also fail
+    pool._reserved[0] ^= 0xFF;
+    assert!(
+        !pool.validate_discriminator(),
+        "Corrupted discriminator must not pass validation"
+    );
 }
 
 #[test]

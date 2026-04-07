@@ -50,8 +50,8 @@ const TAG_WITHDRAW_INSURANCE: u8 = 20;
 // Tags 30 and 31 were added to percolator-launch in PERC-110.
 // Previous values of 22/23 were WRONG — they would have called UpdateRiskParams
 // and RenounceAdmin respectively, which is catastrophically incorrect.
-const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 30;
-const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
+pub const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 30;
+pub const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — permissionless, anyone can top up
@@ -351,7 +351,7 @@ pub fn cpi_set_insurance_withdraw_policy<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// WithdrawInsuranceLimited (Tag 22) — policy authority, requires RESOLVED
+// WithdrawInsuranceLimited (Tag 31) — policy authority, requires RESOLVED
 // ═══════════════════════════════════════════════════════════════
 // Accounts (7): [authority(signer), slab(w), authority_ata(w), vault(w),
 //                token_program, vault_pda, clock]
