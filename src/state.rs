@@ -419,8 +419,9 @@ impl StakePool {
 
     /// Calculate LP tokens for a deposit amount.
     /// Delegates to pure math module (Kani-verified).
+    /// Returns None if pool accounting is broken (total_pool_value() underflows).
     pub fn calc_lp_for_deposit(&self, amount: u64) -> Option<u64> {
-        let pv = self.total_pool_value().unwrap_or(0);
+        let pv = self.total_pool_value()?;
         crate::math::calc_lp_for_deposit(self.total_lp_supply, pv, amount)
     }
 
@@ -550,6 +551,38 @@ mod tests {
         pool.total_lp_supply = 1000;
         // deposit 500 → 500 * 1000 / 2000 = 250
         assert_eq!(pool.calc_lp_for_deposit(500), Some(250));
+    }
+
+    #[test]
+    fn test_calc_lp_broken_accounting_returns_none() {
+        // total_withdrawn > total_deposited: accounting underflow.
+        // calc_lp_for_deposit must propagate None, not silently treat pv as 0.
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 100;
+        pool.total_withdrawn = 200;
+        pool.total_lp_supply = 50;
+        assert_eq!(pool.calc_lp_for_deposit(100), None);
+    }
+
+    #[test]
+    fn test_calc_lp_first_depositor_still_works() {
+        // Fresh pool: total_pool_value() returns Some(0), not None.
+        // First deposit must still get 1:1 LP tokens.
+        let pool = StakePool::zeroed();
+        assert_eq!(pool.total_pool_value(), Some(0));
+        assert_eq!(pool.calc_lp_for_deposit(1000), Some(1000));
+    }
+
+    #[test]
+    fn test_calc_lp_fully_flushed_pool_blocks_deposit() {
+        // Pool fully flushed to insurance: pv=0 but lp_supply>0.
+        // New deposits must be blocked to protect existing LP claims.
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_flushed = 1000;
+        pool.total_lp_supply = 100;
+        assert_eq!(pool.total_pool_value(), Some(0));
+        assert_eq!(pool.calc_lp_for_deposit(100), None);
     }
 
     #[test]
