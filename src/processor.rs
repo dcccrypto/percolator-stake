@@ -1420,6 +1420,23 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     // by sending even 1 token directly to the vault before the first deposit.
     if current_balance > pool_value && pool.total_lp_supply > 0 {
         let fee_delta = current_balance - pool_value;
+
+        // Snapshot pre-fee tranche balances BEFORE incrementing total_fees_earned.
+        // senior_balance() derives from total_pool_value() which includes
+        // total_fees_earned.  Reading it after the increment inflates the senior
+        // weight in distribute_fees, systematically shortchanging the junior
+        // tranche (~6% per cycle on equal balances with a 2x multiplier).
+        let distribute_to_junior =
+            pool.tranche_enabled() && pool.junior_total_lp() > 0;
+        let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
+            (
+                pool.junior_balance(),
+                pool.senior_balance().ok_or(StakeError::Overflow)?,
+            )
+        } else {
+            (0, 0)
+        };
+
         pool.total_fees_earned = pool
             .total_fees_earned
             .checked_add(fee_delta)
@@ -1430,11 +1447,10 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         // Without this call, junior LPs receive ZERO benefit from junior_fee_mult_bps
         // — all fees accrue to the global pool and senior LPs capture the entire yield.
         // distribute_fees returns (junior_fee, senior_fee) that sum to <= fee_delta.
-        if pool.tranche_enabled() && pool.junior_total_lp() > 0 {
-            let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+        if distribute_to_junior {
             let (junior_fee, _) = crate::math::distribute_fees(
-                pool.junior_balance(),
-                senior_bal,
+                snapshot_junior_bal,
+                snapshot_senior_bal,
                 pool.junior_fee_mult_bps(),
                 fee_delta,
             );
