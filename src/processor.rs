@@ -1555,8 +1555,13 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         msg!("AccrueFees: vault account does not match pool.vault");
         return Err(ProgramError::InvalidAccountData);
     }
+    // NEW-5: Verify vault is owned by SPL Token program before unpacking.
+    if *vault_ai.owner != crate::spl_token::id() {
+        msg!("AccrueFees: vault account not owned by SPL Token program");
+        return Err(ProgramError::IllegalOwner);
+    }
 
-    // Read vault token account balance (key already verified above)
+    // Read vault token account balance (key and owner already verified above)
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
     let current_balance = vault_state.amount;
@@ -1772,8 +1777,8 @@ fn process_deposit_junior(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Validate pool account exists and is owned by stake program,
-    // matching the checks in process_deposit for defense-in-depth.
+    // NEW-1: Validate pool account ownership before bytemuck reinterpretation.
+    // Every other write path has this check — DepositJunior was the only gap.
     validate_account_not_empty(pool_pda)?;
     validate_account_owner(pool_pda, program_id)?;
     validate_account_writable(pool_pda)?;
