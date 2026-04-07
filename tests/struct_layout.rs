@@ -39,6 +39,11 @@ fn test_stake_pool_zeroed_is_not_initialized() {
     assert_eq!(pool.total_withdrawn, 0);
     assert_eq!(pool.total_flushed, 0);
     assert_eq!(pool.total_returned, 0);
+    // PERC-272 fields default to zero (insurance LP mode, no fees accrued)
+    assert_eq!(pool.total_fees_earned, 0);
+    assert_eq!(pool.last_fee_accrual_slot, 0);
+    assert_eq!(pool.last_vault_snapshot, 0);
+    assert_eq!(pool.pool_mode, 0);
 }
 
 #[test]
@@ -59,6 +64,11 @@ fn test_bytemuck_roundtrip_pool() {
     pool.total_lp_supply = 500_000;
     pool.cooldown_slots = 100;
     pool.deposit_cap = 10_000_000;
+    // PERC-272 fields
+    pool.total_fees_earned = 555_000;
+    pool.last_fee_accrual_slot = 9_999_999;
+    pool.last_vault_snapshot = 1_200_000;
+    pool.pool_mode = 1;
 
     // Serialize
     let bytes: &[u8] = bytemuck::bytes_of(&pool);
@@ -73,6 +83,12 @@ fn test_bytemuck_roundtrip_pool() {
     assert_eq!(recovered.total_lp_supply, 500_000);
     assert_eq!(recovered.cooldown_slots, 100);
     assert_eq!(recovered.deposit_cap, 10_000_000);
+    // PERC-272 fields — previously untested; any serialization regression would silently corrupt
+    // fee accounting and pool mode on-chain
+    assert_eq!(recovered.total_fees_earned, 555_000);
+    assert_eq!(recovered.last_fee_accrual_slot, 9_999_999);
+    assert_eq!(recovered.last_vault_snapshot, 1_200_000);
+    assert_eq!(recovered.pool_mode, 1);
 }
 
 #[test]
@@ -127,5 +143,11 @@ fn test_stake_pool_field_offsets() {
     assert_eq!(&pool.total_returned as *const _ as usize - base, 208);
     assert_eq!(&pool.total_withdrawn as *const _ as usize - base, 216);
     assert_eq!(&pool.percolator_program as *const _ as usize - base, 224);
+    // PERC-272 fields — offsets 256..288 were previously unverified
+    assert_eq!(&pool.total_fees_earned as *const _ as usize - base, 256);
+    assert_eq!(&pool.last_fee_accrual_slot as *const _ as usize - base, 264);
+    assert_eq!(&pool.last_vault_snapshot as *const _ as usize - base, 272);
+    assert_eq!(&pool.pool_mode as *const _ as usize - base, 280);
+    assert_eq!(&pool._mode_padding as *const _ as usize - base, 281);
     assert_eq!(&pool._reserved as *const _ as usize - base, 288);
 }
