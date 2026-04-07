@@ -1216,6 +1216,10 @@ fn process_admin_withdraw_insurance(
     let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let _ = pool_bump; // pool_pda not signing this CPI
 
+    // Validate token program BEFORE any CPI that passes it through.
+    // Without this, an attacker can substitute a malicious program for SPL Token.
+    verify_token_program(token_program)?;
+
     // Derive vault_auth PDA and its seeds
     // vault_auth = PDA([b"vault_auth", pool_pda])
     let (expected_vault_auth, vault_auth_bump) =
