@@ -4,6 +4,7 @@
 //! percolator-prog wrapper tags. Tag mismatches = calling wrong instruction.
 
 /// These tags MUST match percolator-prog/src/percolator.rs Instruction::decode()
+/// AND the constants in src/cpi.rs.
 ///
 /// Source: toly-percolator-prog/src/percolator.rs lines 1410-1452
 ///   Tag 9:  TopUpInsurance
@@ -15,8 +16,8 @@
 ///   Tag 19: ResolveMarket
 ///   Tag 20: WithdrawInsurance
 ///   Tag 21: AdminForceCloseAccount  <-- NOT used by stake program
-///   Tag 22: SetInsuranceWithdrawPolicy
-///   Tag 23: WithdrawInsuranceLimited
+///   Tag 30: SetInsuranceWithdrawPolicy (PERC-110; was 22 which is UpdateRiskParams)
+///   Tag 31: WithdrawInsuranceLimited  (PERC-110; was 23 which is RenounceAdmin)
 #[test]
 fn test_cpi_tag_top_up_insurance() {
     // TopUpInsurance = tag 9 in wrapper
@@ -56,39 +57,42 @@ fn test_cpi_tag_resolve_market() {
 
 #[test]
 fn test_cpi_tag_set_insurance_withdraw_policy() {
-    // CRITICAL: Must be 22, NOT 21 (21 = AdminForceCloseAccount)
+    // CRITICAL: Must be 30 (PERC-110). Tags 21 and 22 are WRONG:
+    // 21 = AdminForceCloseAccount, 22 = UpdateRiskParams.
     let data = build_cpi_data_insurance_policy();
     assert_eq!(
-        data[0], 22,
-        "SetInsuranceWithdrawPolicy must be tag 22, not 21"
+        data[0], 30,
+        "SetInsuranceWithdrawPolicy must be tag 30 (PERC-110)"
     );
 }
 
 #[test]
 fn test_cpi_tag_withdraw_insurance_limited() {
-    // CRITICAL: Must be 23, NOT 22 (22 = SetInsuranceWithdrawPolicy)
+    // CRITICAL: Must be 31 (PERC-110). Tags 22 and 23 are WRONG:
+    // 22 = UpdateRiskParams, 23 = RenounceAdmin.
     let data = build_cpi_data_withdraw_limited(500);
     assert_eq!(
-        data[0], 23,
-        "WithdrawInsuranceLimited must be tag 23, not 22"
+        data[0], 31,
+        "WithdrawInsuranceLimited must be tag 31 (PERC-110)"
     );
 }
 
 #[test]
-fn test_tag_21_is_force_close_not_insurance() {
-    // Tag 21 is AdminForceCloseAccount — we must NOT use it for insurance policy
-    // This test exists as a regression guard after the tag mismatch was caught
+fn test_insurance_tags_avoid_catastrophic_collisions() {
+    // Regression guard: ensure insurance tags never collide with dangerous
+    // wrapper instructions. Tags 21-23 are all wrong for these operations:
+    //   21 = AdminForceCloseAccount
+    //   22 = UpdateRiskParams
+    //   23 = RenounceAdmin
     let policy_data = build_cpi_data_insurance_policy();
-    assert_ne!(
-        policy_data[0], 21,
-        "Bug: tag 21 would call AdminForceCloseAccount!"
-    );
+    assert_ne!(policy_data[0], 21, "Bug: tag 21 = AdminForceCloseAccount!");
+    assert_ne!(policy_data[0], 22, "Bug: tag 22 = UpdateRiskParams!");
+    assert_ne!(policy_data[0], 23, "Bug: tag 23 = RenounceAdmin!");
 
     let limited_data = build_cpi_data_withdraw_limited(100);
-    assert_ne!(
-        limited_data[0], 22,
-        "Bug: tag 22 would call SetInsuranceWithdrawPolicy!"
-    );
+    assert_ne!(limited_data[0], 21, "Bug: tag 21 = AdminForceCloseAccount!");
+    assert_ne!(limited_data[0], 22, "Bug: tag 22 = UpdateRiskParams!");
+    assert_ne!(limited_data[0], 23, "Bug: tag 23 = RenounceAdmin!");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -136,7 +140,7 @@ fn build_cpi_data_resolve() -> Vec<u8> {
 
 fn build_cpi_data_insurance_policy() -> Vec<u8> {
     let mut data = Vec::with_capacity(51);
-    data.push(22); // TAG_SET_INSURANCE_WITHDRAW_POLICY (was incorrectly 21)
+    data.push(30); // TAG_SET_INSURANCE_WITHDRAW_POLICY (PERC-110; was 22 = UpdateRiskParams)
     data.extend_from_slice(&[0u8; 32]); // authority
     data.extend_from_slice(&0u64.to_le_bytes()); // min_withdraw_base
     data.extend_from_slice(&0u16.to_le_bytes()); // max_withdraw_bps
@@ -146,7 +150,7 @@ fn build_cpi_data_insurance_policy() -> Vec<u8> {
 
 fn build_cpi_data_withdraw_limited(amount: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(9);
-    data.push(23); // TAG_WITHDRAW_INSURANCE_LIMITED (was incorrectly 22)
+    data.push(31); // TAG_WITHDRAW_INSURANCE_LIMITED (PERC-110; was 23 = RenounceAdmin)
     data.extend_from_slice(&amount.to_le_bytes());
     data
 }
