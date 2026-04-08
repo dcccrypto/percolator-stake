@@ -68,8 +68,8 @@ fn test_cpi_tag_resolve_market() {
 
 #[test]
 fn test_cpi_tag_set_insurance_withdraw_policy() {
-    // CRITICAL: Must match TAG_SET_INSURANCE_WITHDRAW_POLICY (30) from production constants.
-    // Previously this test hardcoded 22, which would have passed even if the constant was wrong.
+    // CRITICAL: Must match TAG_SET_INSURANCE_WITHDRAW_POLICY (22) from percolator-prog decode table.
+    // Tag 22 = SetInsuranceWithdrawPolicy in percolator.rs. Was incorrectly set to 30 (ForceCloseResolved).
     let data = build_cpi_data_insurance_policy();
     assert_eq!(
         data[0],
@@ -80,8 +80,8 @@ fn test_cpi_tag_set_insurance_withdraw_policy() {
 
 #[test]
 fn test_cpi_tag_withdraw_insurance_limited() {
-    // CRITICAL: Must match TAG_WITHDRAW_INSURANCE_LIMITED (31) from production constants.
-    // Previously this test hardcoded 23, which would have passed even if the constant was wrong.
+    // CRITICAL: Must match TAG_WITHDRAW_INSURANCE_LIMITED (23) from percolator-prog decode table.
+    // Tag 23 = WithdrawInsuranceLimited in percolator.rs. Was incorrectly set to 31 (unrecognized).
     let data = build_cpi_data_withdraw_limited(500);
     assert_eq!(
         data[0],
@@ -93,16 +93,18 @@ fn test_cpi_tag_withdraw_insurance_limited() {
 #[test]
 fn test_insurance_tags_avoid_catastrophic_collisions() {
     // Regression guard: ensure insurance tags never collide with dangerous
-    // wrapper instructions. Tags 21-23 are all wrong for these operations:
+    // wrapper instructions. Real tag table from percolator-prog:
     //   21 = AdminForceCloseAccount
-    //   22 = UpdateRiskParams
-    //   23 = RenounceAdmin
+    //   22 = SetInsuranceWithdrawPolicy (CORRECT target)
+    //   23 = WithdrawInsuranceLimited   (CORRECT target)
+    //   30 = ForceCloseResolved         (DANGEROUS — old incorrect value)
     let policy_data = build_cpi_data_insurance_policy();
     assert_ne!(policy_data[0], 21, "Bug: tag 21 = AdminForceCloseAccount!");
-    assert_ne!(policy_data[0], 22, "Bug: tag 22 = UpdateRiskParams!");
-    assert_ne!(policy_data[0], 23, "Bug: tag 23 = RenounceAdmin!");
+    assert_ne!(policy_data[0], 30, "Bug: tag 30 = ForceCloseResolved — old wrong value!");
+    assert_eq!(policy_data[0], 22, "SetInsuranceWithdrawPolicy must be tag 22");
 
     let limited_data = build_cpi_data_withdraw_limited(100);
+    assert_eq!(limited_data[0], 23, "WithdrawInsuranceLimited must be tag 23");
     assert_ne!(
         limited_data[0],
         TAG_SET_INSURANCE_WITHDRAW_POLICY,
@@ -177,7 +179,7 @@ fn build_cpi_data_resolve() -> Vec<u8> {
 
 fn build_cpi_data_insurance_policy() -> Vec<u8> {
     let mut data = Vec::with_capacity(51);
-    data.push(TAG_SET_INSURANCE_WITHDRAW_POLICY); // 30 — imported from production constants
+    data.push(TAG_SET_INSURANCE_WITHDRAW_POLICY); // 22 — matches percolator-prog decode table
     data.extend_from_slice(&[0u8; 32]); // authority
     data.extend_from_slice(&0u64.to_le_bytes()); // min_withdraw_base
     data.extend_from_slice(&0u16.to_le_bytes()); // max_withdraw_bps
@@ -187,7 +189,7 @@ fn build_cpi_data_insurance_policy() -> Vec<u8> {
 
 fn build_cpi_data_withdraw_limited(amount: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(9);
-    data.push(TAG_WITHDRAW_INSURANCE_LIMITED); // 31 — imported from production constants
+    data.push(TAG_WITHDRAW_INSURANCE_LIMITED); // 23 — matches percolator-prog decode table
     data.extend_from_slice(&amount.to_le_bytes());
     data
 }

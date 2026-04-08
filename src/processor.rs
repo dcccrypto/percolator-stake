@@ -203,10 +203,11 @@ fn validate_admin_cpi(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // AUDIT HIGH-3: validate discriminator in shared admin CPI guard
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     // FINDING-5: Validate pool version in all admin CPI paths.
-    // This covers process_admin_set_oracle_authority, process_admin_set_risk_threshold,
-    // process_admin_set_maintenance_fee, process_admin_resolve_market,
-    // process_admin_set_insurance_policy, and process_admin_withdraw_insurance.
     validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
@@ -993,6 +994,10 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // AUDIT HIGH-2: validate discriminator before trusting pool data
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     // FINDING-5: Validate pool version on FlushToInsurance.
     validate_pool_version(pool)?;
 
@@ -1128,6 +1133,10 @@ fn process_update_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // AUDIT MED-4: validate discriminator on UpdateConfig
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     // FINDING-5: Validate pool version on UpdateConfig.
     validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
@@ -1164,16 +1173,21 @@ fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    // AUDIT HIGH-1: validate ownership + discriminator before trusting pool data
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
     // M7: Verify caller is pool admin (defense-in-depth).
-    // The wrapper CPI will also check, but we should reject early if the
-    // caller isn't even our admin — prevents non-admin from triggering
-    // admin transfer on wrapper if they happen to be the wrapper admin.
     if pool.admin != current_admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -1185,6 +1199,10 @@ fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
     }
     if pool.percolator_program != percolator_program.key.to_bytes() {
         return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+    // AUDIT MED-1: verify percolator_program is executable
+    if !percolator_program.executable {
+        return Err(StakeError::InvalidAccount.into());
     }
 
     // Verify the pool PDA is correctly derived
@@ -1679,6 +1697,10 @@ fn process_admin_set_hwm_config(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    // AUDIT MED-5: validate discriminator on AdminSetHwmConfig
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     // FINDING-5: Validate pool version on AdminSetHwmConfig.
     validate_pool_version(pool)?;
     if pool.admin != admin.key.to_bytes() {
@@ -1723,6 +1745,10 @@ fn process_admin_set_tranche_config(
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
+    }
+    // AUDIT MED-5: validate discriminator on AdminSetTrancheConfig
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
     }
     // FINDING-5: Validate pool version on AdminSetTrancheConfig.
     validate_pool_version(pool)?;
@@ -1827,12 +1853,18 @@ fn process_deposit_junior(
 
     verify_token_program(token_program)?;
 
-    // Verify user_ata is owned by user, not merely delegated.
-    // Same delegation attack applies as in process_deposit — an approved delegate
-    // could drain a victim's tokens into the pool while claiming LP tokens.
+    // Verify user_ata mint matches pool collateral and is owned by user.
+    // AUDIT MED-3: DepositJunior was missing mint check (present in process_deposit).
     {
         let ata_data = user_ata.try_borrow_data()?;
         if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let mint_bytes: &[u8; 32] = ata_data[0..32]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if mint_bytes != &pool.collateral_mint {
+            msg!("Error: user_ata mint does not match pool collateral_mint");
             return Err(StakeError::InvalidAccount.into());
         }
         let owner_bytes: &[u8; 32] = ata_data[32..64]
@@ -1999,10 +2031,15 @@ fn process_init_trading_pool(
     process_init_pool(program_id, accounts, cooldown_slots, deposit_cap)?;
 
     // Now update pool_mode to 1 (trading LP)
-    let pool_ai = &accounts[2]; // Pool PDA is account [2] in InitPool
+    // AUDIT HIGH-4: Validate pool_pda ownership instead of trusting hardcoded index
+    let pool_ai = &accounts[2]; // Pool PDA is account [2] in InitPool (admin=0, slab=1, pool_pda=2)
+    validate_account_owner(pool_ai, program_id)?;
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
     pool.pool_mode = 1;
 
     msg!("InitTradingPool: pool_mode set to 1 (trading LP vault)");

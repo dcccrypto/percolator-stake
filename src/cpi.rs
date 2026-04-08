@@ -47,11 +47,11 @@ const TAG_WITHDRAW_INSURANCE: u8 = 20;
 // Tag 28 = UnpauseMarket (not used by stake program)
 // Tag 29 = AcceptAdmin (two-step admin transfer, added in PERC-112)
 //
-// Tags 30 and 31 were added to percolator-launch in PERC-110.
-// Previous values of 22/23 were WRONG — they would have called UpdateRiskParams
-// and RenounceAdmin respectively, which is catastrophically incorrect.
-pub const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 30;
-pub const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
+// Tags 22 and 23 in percolator-prog's instruction decode table.
+// Previous cpi.rs had these as 30/31 which is WRONG — tag 30 is
+// ForceCloseResolved and tag 31 is unrecognized. Fixed per audit CRIT-1.
+pub const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 22;
+pub const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
 
 // ═══════════════════════════════════════════════════════════════
 // TopUpInsurance (Tag 9) — permissionless, anyone can top up
@@ -429,11 +429,11 @@ mod tag_tests {
         assert_eq!(TAG_RESOLVE_MARKET, 19, "TAG_RESOLVE_MARKET mismatch");
         assert_eq!(TAG_WITHDRAW_INSURANCE, 20, "TAG_WITHDRAW_INSURANCE mismatch");
         assert_eq!(
-            TAG_SET_INSURANCE_WITHDRAW_POLICY, 30,
+            TAG_SET_INSURANCE_WITHDRAW_POLICY, 22,
             "TAG_SET_INSURANCE_WITHDRAW_POLICY mismatch — added in PERC-110"
         );
         assert_eq!(
-            TAG_WITHDRAW_INSURANCE_LIMITED, 31,
+            TAG_WITHDRAW_INSURANCE_LIMITED, 23,
             "TAG_WITHDRAW_INSURANCE_LIMITED mismatch — added in PERC-110"
         );
     }
