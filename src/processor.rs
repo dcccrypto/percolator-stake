@@ -905,17 +905,24 @@ fn process_withdraw(
             // (supply=0 but value>0) and locks tokens permanently in the vault.
             pool.set_junior_balance(0);
         } else {
-            // Proportional decrease of the RAW junior_balance based on LP share,
-            // not the loss-adjusted withdrawal_amount.  This keeps the raw balance
-            // in sync with the remaining LP holders' proportional claim.
-            let jb = pool.junior_balance();
-            let raw_decrease = (lp_amount as u128)
-                .checked_mul(jb as u128)
-                .and_then(|v| v.checked_div(junior_lp_before as u128))
-                .map(|v| v as u64)
-                .ok_or(StakeError::Overflow)?;
+            // Decrease junior_balance by withdrawal_amount (the loss-adjusted
+            // collateral actually leaving the vault), NOT by a proportional share
+            // of the raw balance.
+            //
+            // During active insurance loss, withdrawal_amount < proportional raw
+            // share because it is based on effective_junior_balance (post-loss).
+            // Using the larger proportional raw decrease causes gross_senior
+            // (= gross_pool - junior_balance) to inflate after each junior
+            // withdrawal, making distribute_loss over-penalize remaining juniors.
+            // The last junior withdrawer can receive zero even though they hold
+            // a fair share of the effective pool.
+            //
+            // By subtracting withdrawal_amount from both total_withdrawn (above)
+            // and junior_balance here, gross_senior stays constant across partial
+            // junior withdrawals, preserving per-LP effective value.
             pool.set_junior_balance(
-                jb.checked_sub(raw_decrease)
+                pool.junior_balance()
+                    .checked_sub(withdrawal_amount)
                     .ok_or(StakeError::Overflow)?,
             );
         }
