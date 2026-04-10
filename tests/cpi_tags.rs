@@ -20,8 +20,8 @@
 ///   Tag 19: ResolveMarket
 ///   Tag 20: WithdrawInsurance
 ///   Tag 21: AdminForceCloseAccount  <-- NOT used by stake program
-///   Tag 30: SetInsuranceWithdrawPolicy  (PERC-110; previously wrong value 22)
-///   Tag 31: WithdrawInsuranceLimited    (PERC-110; previously wrong value 23)
+///   Tag 22: SetInsuranceWithdrawPolicy  (PERC-110; previously wrong value 30)
+///   Tag 23: WithdrawInsuranceLimited    (PERC-110; previously wrong value 31)
 // Re-export the production constants so the tests below compare against them.
 // If a constant is ever changed in src/cpi.rs, this module will fail to compile
 // (name mismatch) or the assertion will catch the wrong value — not a silent pass.

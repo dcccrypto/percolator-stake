@@ -1422,8 +1422,8 @@ fn process_admin_withdraw_insurance(
 
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
-    // CPI: WithdrawInsuranceLimited (wrapper Tag 31)
-    // - vault_auth is the policy authority (set via AdminSetInsurancePolicy / wrapper Tag 30 beforehand)
+    // CPI: WithdrawInsuranceLimited (wrapper Tag 23)
+    // - vault_auth is the policy authority (set via AdminSetInsurancePolicy / wrapper Tag 22 beforehand)
     // - stake_vault is owned by vault_auth → passes verify_token_account check
     // - Requires market to be RESOLVED + all positions closed
     // - Requires SetInsuranceWithdrawPolicy called first with vault_auth as authority
