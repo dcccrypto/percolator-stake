@@ -1981,6 +1981,16 @@ fn process_deposit_junior(
     );
 
     let clock = Clock::from_account_info(clock_sysvar)?;
+
+    // PERC-313: Refresh high-water mark after junior deposit (TVL increased).
+    // Matches the pattern in process_deposit (lines 564-569). Without this,
+    // junior deposits raise TVL without ratcheting the epoch HWM, leaving the
+    // withdrawal floor calculated against a stale (lower) peak.
+    if pool.hwm_enabled() {
+        let current_tvl = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+        pool.refresh_hwm(clock.epoch, current_tvl);
+    }
+
     let (expected_deposit_pda, deposit_bump) =
         state::derive_deposit_pda(program_id, pool_pda.key, user.key);
     if *deposit_pda.key != expected_deposit_pda {
