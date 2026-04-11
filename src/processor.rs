@@ -726,6 +726,33 @@ fn process_withdraw(
         }
     }
 
+    // Validate user_ata (collateral destination) is not the vault itself and
+    // holds the correct mint.  Without the vault check, an attacker can pass
+    // vault.key as user_ata — the SPL Transfer becomes a no-op self-transfer,
+    // but LP is still burned and total_withdrawn still increments, desyncing
+    // pool accounting from the actual vault balance.
+    // NOTE: owner check is deliberately omitted — on withdrawal the user burns
+    // their own LP and should be free to direct collateral to any address
+    // (cold wallet, multisig, etc.).  This differs from process_deposit where
+    // the owner check prevents draining a delegated victim's ATA.
+    if user_ata.key == vault.key {
+        msg!("Error: user_ata cannot be the pool vault — self-transfer blocked");
+        return Err(StakeError::InvalidAccount.into());
+    }
+    {
+        let ata_data = user_ata.try_borrow_data()?;
+        if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let mint_bytes: &[u8; 32] = ata_data[0..32]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+        if mint_bytes != &pool.collateral_mint {
+            msg!("Error: user_ata mint does not match pool collateral_mint");
+            return Err(StakeError::InvalidMint.into());
+        }
+    }
+
     // I5: Validate vault_auth PDA derivation
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
