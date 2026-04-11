@@ -21,8 +21,8 @@ use solana_program::{
 // VERSION BINDING:
 //   Corresponds to percolator-prog instruction layout as of PERC-110 / PERC-112.
 //   Last verified against percolator-prog commit that introduced:
-//     - Tag 30: SetInsuranceWithdrawPolicy (PERC-110)
-//     - Tag 31: WithdrawInsuranceLimited (PERC-110)
+//     - Tag 22: SetInsuranceWithdrawPolicy (PERC-110)
+//     - Tag 23: WithdrawInsuranceLimited (PERC-110)
 //     - Tag 29: AcceptAdmin two-step transfer (PERC-112)
 //
 // If the wrapper ever renumbers instructions, update these constants AND increment
@@ -316,7 +316,7 @@ pub fn cpi_withdraw_insurance<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SetInsuranceWithdrawPolicy (Tag 21) — admin only, requires RESOLVED
+// SetInsuranceWithdrawPolicy (Tag 22) — admin only, requires RESOLVED
 // ═══════════════════════════════════════════════════════════════
 // Accounts: [admin(signer), slab(w)]
 // Data: tag(1) + authority(32) + min_withdraw_base(8) + max_withdraw_bps(2) + cooldown_slots(8)
@@ -351,7 +351,7 @@ pub fn cpi_set_insurance_withdraw_policy<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// WithdrawInsuranceLimited (Tag 31) — policy authority, requires RESOLVED
+// WithdrawInsuranceLimited (Tag 23) — policy authority, requires RESOLVED
 // ═══════════════════════════════════════════════════════════════
 // Accounts (7): [authority(signer), slab(w), authority_ata(w), vault(w),
 //                token_program, vault_pda, clock]
