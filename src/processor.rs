@@ -134,33 +134,9 @@ pub fn process(
             new_cooldown_slots,
             new_deposit_cap,
         } => process_update_config(program_id, accounts, new_cooldown_slots, new_deposit_cap),
-        StakeInstruction::TransferAdmin => process_transfer_admin(program_id, accounts),
-        StakeInstruction::AdminSetOracleAuthority { new_authority } => {
-            process_admin_set_oracle_authority(program_id, accounts, &new_authority)
+        StakeInstruction::ReturnInsurance { amount } => {
+            process_return_insurance(program_id, accounts, amount)
         }
-        StakeInstruction::AdminSetRiskThreshold { new_threshold } => {
-            process_admin_set_risk_threshold(program_id, accounts, new_threshold)
-        }
-        StakeInstruction::AdminSetMaintenanceFee { new_fee } => {
-            process_admin_set_maintenance_fee(program_id, accounts, new_fee)
-        }
-        StakeInstruction::AdminResolveMarket => process_admin_resolve_market(program_id, accounts),
-        StakeInstruction::AdminWithdrawInsurance { amount } => {
-            process_admin_withdraw_insurance(program_id, accounts, amount)
-        }
-        StakeInstruction::AdminSetInsurancePolicy {
-            authority,
-            min_withdraw_base,
-            max_withdraw_bps,
-            cooldown_slots,
-        } => process_admin_set_insurance_policy(
-            program_id,
-            accounts,
-            &authority,
-            min_withdraw_base,
-            max_withdraw_bps,
-            cooldown_slots,
-        ),
         StakeInstruction::AccrueFees => process_accrue_fees(program_id, accounts),
         StakeInstruction::InitTradingPool {
             cooldown_slots,
@@ -176,70 +152,10 @@ pub fn process(
         StakeInstruction::DepositJunior { amount } => {
             process_deposit_junior(program_id, accounts, amount)
         }
+        StakeInstruction::SetMarketResolved => {
+            process_set_market_resolved(program_id, accounts)
+        }
     }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Helper: read pool, validate, return admin seeds
-// ═══════════════════════════════════════════════════════════════
-
-/// Validate pool is initialized, admin is signer, admin is transferred,
-/// and percolator program matches stored value.
-/// Returns the pool bump for PDA signing.
-fn validate_admin_cpi(
-    program_id: &Pubkey,
-    pool_pda: &AccountInfo,
-    admin: &AccountInfo,
-    slab: &AccountInfo,
-    percolator_program: &AccountInfo,
-) -> Result<u8, ProgramError> {
-    if !admin.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    let pool_data = pool_pda.try_borrow_data()?;
-    let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
-
-    if pool.is_initialized != 1 {
-        return Err(StakeError::NotInitialized.into());
-    }
-    // AUDIT HIGH-3: validate discriminator in shared admin CPI guard
-    if !pool.validate_discriminator() {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    // FINDING-5: Validate pool version in all admin CPI paths.
-    validate_pool_version(pool)?;
-    if pool.admin != admin.key.to_bytes() {
-        return Err(StakeError::Unauthorized.into());
-    }
-    if pool.admin_transferred != 1 {
-        return Err(StakeError::AdminNotTransferred.into());
-    }
-    if pool.slab != slab.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-    if pool.percolator_program != percolator_program.key.to_bytes() {
-        return Err(StakeError::InvalidPercolatorProgram.into());
-    }
-
-    // FINDING-8: Verify slab is owned by the percolator program before CPI.
-    // Without this, an attacker can pass a crafted account as slab, bypassing the
-    // ownership invariant and potentially calling the wrong program's handler.
-    // Also verify percolator_program is executable to prevent a data account being
-    // passed as the CPI target.
-    validate_account_owner(slab, percolator_program.key)?;
-    if !percolator_program.executable {
-        msg!("Error: percolator_program account is not executable");
-        return Err(StakeError::InvalidAccount.into());
-    }
-
-    // Verify pool PDA derivation
-    let (expected_pool, bump) = state::derive_pool_pda(program_id, slab.key);
-    if *pool_pda.key != expected_pool {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    Ok(bump)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -362,7 +278,7 @@ fn process_init_pool(
     pool.is_initialized = 1;
     pool.bump = pool_bump;
     pool.vault_authority_bump = vault_auth_bump;
-    pool.admin_transferred = 0; // Not yet — must call TransferAdmin
+    pool.admin_transferred = 0; // deprecated field, always 0
     pool.slab = slab.key.to_bytes();
     pool.admin = admin.key.to_bytes();
     // FINDING-6 (SECURITY NOTE): collateral_mint is admin-provided and NOT verified
@@ -438,14 +354,6 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     }
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
-    }
-
-    // H1: Require admin transfer before accepting deposits.
-    // Without this, users can deposit into a pool where the stake program
-    // doesn't yet have admin control over the wrapper — their funds would
-    // be unprotected by the stake program's safety mechanisms.
-    if pool.admin_transferred != 1 {
-        return Err(StakeError::AdminNotTransferred.into());
     }
 
     // I7: Block deposits after market resolution
@@ -1191,354 +1099,6 @@ fn process_update_config(
     Ok(())
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 5: TransferAdmin — one-time setup, transfers wrapper admin to pool PDA
-// ═══════════════════════════════════════════════════════════════
-
-fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let current_admin = next_account_info(accounts_iter)?; // Human (current wrapper admin)
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-
-    if !current_admin.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // AUDIT HIGH-1: validate ownership + discriminator before trusting pool data
-    validate_account_owner(pool_pda, program_id)?;
-    validate_account_not_empty(pool_pda)?;
-
-    let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-
-    if pool.is_initialized != 1 {
-        return Err(StakeError::NotInitialized.into());
-    }
-    if !pool.validate_discriminator() {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    validate_pool_version(pool)?;
-    // M7: Verify caller is pool admin (defense-in-depth).
-    if pool.admin != current_admin.key.to_bytes() {
-        return Err(StakeError::Unauthorized.into());
-    }
-    if pool.admin_transferred == 1 {
-        return Err(StakeError::AdminAlreadyTransferred.into());
-    }
-    if pool.slab != slab.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-    if pool.percolator_program != percolator_program.key.to_bytes() {
-        return Err(StakeError::InvalidPercolatorProgram.into());
-    }
-    // AUDIT MED-1: verify percolator_program is executable
-    if !percolator_program.executable {
-        return Err(StakeError::InvalidAccount.into());
-    }
-
-    // Verify the pool PDA is correctly derived
-    let (expected_pool, _) = state::derive_pool_pda(program_id, slab.key);
-    if *pool_pda.key != expected_pool {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    // CPI UpdateAdmin: current_admin signs, sets new admin = pool PDA
-    // The current_admin must be the signer of the outer transaction
-    // and must currently be the wrapper slab's admin.
-    cpi::cpi_update_admin(
-        percolator_program,
-        current_admin,
-        slab,
-        pool_pda.key, // new admin = pool PDA
-    )?;
-
-    pool.admin_transferred = 1;
-
-    msg!(
-        "Wrapper admin transferred to pool PDA {} for slab {}",
-        pool_pda.key,
-        slab.key,
-    );
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 6: AdminSetOracleAuthority
-// ═══════════════════════════════════════════════════════════════
-
-fn process_admin_set_oracle_authority(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    new_authority: &Pubkey,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let admin = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
-
-    cpi::cpi_set_oracle_authority(
-        percolator_program,
-        pool_pda,
-        slab,
-        new_authority,
-        admin_seeds,
-    )?;
-
-    msg!("SetOracleAuthority forwarded via CPI");
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 7: AdminSetRiskThreshold
-// ═══════════════════════════════════════════════════════════════
-
-fn process_admin_set_risk_threshold(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    new_threshold: u128,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let admin = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
-
-    cpi::cpi_set_risk_threshold(
-        percolator_program,
-        pool_pda,
-        slab,
-        new_threshold,
-        admin_seeds,
-    )?;
-
-    msg!("SetRiskThreshold forwarded via CPI");
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 8: AdminSetMaintenanceFee
-// ═══════════════════════════════════════════════════════════════
-
-fn process_admin_set_maintenance_fee(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    new_fee: u128,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let admin = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
-
-    cpi::cpi_set_maintenance_fee(percolator_program, pool_pda, slab, new_fee, admin_seeds)?;
-
-    msg!("SetMaintenanceFee forwarded via CPI");
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 9: AdminResolveMarket
-// ═══════════════════════════════════════════════════════════════
-
-fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let admin = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
-
-    // I7: Set resolved flag BEFORE the CPI so that any reentrant call into
-    // process_deposit (via a malicious percolator that CPIs back to this program
-    // during ResolveMarket) sees market_resolved == true and is rejected.
-    // If the CPI fails, the whole transaction reverts including this write.
-    {
-        let mut pool_data = pool_pda.try_borrow_mut_data()?;
-        let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-        pool.set_market_resolved(true);
-    }
-
-    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, admin_seeds)?;
-
-    msg!("ResolveMarket forwarded via CPI");
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 10: AdminWithdrawInsurance — after resolution, get insurance back to vault
-// ═══════════════════════════════════════════════════════════════
-
-fn process_admin_withdraw_insurance(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    amount: u64,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let admin = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let vault_auth = next_account_info(accounts_iter)?; // vault_auth PDA (signer for CPI)
-    let stake_vault = next_account_info(accounts_iter)?; // receives insurance (owned by vault_auth ✓)
-    let wrapper_vault = next_account_info(accounts_iter)?; // wrapper insurance vault
-    let wrapper_vault_pda = next_account_info(accounts_iter)?; // wrapper's vault authority PDA
-    let percolator_program = next_account_info(accounts_iter)?;
-    let token_program = next_account_info(accounts_iter)?;
-    let clock = next_account_info(accounts_iter)?;
-
-    // Validate admin authority
-    let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let _ = pool_bump; // pool_pda not signing this CPI
-
-    // Validate token program BEFORE any CPI that passes it through.
-    // Without this, an attacker can substitute a malicious program for SPL Token.
-    verify_token_program(token_program)?;
-
-    // Derive vault_auth PDA and its seeds
-    // vault_auth = PDA([b"vault_auth", pool_pda])
-    let (expected_vault_auth, vault_auth_bump) =
-        Pubkey::find_program_address(&[b"vault_auth", pool_pda.key.as_ref()], program_id);
-    if vault_auth.key != &expected_vault_auth {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    // Validate stake_vault matches the pool's stored vault address.
-    // Without this, an attacker could pass a different token account as stake_vault,
-    // diverting returned insurance tokens away from the pool's vault.
-    //
-    // BUG-12: Also pre-check that amount does not exceed the outstanding insurance balance
-    // (total_flushed - total_returned).  Without this, we trust the wrapper to enforce
-    // the limit, but our own accounting could overflow or be manipulated if total_returned
-    // is incremented beyond total_flushed (creating phantom insurance returns).
-    {
-        let pool_data = pool_pda.try_borrow_data()?;
-        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
-        if pool.vault != stake_vault.key.to_bytes() {
-            msg!(
-                "Error: stake_vault {} does not match pool vault {}",
-                stake_vault.key,
-                pool.vault_pubkey()
-            );
-            return Err(StakeError::InvalidAccount.into());
-        }
-        let outstanding = pool
-            .total_flushed
-            .checked_sub(pool.total_returned)
-            .ok_or(StakeError::Overflow)?;
-        if amount > outstanding {
-            msg!(
-                "Error: withdraw amount {} exceeds outstanding insurance balance {}",
-                amount,
-                outstanding
-            );
-            return Err(ProgramError::InsufficientFunds);
-        }
-    }
-
-    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
-
-    // CPI: WithdrawInsuranceLimited (wrapper Tag 23)
-    // - vault_auth is the policy authority (set via AdminSetInsurancePolicy / wrapper Tag 22 beforehand)
-    // - stake_vault is owned by vault_auth → passes verify_token_account check
-    // - Requires market to be RESOLVED + all positions closed
-    // - Requires SetInsuranceWithdrawPolicy called first with vault_auth as authority
-    cpi::cpi_withdraw_insurance_limited(
-        percolator_program,
-        vault_auth,
-        slab,
-        stake_vault,
-        wrapper_vault,
-        token_program,
-        wrapper_vault_pda,
-        clock,
-        amount,
-        vault_auth_seeds,
-    )?;
-
-    // Update pool accounting — returned insurance increases pool value for LP holders
-    {
-        let mut pool_data = pool_pda.try_borrow_mut_data()?;
-        let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-        pool.total_returned = pool
-            .total_returned
-            .checked_add(amount)
-            .ok_or(StakeError::Overflow)?;
-    }
-
-    msg!(
-        "Insurance {} tokens withdrawn from wrapper to stake_vault via vault_auth CPI",
-        amount
-    );
-    Ok(())
-}
-
-// ═══════════════════════════════════════════════════════════════
-// 11: AdminSetInsurancePolicy
-// ═══════════════════════════════════════════════════════════════
-
-fn process_admin_set_insurance_policy(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    authority: &Pubkey,
-    min_withdraw_base: u64,
-    max_withdraw_bps: u16,
-    cooldown_slots: u64,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let admin = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-
-    // Validate max_withdraw_bps before CPI — basis points must be <= 10000 (100%).
-    // hwm_floor_bps and junior_fee_mult_bps are validated locally; this parameter
-    // was the only bps field forwarded to the wrapper without a range check.
-    if max_withdraw_bps > 10_000 {
-        msg!(
-            "max_withdraw_bps must be <= 10000, got {}",
-            max_withdraw_bps
-        );
-        return Err(ProgramError::InvalidArgument);
-    }
-
-    let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
-
-    cpi::cpi_set_insurance_withdraw_policy(
-        percolator_program,
-        pool_pda,
-        slab,
-        authority,
-        min_withdraw_base,
-        max_withdraw_bps,
-        cooldown_slots,
-        admin_seeds,
-    )?;
-
-    msg!("SetInsuranceWithdrawPolicy forwarded via CPI");
-    Ok(())
-}
-
 // ============================================================================
 // PERC-272: LP Vault — Fee Accrual & Trading Pool Init
 // ============================================================================
@@ -1863,9 +1423,6 @@ fn process_deposit_junior(
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
-    if pool.admin_transferred != 1 {
-        return Err(StakeError::AdminNotTransferred.into());
-    }
     if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
@@ -2087,5 +1644,143 @@ fn process_init_trading_pool(
     pool.pool_mode = 1;
 
     msg!("InitTradingPool: pool_mode set to 1 (trading LP vault)");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 10: ReturnInsurance — admin returns insurance funds to pool vault
+// ═══════════════════════════════════════════════════════════════
+
+fn process_return_insurance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+) -> ProgramResult {
+    if amount == 0 {
+        return Err(StakeError::ZeroAmount.into());
+    }
+
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let admin_ata = next_account_info(accounts_iter)?;  // source
+    let vault = next_account_info(accounts_iter)?;       // destination
+    let token_program = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    verify_token_program(token_program)?;
+    validate_account_owner(pool_pda, program_id)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+    if pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    // Validate amount doesn't exceed outstanding insurance
+    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    if (amount as u64) > outstanding {
+        msg!(
+            "ReturnInsurance: amount {} exceeds outstanding insurance {}",
+            amount,
+            outstanding
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Validate admin_ata mint matches pool collateral
+    let ata_data = admin_ata.try_borrow_data()?;
+    if ata_data.len() < 72 {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    // Check ATA is owned by SPL Token
+    if *admin_ata.owner != crate::spl_token::id() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    let ata_mint = &ata_data[0..32];
+    if ata_mint != pool.collateral_mint {
+        return Err(StakeError::InvalidMint.into());
+    }
+    drop(ata_data);
+
+    // SPL Token transfer: admin_ata → vault (admin signs as token owner)
+    let transfer_ix = crate::spl_token::transfer(
+        token_program.key,
+        admin_ata.key,
+        vault.key,
+        admin.key,
+        &[],
+        amount,
+    )?;
+    invoke(
+        &transfer_ix,
+        &[admin_ata.clone(), vault.clone(), admin.clone()],
+    )?;
+
+    // Update accounting
+    pool.total_returned = pool.total_returned
+        .checked_add(amount)
+        .ok_or(StakeError::Overflow)?;
+
+    msg!(
+        "ReturnInsurance: {} tokens returned to pool vault (total_returned: {})",
+        amount,
+        pool.total_returned
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 18: SetMarketResolved — admin marks pool as resolved
+// ═══════════════════════════════════════════════════════════════
+
+fn process_set_market_resolved(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    validate_account_owner(pool_pda, program_id)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    if pool.market_resolved() {
+        msg!("Market already resolved");
+        return Err(StakeError::MarketResolved.into());
+    }
+
+    pool.set_market_resolved(true);
+
+    msg!("SetMarketResolved: pool marked as resolved, deposits blocked");
     Ok(())
 }

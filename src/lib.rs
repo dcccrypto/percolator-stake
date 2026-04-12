@@ -1,33 +1,25 @@
-//! Percolator Insurance LP Staking Program (v2 — PDA Admin Architecture)
+//! Percolator Insurance LP Staking Program (v3 — no admin proxy)
 //!
-//! Separate program that manages insurance fund LP staking for Percolator markets.
-//! Per Toly's architecture: "Some external program is the admin key via the PDA,
-//! and implements staking and all the reward APIs, and can create new markets and
-//! can withdraw insurance and rewards via some policy that is 'safe'. But it's just
-//! a PDA admin on the thin wrapper. So security audits and changes can be isolated."
+//! Manages insurance fund LP staking for Percolator markets.
+//! Users deposit collateral, receive LP tokens, and earn yield from insurance operations.
 //!
-//! Architecture:
-//! - The stake_pool PDA (per slab) becomes the ADMIN of the percolator wrapper slab
-//! - Users deposit collateral → stake vault (liquidity buffer)
-//! - LP tokens represent proportional ownership of pool (vault + flushed to insurance)
-//! - FlushToInsurance: CPI into wrapper's TopUpInsurance to fund insurance
-//! - Admin operations (set oracle, risk thresholds) forwarded via CPI with PDA signature
-//! - Wrapper stays thin (pure perp math) — policy logic lives here
-//! - Security audits isolated: audit wrapper for math, audit this for policy
+//! The human admin wallet remains the wrapper slab admin.
+//! Admin operations (ResolveMarket, WithdrawInsurance, SetOracleAuthority, etc.)
+//! are called directly on the wrapper — no CPI proxy needed.
 //!
 //! Instructions:
-//!   0 - InitPool:              Create stake pool for a slab, LP mint, vault
-//!   1 - Deposit:               Deposit collateral → vault, receive LP tokens
-//!   2 - Withdraw:              Burn LP tokens → withdraw from vault (after cooldown)
-//!   3 - FlushToInsurance:      CPI TopUpInsurance — vault → wrapper insurance fund
-//!   4 - UpdateConfig:          Admin updates cooldown, caps, etc.
-//!   5 - TransferAdmin:         Transfer wrapper slab admin to pool PDA (one-time setup)
-//!   6 - AdminSetOracleAuth:    CPI SetOracleAuthority on wrapper (pool PDA signs as admin)
-//!   7 - AdminSetRiskThreshold: CPI SetRiskThreshold on wrapper (pool PDA signs as admin)
-//!   8 - AdminSetMaintenanceFee: CPI SetMaintenanceFee on wrapper
-//!   9 - AdminResolveMarket:    CPI ResolveMarket on wrapper (end-of-epoch)
-//!  10 - AdminWithdrawInsurance: CPI WithdrawInsurance → distribute to LP holders
-//!  11 - AdminSetInsurancePolicy: CPI SetInsuranceWithdrawPolicy on wrapper
+//!   0  - InitPool:            Create stake pool for a slab, LP mint, vault
+//!   1  - Deposit:             Deposit collateral → vault, receive LP tokens
+//!   2  - Withdraw:            Burn LP tokens → withdraw from vault (after cooldown)
+//!   3  - FlushToInsurance:    CPI TopUpInsurance — vault → wrapper insurance fund
+//!   4  - UpdateConfig:        Admin updates cooldown, caps, etc.
+//!  10  - ReturnInsurance:     Admin returns insurance funds to pool vault
+//!  12  - AccrueFees:          Accrue trading fees to LP vault (permissionless)
+//!  13  - InitTradingPool:     Initialize pool in trading LP mode
+//!  14  - AdminSetHwmConfig:   Set high-water mark configuration
+//!  15  - AdminSetTrancheConfig: Configure senior/junior tranches
+//!  16  - DepositJunior:       Deposit into junior (first-loss) tranche
+//!  18  - SetMarketResolved:   Admin marks pool as resolved (blocks deposits)
 
 pub mod cpi;
 pub mod error;
@@ -36,15 +28,6 @@ pub mod math;
 pub mod processor;
 pub mod spl_token;
 pub mod state;
-
-/// Public re-export of CPI instruction tag constants for integration tests.
-///
-/// SECURITY: Integration tests (tests/cpi_tags.rs) import these to ensure
-/// they always compare against the production values, not hardcoded stale integers.
-pub mod cpi_tag_constants {
-    pub use crate::cpi::TAG_SET_INSURANCE_WITHDRAW_POLICY;
-    pub use crate::cpi::TAG_WITHDRAW_INSURANCE_LIMITED;
-}
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint;

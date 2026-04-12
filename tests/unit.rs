@@ -508,28 +508,25 @@ fn test_decode_update_config_none() {
 }
 
 #[test]
-fn test_decode_transfer_admin() {
-    let data = vec![5u8];
-    let ix = StakeInstruction::unpack(&data).unwrap();
-    assert!(matches!(ix, StakeInstruction::TransferAdmin));
+fn test_tombstoned_admin_tags_rejected() {
+    // Tags 5, 6, 7, 8, 9, 11 were admin CPI proxies — now tombstoned
+    for tag in [5u8, 6, 7, 8, 9, 11] {
+        assert!(StakeInstruction::unpack(&[tag]).is_err(), "tag {} should be rejected", tag);
+    }
 }
 
 #[test]
-fn test_decode_admin_resolve_market() {
-    let data = vec![9u8];
-    let ix = StakeInstruction::unpack(&data).unwrap();
-    assert!(matches!(ix, StakeInstruction::AdminResolveMarket));
-}
-
-#[test]
-fn test_decode_admin_withdraw_insurance() {
+fn test_decode_return_insurance() {
     let mut data = vec![10u8];
-    data.extend_from_slice(&5_000_000u64.to_le_bytes()); // amount = 5M tokens
+    data.extend_from_slice(&5_000_000u64.to_le_bytes());
     let ix = StakeInstruction::unpack(&data).unwrap();
-    assert!(matches!(
-        ix,
-        StakeInstruction::AdminWithdrawInsurance { amount: 5_000_000 }
-    ));
+    assert!(matches!(ix, StakeInstruction::ReturnInsurance { amount: 5_000_000 }));
+}
+
+#[test]
+fn test_decode_set_market_resolved() {
+    let ix = StakeInstruction::unpack(&[18u8]).unwrap();
+    assert!(matches!(ix, StakeInstruction::SetMarketResolved));
 }
 
 #[test]

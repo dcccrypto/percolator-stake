@@ -25,10 +25,10 @@ pub enum StakeError {
     DepositCapExceeded = 9,
     /// Invalid PDA derivation
     InvalidPda = 10,
-    /// Admin already transferred to pool PDA
-    AdminAlreadyTransferred = 11,
-    /// Admin not yet transferred — must call TransferAdmin first
-    AdminNotTransferred = 12,
+    /// Deprecated (was AdminAlreadyTransferred) — code kept for stable numbering
+    _DeprecatedAdminAlreadyTransferred = 11,
+    /// Deprecated (was AdminNotTransferred) — code kept for stable numbering
+    _DeprecatedAdminNotTransferred = 12,
     /// Insufficient vault balance for withdrawal
     InsufficientVaultBalance = 13,
     /// Invalid percolator program ID

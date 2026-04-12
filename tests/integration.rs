@@ -11,7 +11,6 @@
 
 use bytemuck::Zeroable;
 use percolator_stake::{
-    cpi_tag_constants::{TAG_SET_INSURANCE_WITHDRAW_POLICY, TAG_WITHDRAW_INSURANCE_LIMITED},
     instruction::StakeInstruction,
     state::{
         derive_deposit_pda, derive_pool_pda, derive_vault_authority, StakeDeposit, StakePool,
@@ -277,136 +276,8 @@ fn test_flush_instruction_decodes_correctly() {
     }
 }
 
-// ════════════════════════════════════════════════════════════════
-// CRIT-1 REGRESSION: AdminSetInsurancePolicy CPI tag = 22 (not 30)
-// ════════════════════════════════════════════════════════════════
-//
-// These tests are the primary regression guard for CRIT-1. If anyone
-// changes TAG_SET_INSURANCE_WITHDRAW_POLICY back to 30 or any other value,
-// these tests will fail immediately.
-
-/// AdminSetInsurancePolicy must use CPI tag 22.
-/// Tag 30 = ForceCloseResolved (completely different, dangerous).
-/// Tag 22 = SetInsuranceWithdrawPolicy (correct).
-#[test]
-fn test_admin_set_insurance_policy_cpi_tag_is_22_not_30() {
-    assert_eq!(
-        TAG_SET_INSURANCE_WITHDRAW_POLICY, 22,
-        "CRIT-1: SetInsuranceWithdrawPolicy must use tag 22, not 30 (ForceCloseResolved)"
-    );
-
-    // Build data as cpi.rs does
-    let authority = [0u8; 32];
-    let min_withdraw_base = 100_000u64;
-    let max_withdraw_bps = 500u16;
-    let cooldown_slots = 1000u64;
-
-    let mut data = Vec::with_capacity(51);
-    data.push(TAG_SET_INSURANCE_WITHDRAW_POLICY);
-    data.extend_from_slice(&authority);
-    data.extend_from_slice(&min_withdraw_base.to_le_bytes());
-    data.extend_from_slice(&max_withdraw_bps.to_le_bytes());
-    data.extend_from_slice(&cooldown_slots.to_le_bytes());
-
-    assert_eq!(data[0], 22, "First byte of SetInsuranceWithdrawPolicy CPI data must be 22");
-    assert_ne!(data[0], 30, "CRIT-1: tag must not be 30 (ForceCloseResolved)");
-    assert_ne!(data[0], 21, "tag must not be 21 (AdminForceCloseAccount)");
-    assert_ne!(data[0], 31, "tag must not be 31 (unrecognized)");
-
-    // Verify data contains authority at [1..33]
-    assert_eq!(&data[1..33], &authority);
-    // min_withdraw_base at [33..41]
-    assert_eq!(
-        u64::from_le_bytes(data[33..41].try_into().unwrap()),
-        min_withdraw_base
-    );
-    // max_withdraw_bps at [41..43]
-    assert_eq!(
-        u16::from_le_bytes(data[41..43].try_into().unwrap()),
-        max_withdraw_bps
-    );
-    // cooldown_slots at [43..51]
-    assert_eq!(
-        u64::from_le_bytes(data[43..51].try_into().unwrap()),
-        cooldown_slots
-    );
-}
-
-/// AdminWithdrawInsurance must use CPI tag 23.
-/// Tag 31 was previously used (wrong, unrecognized by percolator-prog).
-/// Tag 23 = WithdrawInsuranceLimited (correct).
-#[test]
-fn test_admin_withdraw_insurance_cpi_tag_is_23_not_31() {
-    assert_eq!(
-        TAG_WITHDRAW_INSURANCE_LIMITED, 23,
-        "CRIT-1: WithdrawInsuranceLimited must use tag 23, not 31 (unrecognized)"
-    );
-
-    let amount = 250_000u64;
-    let mut data = Vec::with_capacity(9);
-    data.push(TAG_WITHDRAW_INSURANCE_LIMITED);
-    data.extend_from_slice(&amount.to_le_bytes());
-
-    assert_eq!(data[0], 23, "First byte of WithdrawInsuranceLimited CPI data must be 23");
-    assert_ne!(data[0], 31, "CRIT-1: tag must not be 31 (old wrong value)");
-    assert_ne!(data[0], 30, "tag must not be 30 (ForceCloseResolved)");
-    assert_eq!(
-        u64::from_le_bytes(data[1..9].try_into().unwrap()),
-        amount,
-        "WithdrawInsuranceLimited amount must be encoded after tag"
-    );
-}
-
-/// The two CRIT-1 tags must be distinct (cannot collide with each other).
-#[test]
-fn test_crit1_tags_are_distinct() {
-    assert_ne!(
-        TAG_SET_INSURANCE_WITHDRAW_POLICY,
-        TAG_WITHDRAW_INSURANCE_LIMITED,
-        "CRIT-1: policy and withdraw tags must be distinct"
-    );
-}
-
-/// Regression guard: both tags must match the production constants imported
-/// directly from the crate — not hardcoded in the test.
-#[test]
-fn test_crit1_tags_match_production_constants() {
-    // These values are the only correct values per the percolator-prog decode table.
-    // If the constants in src/cpi.rs are ever changed, this test fails at compile
-    // time (if the constant is renamed) or at runtime (if the value is changed).
-    const EXPECTED_POLICY: u8 = 22;
-    const EXPECTED_WITHDRAW: u8 = 23;
-
-    assert_eq!(
-        TAG_SET_INSURANCE_WITHDRAW_POLICY, EXPECTED_POLICY,
-        "TAG_SET_INSURANCE_WITHDRAW_POLICY drifted from expected value 22"
-    );
-    assert_eq!(
-        TAG_WITHDRAW_INSURANCE_LIMITED, EXPECTED_WITHDRAW,
-        "TAG_WITHDRAW_INSURANCE_LIMITED drifted from expected value 23"
-    );
-}
-
-/// Verify that tags 30 and 31 are NOT used for insurance operations.
-/// This is the exact scenario that CRIT-1 patched.
-#[test]
-fn test_crit1_dangerous_tags_not_used_for_insurance() {
-    // Tag 30 in percolator-prog is ForceCloseResolved.
-    // Tag 31 is unrecognized. Using either for insurance ops would be catastrophic.
-    assert_ne!(
-        TAG_SET_INSURANCE_WITHDRAW_POLICY, 30,
-        "CRIT-1 REGRESSION: SetInsuranceWithdrawPolicy must not use tag 30 (ForceCloseResolved)!"
-    );
-    assert_ne!(
-        TAG_WITHDRAW_INSURANCE_LIMITED, 31,
-        "CRIT-1 REGRESSION: WithdrawInsuranceLimited must not use tag 31 (unrecognized)!"
-    );
-    // Also verify no off-by-one errors
-    assert_ne!(TAG_SET_INSURANCE_WITHDRAW_POLICY, 29);
-    assert_ne!(TAG_SET_INSURANCE_WITHDRAW_POLICY, 31);
-    assert_ne!(TAG_WITHDRAW_INSURANCE_LIMITED, 22);
-    assert_ne!(TAG_WITHDRAW_INSURANCE_LIMITED, 30);
-}
+// CPI tag tests removed — admin CPI proxy instructions no longer exist.
+// The only CPI is TopUpInsurance (tag 9), tested in cpi.rs unit tests.
 
 // ════════════════════════════════════════════════════════════════
 // POOL VERSION VALIDATION: reject version-0 pools
@@ -856,24 +727,23 @@ fn test_all_standard_instruction_tags_decode() {
         _ => panic!("Expected FlushToInsurance"),
     }
 
-    // Tag 5: TransferAdmin
-    let data = vec![5u8];
-    assert!(matches!(StakeInstruction::unpack(&data).unwrap(), StakeInstruction::TransferAdmin));
+    // Tags 5, 9 removed (were admin CPI proxies)
+    assert!(StakeInstruction::unpack(&[5u8]).is_err());
+    assert!(StakeInstruction::unpack(&[9u8]).is_err());
 
-    // Tag 9: AdminResolveMarket
-    let data = vec![9u8];
-    assert!(matches!(
-        StakeInstruction::unpack(&data).unwrap(),
-        StakeInstruction::AdminResolveMarket
-    ));
-
-    // Tag 10: AdminWithdrawInsurance
+    // Tag 10: ReturnInsurance (was AdminWithdrawInsurance)
     let mut data = vec![10u8];
     data.extend_from_slice(&3_000_000u64.to_le_bytes());
     match StakeInstruction::unpack(&data).unwrap() {
-        StakeInstruction::AdminWithdrawInsurance { amount } => assert_eq!(amount, 3_000_000),
-        _ => panic!("Expected AdminWithdrawInsurance"),
+        StakeInstruction::ReturnInsurance { amount } => assert_eq!(amount, 3_000_000),
+        _ => panic!("Expected ReturnInsurance"),
     }
+
+    // Tag 18: SetMarketResolved
+    assert!(matches!(
+        StakeInstruction::unpack(&[18u8]).unwrap(),
+        StakeInstruction::SetMarketResolved
+    ));
 }
 
 /// Invalid instruction tags must return errors.

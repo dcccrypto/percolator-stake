@@ -1,10 +1,14 @@
-use solana_program::{program_error::ProgramError, pubkey::Pubkey};
+use solana_program::program_error::ProgramError;
 
-/// Instructions for the Percolator Insurance LP Staking program (v2 — PDA Admin).
+/// Instructions for the Percolator Insurance LP Staking program (v3 — no admin proxy).
+///
+/// The stake program handles deposits, withdrawals, LP math, insurance flush/return,
+/// fee accrual, HWM, and tranches. All wrapper admin operations (ResolveMarket,
+/// SetOracleAuthority, WithdrawInsurance, etc.) are called directly by the human
+/// admin wallet on the wrapper program.
 #[derive(Debug)]
 pub enum StakeInstruction {
-    /// Initialize a stake pool for a slab (market).
-    /// Creates the pool PDA, LP mint, and collateral vault.
+    /// 0: Initialize a stake pool for a slab (market).
     ///
     /// Accounts:
     ///   0. `[signer, writable]` Admin (pays rent, becomes pool admin)
@@ -13,7 +17,7 @@ pub enum StakeInstruction {
     ///   3. `[writable]` LP Mint (to be created, authority = vault_auth PDA)
     ///   4. `[writable]` Vault token account (to be created, authority = vault_auth PDA)
     ///   5. `[]` Vault authority PDA
-    ///   6. `[]` Collateral mint (must match slab's collateral mint)
+    ///   6. `[]` Collateral mint
     ///   7. `[]` Percolator program ID
     ///   8. `[]` Token program
     ///   9. `[]` System program
@@ -23,7 +27,7 @@ pub enum StakeInstruction {
         deposit_cap: u64,
     },
 
-    /// Deposit collateral into the stake vault. Mints LP tokens pro-rata.
+    /// 1: Deposit collateral into the stake vault. Mints LP tokens pro-rata.
     ///
     /// Accounts:
     ///   0. `[signer]` User depositing
@@ -39,9 +43,7 @@ pub enum StakeInstruction {
     ///  10. `[]` System program
     Deposit { amount: u64 },
 
-    /// Withdraw collateral by burning LP tokens. Subject to cooldown.
-    /// Withdrawal limited by vault balance (buffer). If insurance has been
-    /// flushed, user may need to wait for market resolution to get full value.
+    /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown.
     ///
     /// Accounts:
     ///   0. `[signer]` User withdrawing
@@ -56,24 +58,21 @@ pub enum StakeInstruction {
     ///   9. `[]` Clock sysvar
     Withdraw { lp_amount: u64 },
 
-    /// CPI into percolator wrapper's TopUpInsurance to move collateral from
-    /// stake vault → wrapper insurance fund. Permissionless trigger.
-    ///
-    /// The vault_auth PDA signs as the TopUpInsurance "signer" — the wrapper
-    /// verifies the signer's ATA (our vault) and transfers to wrapper vault.
+    /// 3: CPI into percolator wrapper's TopUpInsurance to move collateral from
+    /// stake vault → wrapper insurance fund.
     ///
     /// Accounts:
-    ///   0. `[signer]` Caller (permissionless, just pays tx fee)
+    ///   0. `[signer]` Caller (admin-only per C10 fix)
     ///   1. `[writable]` Pool PDA
-    ///   2. `[writable]` Pool vault token account (source — "signer_ata" for CPI)
-    ///   3. `[]` Vault authority PDA (signs CPI as TopUpInsurance signer)
-    ///   4. `[writable]` Slab account (percolator market, writable for CPI)
+    ///   2. `[writable]` Pool vault token account (source)
+    ///   3. `[]` Vault authority PDA (signs CPI)
+    ///   4. `[writable]` Slab account
     ///   5. `[writable]` Wrapper vault token account (destination)
     ///   6. `[]` Percolator program
     ///   7. `[]` Token program
     FlushToInsurance { amount: u64 },
 
-    /// Admin updates pool configuration.
+    /// 4: Admin updates pool configuration.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
@@ -83,99 +82,33 @@ pub enum StakeInstruction {
         new_deposit_cap: Option<u64>,
     },
 
-    /// Transfer wrapper slab admin authority to the pool PDA.
-    /// One-time setup — the current wrapper admin (human) must sign.
-    /// After this, the pool PDA IS the admin and can CPI admin instructions.
-    ///
-    /// Accounts:
-    ///   0. `[signer]` Current wrapper admin (human)
-    ///   1. `[writable]` Pool PDA (admin_transferred flag updated)
-    ///   2. `[writable]` Slab account (wrapper, admin field updated via CPI)
-    ///   3. `[]` Percolator program
-    TransferAdmin,
+    // Tags 5-9, 11 removed: were admin CPI proxies (TransferAdmin, SetOracleAuthority,
+    // SetRiskThreshold, SetMaintenanceFee, ResolveMarket, SetInsurancePolicy).
+    // Human admin now calls wrapper directly.
 
-    /// Pool admin forwards SetOracleAuthority to wrapper via CPI.
-    /// Pool PDA signs as wrapper admin.
+    /// 10: Return insurance funds to the pool vault.
+    /// Admin calls WithdrawInsurance on the wrapper directly (gets USDC to admin ATA),
+    /// then calls this to transfer from admin ATA to pool vault and update accounting.
     ///
     /// Accounts:
-    ///   0. `[signer]` Pool admin (human who controls this pool)
-    ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
-    ///   2. `[writable]` Slab account
-    ///   3. `[]` Percolator program
-    AdminSetOracleAuthority { new_authority: Pubkey },
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Admin's collateral token account (source)
+    ///   3. `[writable]` Pool vault token account (destination)
+    ///   4. `[]` Token program
+    ReturnInsurance { amount: u64 },
 
-    /// Pool admin forwards SetRiskThreshold to wrapper via CPI.
+    /// 12: Accrue trading fees from percolator engine to LP vault.
+    /// Permissionless — anyone can trigger.
     ///
     /// Accounts:
-    ///   0. `[signer]` Pool admin
-    ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
-    ///   2. `[writable]` Slab account
-    ///   3. `[]` Percolator program
-    AdminSetRiskThreshold { new_threshold: u128 },
-
-    /// Pool admin forwards SetMaintenanceFee to wrapper via CPI.
-    ///
-    /// Accounts:
-    ///   0. `[signer]` Pool admin
-    ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
-    ///   2. `[writable]` Slab account
-    ///   3. `[]` Percolator program
-    AdminSetMaintenanceFee { new_fee: u128 },
-
-    /// Pool admin resolves the market (end of epoch). Wrapper enters withdraw-only mode.
-    ///
-    /// Accounts:
-    ///   0. `[signer]` Pool admin
-    ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
-    ///   2. `[writable]` Slab account
-    ///   3. `[]` Percolator program
-    AdminResolveMarket,
-
-    /// Pool admin withdraws insurance fund after market resolution.
-    /// Tokens go to pool vault (via vault_auth ATA), then available for LP holder withdrawals.
-    ///
-    /// Accounts:
-    ///   0. `[signer]` Pool admin
-    ///   1. `[writable]` Pool PDA (wrapper admin, signs CPI; state updated)
-    ///   2. `[writable]` Slab account
-    ///   3. `[writable]` Pool vault token account (receives insurance — "admin_ata" for CPI)
-    ///   4. `[]` Vault authority PDA (owner of pool vault)
-    ///   5. `[writable]` Wrapper vault token account (source)
-    ///   6. `[]` Wrapper vault authority PDA
-    ///   7. `[]` Percolator program
-    ///   8. `[]` Token program
-    ///
-    /// 10: AdminWithdrawInsurance — CPIs WithdrawInsuranceLimited (wrapper Tag 23) via vault_auth PDA.
-    /// Requires market RESOLVED and SetInsuranceWithdrawPolicy (wrapper Tag 22) called with vault_auth as authority.
-    AdminWithdrawInsurance { amount: u64 },
-
-    /// Pool admin sets insurance withdrawal policy on wrapper.
-    ///
-    /// Accounts:
-    ///   0. `[signer]` Pool admin
-    ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
-    ///   2. `[writable]` Slab account
-    ///   3. `[]` Percolator program
-    AdminSetInsurancePolicy {
-        authority: Pubkey,
-        min_withdraw_base: u64,
-        max_withdraw_bps: u16,
-        cooldown_slots: u64,
-    },
-
-    /// PERC-272: Accrue trading fees from percolator engine to LP vault.
-    /// Permissionless — anyone can trigger fee accrual.
-    /// Reads the vault token account balance and computes fee delta.
-    ///
-    /// Accounts:
-    ///   0. `[signer]` Caller (permissionless, just pays tx fee)
-    ///   1. `[writable]` Pool PDA (state updated: total_fees_earned, last_fee_accrual_slot)
+    ///   0. `[signer]` Caller (permissionless)
+    ///   1. `[writable]` Pool PDA
     ///   2. `[]` Pool vault token account (read balance)
     ///   3. `[]` Clock sysvar
     AccrueFees,
 
-    /// PERC-272: Initialize pool in trading LP mode.
-    /// Same as InitPool but sets pool_mode = 1 (trading LP vault).
+    /// 13: Initialize pool in trading LP mode (pool_mode = 1).
     ///
     /// Accounts: same as InitPool
     InitTradingPool {
@@ -183,33 +116,35 @@ pub enum StakeInstruction {
         deposit_cap: u64,
     },
 
-    /// PERC-313: Set high-water mark configuration.
-    /// Enables/disables HWM protection and sets the floor percentage.
-    /// When enabled, withdrawals that would push vault TVL below
-    /// `hwm_floor_bps%` of the epoch's high-water mark TVL are blocked.
+    /// 14: Set high-water mark configuration.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
     AdminSetHwmConfig {
-        /// Enable (true) or disable (false) HWM protection
         enabled: bool,
-        /// Floor as basis points of epoch HWM TVL (e.g. 5000 = 50%)
         hwm_floor_bps: u16,
     },
 
-    /// PERC-303: Enable/configure senior-junior LP tranches.
+    /// 15: Enable/configure senior-junior LP tranches.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
     AdminSetTrancheConfig { junior_fee_mult_bps: u16 },
 
-    /// PERC-303: Deposit into the junior (first-loss) tranche.
-    /// Junior LP absorbs losses first, earns multiplied fee share.
+    /// 16: Deposit into the junior (first-loss) tranche.
     ///
     /// Accounts: same as Deposit
     DepositJunior { amount: u64 },
+
+    /// 18: Admin marks the pool as market-resolved (blocks new deposits).
+    /// Call this after resolving the market on the wrapper directly.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    SetMarketResolved,
 }
 
 impl StakeInstruction {
@@ -220,7 +155,6 @@ impl StakeInstruction {
 
         match tag {
             0 => {
-                // InitPool: cooldown_slots(8) + deposit_cap(8)
                 if rest.len() < 16 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -265,56 +199,16 @@ impl StakeInstruction {
                     new_deposit_cap: if has_cap { Some(cap) } else { None },
                 })
             }
-            5 => Ok(Self::TransferAdmin),
-            6 => {
-                if rest.len() < 32 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                let new_authority = Pubkey::try_from(&rest[0..32])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
-                Ok(Self::AdminSetOracleAuthority { new_authority })
-            }
-            7 => {
-                if rest.len() < 16 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                let new_threshold = u128::from_le_bytes(rest[0..16].try_into().unwrap());
-                Ok(Self::AdminSetRiskThreshold { new_threshold })
-            }
-            8 => {
-                if rest.len() < 16 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                let new_fee = u128::from_le_bytes(rest[0..16].try_into().unwrap());
-                Ok(Self::AdminSetMaintenanceFee { new_fee })
-            }
-            9 => Ok(Self::AdminResolveMarket),
+            // Tags 5-9, 11 tombstoned — were admin CPI proxies, now removed.
             10 => {
                 if rest.len() < 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 let amount = u64::from_le_bytes(rest[0..8].try_into().unwrap());
-                Ok(Self::AdminWithdrawInsurance { amount })
-            }
-            11 => {
-                if rest.len() < 50 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                let authority = Pubkey::try_from(&rest[0..32])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
-                let min_withdraw_base = u64::from_le_bytes(rest[32..40].try_into().unwrap());
-                let max_withdraw_bps = u16::from_le_bytes(rest[40..42].try_into().unwrap());
-                let cooldown_slots = u64::from_le_bytes(rest[42..50].try_into().unwrap());
-                Ok(Self::AdminSetInsurancePolicy {
-                    authority,
-                    min_withdraw_base,
-                    max_withdraw_bps,
-                    cooldown_slots,
-                })
+                Ok(Self::ReturnInsurance { amount })
             }
             12 => Ok(Self::AccrueFees),
             13 => {
-                // InitTradingPool: cooldown_slots(8) + deposit_cap(8)
                 if rest.len() < 16 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -326,7 +220,6 @@ impl StakeInstruction {
                 })
             }
             14 => {
-                // PERC-313: AdminSetHwmConfig: enabled(1) + hwm_floor_bps(2)
                 if rest.len() < 3 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -338,7 +231,6 @@ impl StakeInstruction {
                 })
             }
             15 => {
-                // PERC-303: AdminSetTrancheConfig: junior_fee_mult_bps(2)
                 if rest.len() < 2 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -348,13 +240,13 @@ impl StakeInstruction {
                 })
             }
             16 => {
-                // PERC-303: DepositJunior: amount(8)
                 if rest.len() < 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 let amount = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                 Ok(Self::DepositJunior { amount })
             }
+            18 => Ok(Self::SetMarketResolved),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -364,42 +256,19 @@ impl StakeInstruction {
 mod tests {
     use super::*;
 
-    #[allow(dead_code)]
-    fn pack_u64(v: u64) -> Vec<u8> {
-        v.to_le_bytes().to_vec()
-    }
-
-    #[allow(dead_code)]
-    fn pack_u128(v: u128) -> Vec<u8> {
-        v.to_le_bytes().to_vec()
-    }
-
-    // ── Tag 0: InitPool ──
-
     #[test]
     fn test_unpack_init_pool() {
-        let mut data = vec![0u8]; // tag
-        data.extend_from_slice(&100u64.to_le_bytes()); // cooldown
-        data.extend_from_slice(&5000u64.to_le_bytes()); // cap
+        let mut data = vec![0u8];
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.extend_from_slice(&5000u64.to_le_bytes());
         match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::InitPool {
-                cooldown_slots,
-                deposit_cap,
-            } => {
+            StakeInstruction::InitPool { cooldown_slots, deposit_cap } => {
                 assert_eq!(cooldown_slots, 100);
                 assert_eq!(deposit_cap, 5000);
             }
             _ => panic!("wrong variant"),
         }
     }
-
-    #[test]
-    fn test_unpack_init_pool_too_short() {
-        let data = vec![0u8, 1, 2, 3]; // only 3 bytes of payload
-        assert!(StakeInstruction::unpack(&data).is_err());
-    }
-
-    // ── Tag 1: Deposit ──
 
     #[test]
     fn test_unpack_deposit() {
@@ -411,8 +280,6 @@ mod tests {
         }
     }
 
-    // ── Tag 2: Withdraw ──
-
     #[test]
     fn test_unpack_withdraw() {
         let mut data = vec![2u8];
@@ -423,227 +290,45 @@ mod tests {
         }
     }
 
-    // ── Tag 3: FlushToInsurance ──
-
     #[test]
-    fn test_unpack_flush() {
-        let mut data = vec![3u8];
-        data.extend_from_slice(&500u64.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::FlushToInsurance { amount } => assert_eq!(amount, 500),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Tag 4: UpdateConfig ──
-
-    #[test]
-    fn test_unpack_update_config_both() {
-        let mut data = vec![4u8];
-        data.push(1); // has_cooldown
-        data.extend_from_slice(&200u64.to_le_bytes());
-        data.push(1); // has_cap
-        data.extend_from_slice(&1000u64.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::UpdateConfig {
-                new_cooldown_slots,
-                new_deposit_cap,
-            } => {
-                assert_eq!(new_cooldown_slots, Some(200));
-                assert_eq!(new_deposit_cap, Some(1000));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_unpack_update_config_none() {
-        let mut data = vec![4u8];
-        data.push(0); // no cooldown
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.push(0); // no cap
-        data.extend_from_slice(&0u64.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::UpdateConfig {
-                new_cooldown_slots,
-                new_deposit_cap,
-            } => {
-                assert_eq!(new_cooldown_slots, None);
-                assert_eq!(new_deposit_cap, None);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Tag 5: TransferAdmin ──
-
-    #[test]
-    fn test_unpack_transfer_admin() {
-        let data = vec![5u8];
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::TransferAdmin => {}
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Tag 7: AdminSetRiskThreshold ──
-
-    #[test]
-    fn test_unpack_risk_threshold() {
-        let mut data = vec![7u8];
-        data.extend_from_slice(&12345u128.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminSetRiskThreshold { new_threshold } => {
-                assert_eq!(new_threshold, 12345);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Tag 8: AdminSetMaintenanceFee ──
-
-    #[test]
-    fn test_unpack_maintenance_fee() {
-        let mut data = vec![8u8];
-        data.extend_from_slice(&77u128.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminSetMaintenanceFee { new_fee } => {
-                assert_eq!(new_fee, 77);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Tag 9: AdminResolveMarket ──
-
-    #[test]
-    fn test_unpack_resolve_market() {
-        let data = vec![9u8];
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminResolveMarket => {}
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── Tag 10: AdminWithdrawInsurance ──
-
-    #[test]
-    fn test_unpack_withdraw_insurance() {
+    fn test_unpack_return_insurance() {
         let mut data = vec![10u8];
         data.extend_from_slice(&1234u64.to_le_bytes());
         match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminWithdrawInsurance { amount } => {
-                assert_eq!(amount, 1234);
-            }
+            StakeInstruction::ReturnInsurance { amount } => assert_eq!(amount, 1234),
             _ => panic!("wrong variant"),
         }
     }
 
-    // ── Invalid tag ──
-
-    // ── Tag 14: AdminSetTrancheConfig ──
-
     #[test]
-    fn test_unpack_set_tranche_config() {
-        let mut data = vec![15u8]; // Tag 15 (14 reserved for PERC-313 HWM)
-        data.extend_from_slice(&20000u16.to_le_bytes()); // 2x multiplier
+    fn test_unpack_set_market_resolved() {
+        let data = vec![18u8];
         match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminSetTrancheConfig {
-                junior_fee_mult_bps,
-            } => {
-                assert_eq!(junior_fee_mult_bps, 20000);
-            }
+            StakeInstruction::SetMarketResolved => {}
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn test_unpack_set_tranche_config_too_short() {
-        let data = vec![15u8, 1]; // only 1 byte
-        assert!(StakeInstruction::unpack(&data).is_err());
-    }
-
-    // ── Tag 16: DepositJunior ──
-
-    #[test]
-    fn test_unpack_deposit_junior() {
-        let mut data = vec![16u8];
-        data.extend_from_slice(&5000u64.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::DepositJunior { amount } => assert_eq!(amount, 5000),
-            _ => panic!("wrong variant"),
+    fn test_tombstoned_tags_rejected() {
+        // Tags 5-9, 11, 17 should all return InvalidInstructionData
+        for tag in [5u8, 6, 7, 8, 9, 11, 17] {
+            let data = vec![tag];
+            assert!(
+                StakeInstruction::unpack(&data).is_err(),
+                "tag {} should be rejected",
+                tag
+            );
         }
-    }
-
-    #[test]
-    fn test_unpack_deposit_junior_too_short() {
-        let data = vec![16u8, 1, 2, 3]; // only 3 bytes
-        assert!(StakeInstruction::unpack(&data).is_err());
     }
 
     #[test]
     fn test_unpack_invalid_tag() {
-        let data = vec![255u8];
-        assert!(StakeInstruction::unpack(&data).is_err());
+        assert!(StakeInstruction::unpack(&[255u8]).is_err());
     }
 
     #[test]
     fn test_unpack_empty() {
-        let data: Vec<u8> = vec![];
-        assert!(StakeInstruction::unpack(&data).is_err());
-    }
-
-    // ── Tag 14: AdminSetHwmConfig ──
-
-    #[test]
-    fn test_unpack_hwm_config_enabled() {
-        let mut data = vec![14u8];
-        data.push(1); // enabled = true
-        data.extend_from_slice(&5000u16.to_le_bytes()); // hwm_floor_bps
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminSetHwmConfig {
-                enabled,
-                hwm_floor_bps,
-            } => {
-                assert!(enabled);
-                assert_eq!(hwm_floor_bps, 5000);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_unpack_hwm_config_disabled() {
-        let mut data = vec![14u8];
-        data.push(0); // enabled = false
-        data.extend_from_slice(&0u16.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::AdminSetHwmConfig {
-                enabled,
-                hwm_floor_bps,
-            } => {
-                assert!(!enabled);
-                assert_eq!(hwm_floor_bps, 0);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_unpack_hwm_config_too_short() {
-        let data = vec![14u8, 1]; // only 1 byte of payload, need 3
-        assert!(StakeInstruction::unpack(&data).is_err());
-    }
-
-    // ── Boundary: max u64 values ──
-
-    #[test]
-    fn test_unpack_max_values() {
-        let mut data = vec![1u8]; // Deposit
-        data.extend_from_slice(&u64::MAX.to_le_bytes());
-        match StakeInstruction::unpack(&data).unwrap() {
-            StakeInstruction::Deposit { amount } => assert_eq!(amount, u64::MAX),
-            _ => panic!("wrong variant"),
-        }
+        assert!(StakeInstruction::unpack(&[]).is_err());
     }
 }

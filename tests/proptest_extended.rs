@@ -647,16 +647,7 @@ proptest! {
     #[test]
     fn prop_cpi_tags_are_distinct(_dummy: u8) {
         let tags = [
-            9u8,  // TopUpInsurance
-            11u8, // SetRiskThreshold
-            12u8, // UpdateAdmin
-            15u8, // SetMaintenanceFee
-            16u8, // SetOracleAuthority
-            18u8, // SetOraclePriceCap
-            19u8, // ResolveMarket
-            20u8, // WithdrawInsurance
-            22u8, // SetInsuranceWithdrawPolicy
-            23u8, // WithdrawInsuranceLimited
+            9u8,  // TopUpInsurance (only remaining CPI)
         ];
         for i in 0..tags.len() {
             for j in (i + 1)..tags.len() {

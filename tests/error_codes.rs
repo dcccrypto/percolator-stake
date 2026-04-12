@@ -17,8 +17,8 @@ fn test_all_error_codes_unique() {
         StakeError::MarketResolved as u32,
         StakeError::DepositCapExceeded as u32,
         StakeError::InvalidPda as u32,
-        StakeError::AdminAlreadyTransferred as u32,
-        StakeError::AdminNotTransferred as u32,
+        11u32, // deprecated: was AdminAlreadyTransferred
+        12u32, // deprecated: was AdminNotTransferred
         StakeError::InsufficientVaultBalance as u32,
         StakeError::InvalidPercolatorProgram as u32,
         StakeError::CpiFailed as u32,
@@ -69,8 +69,7 @@ fn test_all_errors_are_custom() {
         StakeError::MarketResolved,
         StakeError::DepositCapExceeded,
         StakeError::InvalidPda,
-        StakeError::AdminAlreadyTransferred,
-        StakeError::AdminNotTransferred,
+        // 11, 12 deprecated (AdminAlreadyTransferred, AdminNotTransferred)
         StakeError::InsufficientVaultBalance,
         StakeError::InvalidPercolatorProgram,
         StakeError::CpiFailed,
