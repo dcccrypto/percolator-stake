@@ -271,6 +271,26 @@ fn process_init_pool(
         &[vault_auth_seeds],
     )?;
 
+    // Phase 3C FIX-1: pool_pda must be writable before writing state.
+    validate_account_writable(pool_pda)?;
+
+    // Phase 4 FIX-4: Verify the caller-supplied percolator_program matches the known
+    // mainnet program ID.  A fake program could receive PDA signer authority via CPI
+    // and drain the vault.  Gate with #[cfg(not(feature = "test"))] so unit tests can
+    // supply a localnet program ID without failing this check.
+    #[cfg(not(feature = "test"))]
+    {
+        const PERCOLATOR_MAINNET: &str = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
+        let expected_prog: Pubkey = PERCOLATOR_MAINNET.parse().expect("valid pubkey literal");
+        if *percolator_program.key != expected_prog {
+            msg!(
+                "InitPool: percolator_program {} does not match mainnet ID",
+                percolator_program.key
+            );
+            return Err(StakeError::InvalidAccount.into());
+        }
+    }
+
     // Write pool state
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -923,6 +943,8 @@ fn process_flush_to_insurance(
     // operate on attacker-controlled bytes.
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    // Phase 3C FIX-1: pool_pda must be writable before writing state.
+    validate_account_writable(pool_pda)?;
 
     // FINDING-2: Verify token program before the CPI call that grants PDA signer authority.
     // Without this check an attacker can pass a fake token program, receive the PDA
@@ -1068,6 +1090,8 @@ fn process_update_config(
     // without an authentic pool PDA.
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    // Phase 3C FIX-1: pool_pda must be writable before writing state.
+    validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -1176,9 +1200,36 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     // Read vault token account balance (key and owner already verified above)
     let vault_data = vault_ai.try_borrow_data()?;
     let vault_state = crate::spl_token::state::Account::unpack(&vault_data)?;
+    // Phase 3C FIX-2: Reject uninitialized or frozen vault accounts.
+    // An uninitialized vault has zero balance and no valid state — accruing fees
+    // against it would corrupt pool accounting.
+    if vault_state.state != crate::spl_token::state::AccountState::Initialized {
+        msg!("AccrueFees: vault token account is not in Initialized state");
+        return Err(ProgramError::InvalidAccountData);
+    }
     let current_balance = vault_state.amount;
 
     let clock = Clock::from_account_info(clock_ai)?;
+
+    // Phase 4 FIX-6: Rate-limit AccrueFees to prevent spam and griefing.
+    // Calling AccrueFees every slot burns compute and allows fee manipulation in the
+    // same block.  A minimum interval of 10 slots (~4 seconds on mainnet) is cheap to
+    // enforce and closes the intra-block manipulation window.
+    const MIN_ACCRUAL_INTERVAL_SLOTS: u64 = 10;
+    if pool.last_fee_accrual_slot > 0
+        && clock
+            .slot
+            .saturating_sub(pool.last_fee_accrual_slot)
+            < MIN_ACCRUAL_INTERVAL_SLOTS
+    {
+        msg!(
+            "AccrueFees: called too soon (slot {}, last {}, min interval {})",
+            clock.slot,
+            pool.last_fee_accrual_slot,
+            MIN_ACCRUAL_INTERVAL_SLOTS,
+        );
+        return Ok(());
+    }
 
     // BUG-7: Compute the expected vault balance using total_pool_value() rather than
     // manually reconstructing it.  The manual formula
@@ -1279,6 +1330,8 @@ fn process_admin_set_hwm_config(
     // BUG-4: Validate pool account ownership and non-emptiness before reading it.
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
+    // Phase 3C FIX-1: pool_pda must be writable before writing state.
+    validate_account_writable(pool_pda)?;
 
     // Validate hwm_floor_bps before modifying state
     if enabled {
@@ -1333,6 +1386,8 @@ fn process_admin_set_tranche_config(
     // BUG-4: Validate pool account ownership and non-emptiness before reading it.
     validate_account_owner(pool_ai, program_id)?;
     validate_account_not_empty(pool_ai)?;
+    // Phase 3C FIX-1: pool_ai must be writable before writing state.
+    validate_account_writable(pool_ai)?;
 
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -1635,6 +1690,24 @@ fn process_init_trading_pool(
     // AUDIT HIGH-4: Validate pool_pda ownership instead of trusting hardcoded index
     let pool_ai = &accounts[2]; // Pool PDA is account [2] in InitPool (admin=0, slab=1, pool_pda=2)
     validate_account_owner(pool_ai, program_id)?;
+
+    // Phase 4 FIX-5: Re-derive the pool PDA from slab key (accounts[1]) and compare
+    // against accounts[2].  process_init_pool already checked this, but we re-verify
+    // here because accounts[2] is accessed by raw index — if the caller reorders or
+    // duplicates accounts we must not write pool_mode into a wrong account.
+    {
+        let slab_ai = &accounts[1];
+        let (expected_pool, _) = state::derive_pool_pda(program_id, slab_ai.key);
+        if *pool_ai.key != expected_pool {
+            msg!(
+                "InitTradingPool: accounts[2] {} does not match derived pool PDA {}",
+                pool_ai.key,
+                expected_pool,
+            );
+            return Err(StakeError::InvalidPda.into());
+        }
+    }
+
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
         .map_err(|_| ProgramError::InvalidAccountData)?;
@@ -1672,6 +1745,8 @@ fn process_return_insurance(
     }
     verify_token_program(token_program)?;
     validate_account_owner(pool_pda, program_id)?;
+    // Phase 3C FIX-1: pool_pda must be writable before writing state.
+    validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
@@ -1692,7 +1767,7 @@ fn process_return_insurance(
 
     // Validate amount doesn't exceed outstanding insurance
     let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
-    if (amount as u64) > outstanding {
+    if amount > outstanding {
         msg!(
             "ReturnInsurance: amount {} exceeds outstanding insurance {}",
             amount,
@@ -1758,7 +1833,17 @@ fn process_set_market_resolved(
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    // Phase 3C FIX-3: Guard against empty pool_pda before writing.
+    // An attacker could race-create an empty account at the pool PDA address
+    // and trigger this handler before the real InitPool runs, causing a
+    // bytemuck write into zero-length data.
+    if pool_pda.data_is_empty() {
+        msg!("SetMarketResolved: pool_pda account is empty");
+        return Err(StakeError::NotInitialized.into());
+    }
     validate_account_owner(pool_pda, program_id)?;
+    // Phase 3C FIX-1: pool_pda must be writable before writing state.
+    validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
