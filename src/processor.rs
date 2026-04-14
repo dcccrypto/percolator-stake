@@ -280,7 +280,7 @@ fn process_init_pool(
     // supply a localnet program ID without failing this check.
     #[cfg(not(feature = "test"))]
     {
-        const PERCOLATOR_MAINNET: &str = "GM8zjJ8LTBMv9xEsverh6H6wLyevgMHEJXcEzyY3rY24";
+        const PERCOLATOR_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
         let expected_prog: Pubkey = PERCOLATOR_MAINNET.parse().expect("valid pubkey literal");
         if *percolator_program.key != expected_prog {
             msg!(
