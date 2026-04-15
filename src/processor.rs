@@ -1799,6 +1799,34 @@ fn process_admin_set_tranche_config(
         return Err(ProgramError::InvalidArgument);
     }
 
+    // GOVERNANCE: lock the multiplier once any junior LP exists.
+    //
+    // Junior depositors entered under the current junior_fee_mult_bps — it is
+    // the economic term they accepted for taking first-loss exposure.  Since
+    // process_accrue_fees reads the multiplier live (see distribute_fees call)
+    // with no per-epoch snapshot, a mid-life change would:
+    //   - allow admin to pump the multiplier right before AccrueFees to
+    //     extract outsized fees into an admin-controlled junior position, OR
+    //   - allow admin to depress the multiplier to silently reduce junior
+    //     yield below what depositors were promised.
+    //
+    // Allow idempotent re-writes (same value) so admin tooling can re-apply
+    // config without triggering the lock.  After all juniors withdraw
+    // (junior_total_lp == 0), the multiplier is freely configurable for the
+    // next cohort of depositors.
+    if pool.junior_total_lp() > 0
+        && pool.junior_fee_mult_bps() != junior_fee_mult_bps
+    {
+        msg!(
+            "AdminSetTrancheConfig: junior_fee_mult_bps is locked while juniors \
+             exist (current={}, requested={}, junior_total_lp={})",
+            pool.junior_fee_mult_bps(),
+            junior_fee_mult_bps,
+            pool.junior_total_lp()
+        );
+        return Err(StakeError::Unauthorized.into());
+    }
+
     pool.set_tranche_enabled(true);
     pool.set_junior_fee_mult_bps(junior_fee_mult_bps);
 
