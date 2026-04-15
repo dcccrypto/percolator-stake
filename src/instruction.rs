@@ -138,12 +138,13 @@ pub enum StakeInstruction {
     ///   0. `[signer]` Pool admin
     ///   1. `[writable]` Pool PDA (wrapper admin, signs CPI; state updated)
     ///   2. `[writable]` Slab account
-    ///   3. `[writable]` Pool vault token account (receives insurance — "admin_ata" for CPI)
-    ///   4. `[]` Vault authority PDA (owner of pool vault)
+    ///   3. `[]` Vault authority PDA (signer for CPI; owner of pool vault)
+    ///   4. `[writable]` Pool vault token account (receives insurance — "admin_ata" for CPI)
     ///   5. `[writable]` Wrapper vault token account (source)
     ///   6. `[]` Wrapper vault authority PDA
     ///   7. `[]` Percolator program
     ///   8. `[]` Token program
+    ///   9. `[]` Clock sysvar (required by wrapper Tag 23 for post-resolution timing checks)
     ///
     /// 10: AdminWithdrawInsurance — CPIs WithdrawInsuranceLimited (wrapper Tag 23) via vault_auth PDA.
     /// Requires market RESOLVED and SetInsuranceWithdrawPolicy (wrapper Tag 22) called with vault_auth as authority.
