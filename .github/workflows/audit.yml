@@ -1,0 +1,86 @@
+name: Audit
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.cargo/audit.toml'
+      - '.github/workflows/audit.yml'
+  schedule:
+    # Weekly Monday 06:00 UTC — catches dep tree regressions in untouched branches.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Enforces the "dev-only, not in BPF binary" rationale in .cargo/audit.toml
+  # by mechanically asserting that ed25519-dalek 1.x and curve25519-dalek 3.x
+  # (the crates with ignored RustSec advisories RUSTSEC-2022-0093 and
+  # RUSTSEC-2024-0344) do not appear in the on-chain dependency tree.
+  #
+  # `cargo audit` itself is tracked separately — upstream cargo-audit 0.21.x
+  # cannot parse CVSS 4.0 advisories present in the current RustSec DB.
+  # See tracking issue for when to add the audit step back.
+  bpf-tree-shake:
+    name: Verify ignored advisories stay dev-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+        with:
+          toolchain: stable
+      - name: Resolve on-chain (non-dev) dependency tree
+        # -e normal excludes dev-dependencies and build-dependencies.
+        # --prefix none strips tree-drawing characters so crate names start at column 0.
+        # This is the set of crates that end up in the BPF .so.
+        run: |
+          cargo tree -e normal --no-default-features --prefix none > on-chain-tree.txt
+          echo "=== On-chain dependency tree ==="
+          cat on-chain-tree.txt
+      - name: Assert ignored-CVE crates are absent from on-chain tree
+        # .cargo/audit.toml ignores RUSTSEC-2022-0093 (ed25519-dalek <2.0) and
+        # RUSTSEC-2024-0344 (curve25519-dalek timing) with the rationale that
+        # these crates are reachable only via [dev-dependencies] (solana-sdk etc.)
+        # and never link into the on-chain BPF binary.  If a future dep change
+        # pulled either crate into the normal tree, the ignores would become
+        # unsafe — fail CI so the regression is caught before mainnet.
+        #
+        # Grep patterns are version-specific: curve25519-dalek v4.x is
+        # legitimately present in the normal tree via solana-program — only
+        # v3.x has the ignored CVE, so no false positive.
+        run: |
+          set -euo pipefail
+          fail=0
+          if grep -E '^ed25519-dalek v1\.' on-chain-tree.txt; then
+            echo "::error::ed25519-dalek 1.x found in on-chain dependency tree."
+            echo "::error::This invalidates the .cargo/audit.toml ignore for RUSTSEC-2022-0093."
+            echo "::error::Either remove the dependency or remove the audit.toml ignore."
+            fail=1
+          fi
+          if grep -E '^curve25519-dalek v3\.' on-chain-tree.txt; then
+            echo "::error::curve25519-dalek 3.x found in on-chain dependency tree."
+            echo "::error::This invalidates the .cargo/audit.toml ignore for RUSTSEC-2024-0344."
+            echo "::error::Either remove the dependency or remove the audit.toml ignore."
+            fail=1
+          fi
+          if [ "$fail" = "0" ]; then
+            echo "OK: ignored-CVE crates absent from on-chain dependency tree."
+          fi
+          exit $fail
+      - name: Upload dependency tree artifact
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4
+        with:
+          name: on-chain-tree
+          path: on-chain-tree.txt
