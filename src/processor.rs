@@ -138,6 +138,9 @@ pub fn process(
             process_propose_admin(program_id, accounts, new_admin)
         }
         StakeInstruction::AcceptAdmin => process_accept_admin(program_id, accounts),
+        StakeInstruction::BindInsuranceAuthority => {
+            process_bind_insurance_authority(program_id, accounts)
+        }
         StakeInstruction::ReturnInsurance { amount } => {
             process_return_insurance(program_id, accounts, amount)
         }
@@ -1230,6 +1233,85 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     pool.pending_admin = [0u8; 32];
 
     msg!("AcceptAdmin: admin rotation complete");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 19: BindInsuranceAuthority — one-time bind of the v16 market's
+// insurance_authority to our vault_auth PDA (see cpi::cpi_bind_insurance_authority)
+// ═══════════════════════════════════════════════════════════════
+
+/// Admin-invoked one-time bind. CPIs the wrapper's UpdateAuthority(INSURANCE,
+/// vault_auth_pda): the admin co-signs as the CURRENT authority and our PDA
+/// co-signs (invoke_signed) as the NEW authority. This is the ONLY way to make
+/// the market's `insurance_authority` equal a PDA (v16 requires the new authority
+/// to sign, which a plain admin tx can't do for a PDA). Required once after
+/// market creation, before the first FlushToInsurance.
+fn process_bind_insurance_authority(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Validate pool account before bytemuck reinterpretation.
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    // Read pool (immutable — we don't mutate stake state here) and copy out the
+    // fields we need so the borrow is released before the CPI.
+    let (pool_slab, pool_percolator) = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool)?;
+        // Admin-gated: only the pool admin may bind (and the admin must currently
+        // be the market's insurance_authority for the wrapper CPI to succeed).
+        if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        (pool.slab, pool.percolator_program)
+    };
+
+    // Bind to the pool's recorded market + wrapper program (prevents pointing the
+    // bind at an attacker-supplied market/program).
+    if pool_slab != slab.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool_percolator != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // Derive + verify the vault_auth PDA (the new authority we bind).
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    cpi::cpi_bind_insurance_authority(
+        percolator_program,
+        admin,      // current authority (== cfg.insurance_authority at bind time)
+        vault_auth, // new authority (PDA), signed via invoke_signed
+        slab,       // market
+        vault_auth_seeds,
+    )?;
+
+    msg!("BindInsuranceAuthority: market insurance_authority bound to vault_auth PDA");
     Ok(())
 }
 

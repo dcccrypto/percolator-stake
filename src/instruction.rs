@@ -72,6 +72,25 @@ pub enum StakeInstruction {
     ///   7. `[]` Token program
     FlushToInsurance { amount: u64 },
 
+    /// 19: BindInsuranceAuthority — ONE-TIME bind of the v16 market's
+    /// `insurance_authority` to our `vault_auth` PDA, so FlushToInsurance (which
+    /// signs as that PDA) passes v16's authority gate. CPIs the wrapper's
+    /// UpdateAuthority(INSURANCE, vault_auth_pda): the admin co-signs as the
+    /// current authority and the PDA co-signs via invoke_signed as the new
+    /// authority — the only way to bind a PDA (a plain admin tx can't, because the
+    /// wrapper requires the new authority to sign and a PDA cannot sign directly).
+    /// Must be called once after market creation, before the first flush. Fails
+    /// (wrapper Unauthorized) if the admin is no longer the current authority
+    /// (i.e. already bound), making it naturally single-use.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (current insurance_authority; must equal pool.admin)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (the new authority; signed via CPI)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    BindInsuranceAuthority,
+
     /// 4: Admin updates pool configuration.
     ///
     /// Accounts:
@@ -258,6 +277,7 @@ impl StakeInstruction {
             }
             6 => Ok(Self::AcceptAdmin),
             // Tags 7-9, 11 tombstoned — were admin CPI proxies, now removed.
+            19 => Ok(Self::BindInsuranceAuthority),
             10 => {
                 if rest.len() < 8 {
                     return Err(ProgramError::InvalidInstructionData);
@@ -432,6 +452,19 @@ mod tests {
     fn test_unpack_accept_admin() {
         match StakeInstruction::unpack(&[6u8]).unwrap() {
             StakeInstruction::AcceptAdmin => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_bind_insurance_authority() {
+        match StakeInstruction::unpack(&[19u8]).unwrap() {
+            StakeInstruction::BindInsuranceAuthority => {}
+            _ => panic!("wrong variant"),
+        }
+        // trailing bytes are ignored (no payload); still decodes.
+        match StakeInstruction::unpack(&[19u8, 0, 0]).unwrap() {
+            StakeInstruction::BindInsuranceAuthority => {}
             _ => panic!("wrong variant"),
         }
     }

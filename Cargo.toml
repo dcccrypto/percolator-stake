@@ -29,6 +29,21 @@ solana-sdk = "=2.2.1"
 # solana-program-test = "2.1"
 proptest = "1.4"
 
+# Assembled LiteSVM e2e (tests/v16_stake_insurance_e2e.rs): loads the stake .so
+# AND the v16 wrapper .so to drive FlushToInsurance -> TopUpInsurance across the
+# program boundary. litesvm 0.6 targets solana 2.2 (matches our solana-sdk pin),
+# so host types stay 2.2.x; the wrapper .so (built against solana-program 1.18)
+# still loads because BPF load is version-agnostic (same as the 2.2.1 NFT .so
+# loading under the wrapper repo's litesvm). dev-dep only — not in the BPF binary.
+#
+# NOTE: we deliberately do NOT dev-depend on percolator-prog to reuse its
+# encoder/decoder: it pulls solana 1.18's curve25519-dalek v3.2.1 (zeroize <1.4),
+# which is unresolvable against the solana 2.2 graph's zeroize 1.8.2. The e2e
+# instead hand-encodes the one wrapper instruction it sends directly (InitMarket)
+# and asserts the flush via real SPL token-balance movement.
+litesvm = "0.6"
+bytemuck = { version = "1.14", features = ["derive"] }
+
 # Pin crates that use edition2024 manifests (incompatible with cargo-build-sbf's cargo 1.79)
 [patch.crates-io]
 blake3 = { git = "https://github.com/BLAKE3-team/BLAKE3", tag = "1.5.5" }
