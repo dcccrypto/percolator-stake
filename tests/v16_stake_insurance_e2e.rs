@@ -1,11 +1,11 @@
 //! Assembled LiteSVM end-to-end test for the v16 insurance-flush re-bind.
 //!
 //! Loads BOTH on-chain programs into one LiteSVM instance:
-//!   * the percolator-stake .so (this crate, solana-program 2.2.1) at STAKE_ID
-//!   * the v16 wrapper .so (percolator-prog, solana-program 1.18) at WRAPPER_MAINNET
-//! and drives the real cross-program path:
-//!   InitMarket (wrapper) -> BindInsuranceAuthority (stake CPIs wrapper
-//!   UpdateAuthority) -> FlushToInsurance (stake CPIs wrapper TopUpInsurance).
+//! the percolator-stake .so (this crate, solana-program 2.2.1) at STAKE_ID, and
+//! the v16 wrapper .so (percolator-prog, solana-program 1.18) at WRAPPER_MAINNET.
+//! Drives the real cross-program path: InitMarket (wrapper) then
+//! BindInsuranceAuthority (stake CPIs wrapper UpdateAuthority) then
+//! FlushToInsurance (stake CPIs wrapper TopUpInsurance).
 //!
 //! This is the test the stake crate's pure-struct suite CANNOT provide: it
 //! exercises the actual u128 wire, the authority binding, and Live-mode gate
@@ -153,6 +153,7 @@ struct Env {
     admin: Keypair,
     payer: Keypair,
     market: Pubkey,
+    #[allow(dead_code)]
     mint: Pubkey,
     wrapper_vault: Pubkey,
     pool_pda: Pubkey,
@@ -168,8 +169,8 @@ impl Env {
         let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
         let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-        svm.add_program_from_file(stake_id, &stake_so()).unwrap();
-        svm.add_program_from_file(wrapper_id, &wrapper_so())
+        svm.add_program_from_file(stake_id, stake_so()).unwrap();
+        svm.add_program_from_file(wrapper_id, wrapper_so())
             .unwrap();
 
         let payer = Keypair::new();
@@ -342,8 +343,8 @@ fn smoke_both_programs_load() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
-    svm.add_program_from_file(stake_id, &stake_path).unwrap();
-    svm.add_program_from_file(wrapper_id, &wrapper_path)
+    svm.add_program_from_file(stake_id, stake_path).unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_path)
         .unwrap();
     assert!(svm.get_account(&stake_id).unwrap().executable);
     assert!(svm.get_account(&wrapper_id).unwrap().executable);
@@ -422,7 +423,7 @@ fn flush_unbound_authority_rejected_with_unauthorized() {
 fn setup_pool_only(admin: &Pubkey) -> (LiteSVM, Pubkey, Pubkey) {
     let mut svm = LiteSVM::new();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
-    svm.add_program_from_file(stake_id, &stake_so()).unwrap();
+    svm.add_program_from_file(stake_id, stake_so()).unwrap();
     let slab = Pubkey::new_unique();
     let (pool_pda, _) = derive_pool_pda(&stake_id, &slab);
     let mut pool = StakePool::zeroed();
@@ -840,9 +841,9 @@ fn no_lockout_rotate_then_rebind_from_new_program() {
     let stake_id_2 = Pubkey::new_unique(); // the "redeployed" stake program
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    svm.add_program_from_file(stake_id, &stake_so()).unwrap();
-    svm.add_program_from_file(stake_id_2, &stake_so()).unwrap();
-    svm.add_program_from_file(wrapper_id, &wrapper_so())
+    svm.add_program_from_file(stake_id, stake_so()).unwrap();
+    svm.add_program_from_file(stake_id_2, stake_so()).unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_so())
         .unwrap();
 
     let admin = Keypair::new();

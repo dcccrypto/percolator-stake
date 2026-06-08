@@ -1991,7 +1991,7 @@ fn process_return_insurance(
 
     // Validate amount doesn't exceed outstanding insurance
     let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
-    if (amount as u64) > outstanding {
+    if amount > outstanding {
         msg!(
             "ReturnInsurance: amount {} exceeds outstanding insurance {}",
             amount,
