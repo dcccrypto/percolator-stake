@@ -518,6 +518,197 @@ mod kani_proofs {
     }
 
     // ═══════════════════════════════════════════════════════════
+    // effective_junior_balance Wrapper Composition
+    // ═══════════════════════════════════════════════════════════
+    //
+    // effective_junior_balance is consumed by every junior deposit
+    // (process_deposit_junior) for LP pricing and every junior
+    // withdrawal (process_withdraw) for collateral valuation.  It
+    // composes distribute_loss (already Kani-proven in the proofs
+    // above) with a derivation of gross_senior from raw accounting
+    // fields.  distribute_loss is proven in isolation; these proofs
+    // verify the wrapper composition, including the net_loss == 0
+    // short-circuit, the gross_senior derivation, and the final
+    // saturating_sub — the region involved in the prior BUG-6 fix
+    // where losses were previously double-applied on the junior side.
+
+    /// Panic-freedom for effective_junior_balance across arbitrary
+    /// accounting states (including pathological ones like
+    /// withdrawn > deposited).  All internal arithmetic uses
+    /// saturating_sub or the already-proven distribute_loss.
+    #[kani::proof]
+    fn proof_effective_junior_balance_no_panic() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let junior_balance: u64 = kani::any();
+        let total_deposited: u64 = kani::any();
+        let total_withdrawn: u64 = kani::any();
+        let total_flushed: u64 = kani::any();
+        let total_returned: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(total_deposited <= 1_000_000_000);
+        kani::assume(total_withdrawn <= 1_000_000_000);
+        kani::assume(total_flushed <= 1_000_000_000);
+        kani::assume(total_returned <= 1_000_000_000);
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        pool.set_tranche_enabled(true);
+        pool.set_junior_balance(junior_balance);
+        pool.total_deposited = total_deposited;
+        pool.total_withdrawn = total_withdrawn;
+        pool.total_flushed = total_flushed;
+        pool.total_returned = total_returned;
+
+        // If we reach here without panicking, the proof passes.
+        let _ = pool.effective_junior_balance();
+    }
+
+    /// effective_junior_balance() <= junior_balance() for ALL inputs.
+    /// Loss adjustment can only DECREASE the junior side, never inflate.
+    /// This is the load-bearing invariant LP-pricing call sites depend on.
+    #[kani::proof]
+    fn proof_effective_junior_balance_bounded_by_raw() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let junior_balance: u64 = kani::any();
+        let total_deposited: u64 = kani::any();
+        let total_withdrawn: u64 = kani::any();
+        let total_flushed: u64 = kani::any();
+        let total_returned: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(total_deposited <= 1_000_000_000);
+        kani::assume(total_withdrawn <= 1_000_000_000);
+        kani::assume(total_flushed <= 1_000_000_000);
+        kani::assume(total_returned <= 1_000_000_000);
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        pool.set_tranche_enabled(true);
+        pool.set_junior_balance(junior_balance);
+        pool.total_deposited = total_deposited;
+        pool.total_withdrawn = total_withdrawn;
+        pool.total_flushed = total_flushed;
+        pool.total_returned = total_returned;
+
+        let eff = pool.effective_junior_balance();
+
+        // Non-vacuity: the loss-application branch is reachable beyond
+        // the trivial net_loss == 0 short-circuit.
+        kani::cover!(
+            eff < junior_balance,
+            "loss-application branch is reachable"
+        );
+
+        assert!(
+            eff <= junior_balance,
+            "effective_junior_balance must never exceed stored junior_balance"
+        );
+    }
+
+    /// When total_flushed == total_returned (no outstanding insurance
+    /// loss), effective_junior_balance() == junior_balance() exactly.
+    /// Pins the net_loss == 0 early-return: a regression that mis-derives
+    /// gross_senior could silently apply a non-zero junior_loss even on
+    /// lossless pools, causing depositors to over-pay for junior LP.
+    #[kani::proof]
+    fn proof_effective_junior_balance_no_loss_identity() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let junior_balance: u64 = kani::any();
+        let total_deposited: u64 = kani::any();
+        let total_withdrawn: u64 = kani::any();
+        let flushed_eq_returned: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(total_deposited <= 1_000_000_000);
+        kani::assume(total_withdrawn <= 1_000_000_000);
+        kani::assume(flushed_eq_returned <= 1_000_000_000);
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        pool.set_tranche_enabled(true);
+        pool.set_junior_balance(junior_balance);
+        pool.total_deposited = total_deposited;
+        pool.total_withdrawn = total_withdrawn;
+        // Key precondition: no outstanding insurance loss.
+        pool.total_flushed = flushed_eq_returned;
+        pool.total_returned = flushed_eq_returned;
+
+        kani::cover!(
+            junior_balance > 0,
+            "identity holds for non-trivial junior_balance"
+        );
+
+        assert_eq!(
+            pool.effective_junior_balance(),
+            junior_balance,
+            "no-loss pool must not adjust junior balance"
+        );
+    }
+
+    /// Tranche conservation: effective_junior + senior == total_pool_value
+    /// when both are well-defined.  senior_balance() is derived as
+    /// total_pool_value() - effective_junior_balance(), so this proves
+    /// the two derived getters are mutually consistent — no value is
+    /// created or destroyed by the tranche split.  Pins the implicit
+    /// precondition senior_balance's checked_sub relies on.
+    #[kani::proof]
+    fn proof_effective_junior_tranche_conservation() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+
+        let junior_balance: u64 = kani::any();
+        let total_deposited: u64 = kani::any();
+        let total_withdrawn: u64 = kani::any();
+        let total_flushed: u64 = kani::any();
+        let total_returned: u64 = kani::any();
+
+        kani::assume(junior_balance <= 1_000_000_000);
+        kani::assume(total_deposited <= 1_000_000_000);
+        kani::assume(total_withdrawn <= 1_000_000_000);
+        kani::assume(total_flushed <= 1_000_000_000);
+        kani::assume(total_returned <= 1_000_000_000);
+
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        pool.set_tranche_enabled(true);
+        pool.set_junior_balance(junior_balance);
+        pool.total_deposited = total_deposited;
+        pool.total_withdrawn = total_withdrawn;
+        pool.total_flushed = total_flushed;
+        pool.total_returned = total_returned;
+
+        // Only meaningful when the pool accounting is consistent enough
+        // for total_pool_value() and senior_balance() to be well-defined.
+        let tpv = match pool.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let senior = match pool.senior_balance() {
+            Some(v) => v,
+            None => return,
+        };
+        let junior = pool.effective_junior_balance();
+
+        kani::cover!(
+            junior > 0 && senior > 0,
+            "both tranches non-empty"
+        );
+
+        assert_eq!(
+            junior + senior,
+            tpv,
+            "tranche conservation violated: junior + senior != total_pool_value"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // PERC-313: High-Water Mark Floor
     // ═══════════════════════════════════════════════════════════
 
