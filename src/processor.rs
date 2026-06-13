@@ -1521,6 +1521,29 @@ fn process_admin_set_insurance_policy(
         return Err(ProgramError::InvalidArgument);
     }
 
+    // SECURITY: The wrapper's policy `authority` MUST be the vault_auth PDA.
+    // process_admin_withdraw_insurance (Tag 10) signs the matching
+    // WithdrawInsuranceLimited CPI with vault_auth_seeds — that is the ONLY
+    // signer the stake program can produce for this path.  If the admin sets
+    // any other authority here, they (or anyone with that key) can bypass the
+    // stake program entirely by calling the wrapper's WithdrawInsuranceLimited
+    // directly.  Funds extract to the attacker while pool.total_returned is
+    // never incremented, silently desyncing total_pool_value() from reality
+    // and corrupting LP redemption math.
+    //
+    // This mirrors the vault_auth derivation/check in
+    // process_admin_withdraw_insurance at lines 1418-1422.
+    let (expected_vault_auth, _) =
+        Pubkey::find_program_address(&[b"vault_auth", pool_pda.key.as_ref()], program_id);
+    if authority != &expected_vault_auth {
+        msg!(
+            "AdminSetInsurancePolicy: authority must equal vault_auth PDA (expected {}, got {})",
+            expected_vault_auth,
+            authority
+        );
+        return Err(StakeError::InvalidPda.into());
+    }
+
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
