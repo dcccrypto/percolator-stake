@@ -261,12 +261,12 @@ pub fn distribute_fees(
         let q = (total_fee as u128) / total_weight;
         let r = (total_fee as u128) % total_weight;
         let part1 = q * junior_weight; // q ≤ 2^64, junior_weight ≤ 2^80 → fits u128
-        // For part2: r < total_weight ≤ 2^81, junior_weight ≤ 2^80 → product ≤ 2^161
-        // Use checked_mul; if it overflows clamp part2 to total_fee (conservative safe bound).
-        let part2 = r
-            .checked_mul(junior_weight)
-            .map(|p| p / total_weight)
-            .unwrap_or(total_fee as u128);
+        // part2 = floor(r * junior_weight / total_weight). r < total_weight ≤ ~2^81 and
+        // junior_weight ≤ ~2^80, so r * junior_weight (~2^161) overflows u128. The previous
+        // `unwrap_or(total_fee)` fallback on that overflow handed junior 100% of the fee
+        // (0% to the protected senior tranche) — see #120. Use an exact, overflow-safe
+        // 256-bit mul-div instead. The true result is < junior_weight ≤ ~2^80, so it fits.
+        let part2 = mul_div_floor(r, junior_weight, total_weight);
         part1.saturating_add(part2)
     };
     // Clamp to total_fee (should always hold since junior_weight <= total_weight)
@@ -274,6 +274,54 @@ pub fn distribute_fees(
     let senior_fee = total_fee.saturating_sub(junior_fee); // remainder to senior
 
     (junior_fee, senior_fee)
+}
+
+/// Exact `floor(a * b / d)` for u128 operands, overflow-safe even when `a * b`
+/// exceeds u128. Requires `d != 0` and the true quotient to fit in u128 (callers
+/// guarantee this: here `b <= d`, so the quotient is `<= a`). Used by
+/// `distribute_fees` so the fee split is correct at extreme balances/fee values
+/// where the naive `a * b` overflows (#120).
+fn mul_div_floor(a: u128, b: u128, d: u128) -> u128 {
+    // Fast path: the product fits in u128.
+    if let Some(p) = a.checked_mul(b) {
+        return p / d;
+    }
+    // Slow path: form the full 256-bit product a*b = hi*2^128 + lo via 64-bit limbs,
+    // then long-divide (hi:lo) by d bit by bit.
+    let mask = u64::MAX as u128;
+    let (a0, a1) = (a & mask, a >> 64);
+    let (b0, b1) = (b & mask, b >> 64);
+    let m0 = a0 * b0; // each < 2^128
+    let m1 = a0 * b1;
+    let m2 = a1 * b0;
+    let m3 = a1 * b1;
+    // mid = m1 + m2 (the cross terms), tracking the carry bit that overflows u128.
+    let (mid, mid_carry) = {
+        let (s, c) = m1.overflowing_add(m2);
+        (s, c as u128)
+    };
+    // lo = m0 + (mid_low << 64); carry + mid_high + mid_carry + m3 go to hi.
+    let (lo, c1) = m0.overflowing_add(mid << 64);
+    let hi = m3 + (mid >> 64) + (mid_carry << 64) + (c1 as u128);
+    // Long division of (hi:lo) by d. The quotient fits u128 because the true result
+    // is <= a; bits at positions >= 128 are therefore always 0.
+    let mut rem: u128 = 0;
+    let mut quo: u128 = 0;
+    let mut i: u32 = 256;
+    while i > 0 {
+        i -= 1;
+        let bit = if i >= 128 { (hi >> (i - 128)) & 1 } else { (lo >> i) & 1 };
+        let rem_top = rem >> 127; // bit shifted out of the 128-bit rem below
+        rem = (rem << 1) | bit;
+        // Compare the true remainder (rem_top:rem) against d; reduce if >=.
+        if rem_top == 1 || rem >= d {
+            rem = rem.wrapping_sub(d);
+            if i < 128 {
+                quo |= 1u128 << i;
+            }
+        }
+    }
+    quo
 }
 
 /// Check senior never loses while junior is positive.
@@ -692,6 +740,53 @@ mod tests {
         let (jf, sf) = distribute_fees(1000, 4000, 20000, 0);
         assert_eq!(jf, 0);
         assert_eq!(sf, 0);
+    }
+
+    // #120: at extreme balances/fee the inner `r * junior_weight` overflows u128.
+    // The old fallback handed junior 100%; these assert the exact proportional split.
+    // Expected values computed with arbitrary-precision integers (junior = floor(
+    // total_fee * junior_weight / total_weight), senior = total_fee - junior).
+    #[test]
+    fn test_distribute_fees_overflow_proportional() {
+        let max = u64::MAX;
+        // Symmetric, 5x junior mult → junior weight 50000, senior 10000 → 5/6 vs 1/6.
+        let (jf, sf) = distribute_fees(max, max, 50000, max);
+        assert_eq!(jf, 15372286728091293012);
+        assert_eq!(sf, 3074457345618258603);
+        assert_eq!((jf as u128) + (sf as u128), max as u128); // conservation
+        assert!(sf > 0, "#120: protected senior must not be zeroed out");
+
+        // Junior-heavy.
+        let (jf, sf) = distribute_fees(max, 1_000_000, 50000, max);
+        assert_eq!(jf, 18446744073709351615);
+        assert_eq!(sf, 200000);
+
+        // Senior-heavy.
+        let (jf, sf) = distribute_fees(1_000_000, max, 50000, max);
+        assert_eq!(jf, 4999999);
+        assert_eq!(sf, 18446744073704551616);
+
+        // Mid-range values that still overflow the naive product.
+        let (jf, sf) = distribute_fees(max / 2, max / 3, 30000, max / 7);
+        assert_eq!(jf, 2156112943680337201);
+        assert_eq!(sf, 479136209706741601);
+    }
+
+    #[test]
+    fn test_mul_div_floor_matches_native_when_product_fits() {
+        // Fast-path agreement with the native computation across a range of values.
+        for &(a, b, d) in &[
+            (1_000_000u128, 500_000u128, 1_500_000u128),
+            (0, 123, 7),
+            (u64::MAX as u128, 3, 7),
+            (12345678, 87654321, 999983),
+            (1, 1, 1),
+        ] {
+            assert_eq!(mul_div_floor(a, b, d), (a * b) / d);
+        }
+        // Slow-path (a*b overflows u128) sanity: floor(2^120 * 2^120 / 2^120) == 2^120.
+        let big = 1u128 << 120;
+        assert_eq!(mul_div_floor(big, big, big), big);
     }
 
     #[test]
