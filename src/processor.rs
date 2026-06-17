@@ -440,6 +440,22 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         return Err(StakeError::InvalidPda.into());
     }
 
+    // JIT fee-snipe fix: crystallize any pending trading-fee surplus into share
+    // price BEFORE pricing this deposit, so LP cannot be minted at the stale
+    // pre-accrual price and capture fees earned before the depositor joined.
+    // Mode-1 only; the vault balance is read here (before the user->vault transfer
+    // below) so only the fee surplus — not this deposit's own collateral — is folded.
+    if pool.pool_mode == 1 {
+        if *vault.owner != crate::spl_token::id() {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let current_balance = {
+            let vault_data = vault.try_borrow_data()?;
+            crate::spl_token::state::Account::unpack(&vault_data)?.amount
+        };
+        accrue_fees_inner(pool, current_balance)?;
+    }
+
     // H1: Require admin transfer before accepting deposits.
     // Without this, users can deposit into a pool where the stake program
     // doesn't yet have admin control over the wrapper — their funds would
@@ -693,6 +709,22 @@ fn process_withdraw(
     }
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
+    }
+
+    // JIT fee-snipe fix: crystallize any pending trading-fee surplus into share
+    // price BEFORE pricing this withdrawal, so the withdrawer realizes their fair
+    // share of earned fees (and the HWM floor sees true TVL) rather than redeeming
+    // at the stale pre-accrual price. Mode-1 only; read the vault balance before the
+    // vault->user transfer below.
+    if pool.pool_mode == 1 {
+        if *vault.owner != crate::spl_token::id() {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let current_balance = {
+            let vault_data = vault.try_borrow_data()?;
+            crate::spl_token::state::Account::unpack(&vault_data)?.amount
+        };
+        accrue_fees_inner(pool, current_balance)?;
     }
 
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority.
@@ -1572,6 +1604,72 @@ fn process_admin_set_insurance_policy(
 /// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
 /// To keep it simple and trustless: we track the vault token account balance directly.
 /// Any increase in vault balance beyond deposits is fee revenue.
+/// Crystallize any un-accrued vault surplus into pool share price. Shared by the
+/// permissionless `AccrueFees` instruction and the deposit/withdraw pre-accrue guard
+/// so both apply identical accounting.
+///
+/// `current_balance` MUST be the balance of the verified vault token account read
+/// BEFORE any deposit transfer in the calling instruction — otherwise the deposit's
+/// own collateral would be mis-credited as fees. The caller must have already
+/// confirmed `pool.pool_mode == 1` and verified the vault account's key + SPL-Token
+/// ownership. Mutates only `pool`. No-op when there is no surplus or no LP holders,
+/// preserving the first-depositor bootstrap / anti-brick guard.
+fn accrue_fees_inner(pool: &mut state::StakePool, current_balance: u64) -> ProgramResult {
+    // total_pool_value() = deposited - withdrawn - flushed + returned + fees_earned (mode 1)
+    let pool_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+
+    // Only accrue when there are active LP holders. Accruing with total_lp_supply == 0
+    // would set total_fees_earned > 0 at zero supply, tripping calc_lp_for_deposit's
+    // orphaned-value guard and permanently bricking the first deposit.
+    if current_balance > pool_value && pool.total_lp_supply > 0 {
+        let fee_delta = current_balance - pool_value;
+
+        // Snapshot pre-fee tranche balances BEFORE incrementing total_fees_earned:
+        // senior_balance() derives from total_pool_value() (which includes
+        // total_fees_earned), so reading it post-increment would inflate the senior
+        // weight in distribute_fees and shortchange the junior tranche.
+        let distribute_to_junior = pool.tranche_enabled() && pool.junior_total_lp() > 0;
+        let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
+            (
+                pool.junior_balance(),
+                pool.senior_balance().ok_or(StakeError::Overflow)?,
+            )
+        } else {
+            (0, 0)
+        };
+
+        pool.total_fees_earned = pool
+            .total_fees_earned
+            .checked_add(fee_delta)
+            .ok_or(StakeError::Overflow)?;
+
+        // Distribute the fee delta between junior/senior sub-pools (junior gets its
+        // multiplier-weighted share; senior implicitly receives the remainder since
+        // senior_balance derives from total_pool_value() which already grew by fee_delta).
+        if distribute_to_junior {
+            let (junior_fee, _) = crate::math::distribute_fees(
+                snapshot_junior_bal,
+                snapshot_senior_bal,
+                pool.junior_fee_mult_bps(),
+                fee_delta,
+            );
+            pool.set_junior_balance(
+                pool.junior_balance()
+                    .checked_add(junior_fee)
+                    .ok_or(StakeError::Overflow)?,
+            );
+        }
+
+        msg!(
+            "accrue_fees: accrued {} fees, total_fees_earned={}",
+            fee_delta,
+            pool.total_fees_earned
+        );
+    }
+
+    Ok(())
+}
+
 fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
@@ -1643,76 +1741,10 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
 
     let clock = Clock::from_account_info(clock_ai)?;
 
-    // BUG-7: Compute the expected vault balance using total_pool_value() rather than
-    // manually reconstructing it.  The manual formula
-    //   pool_value = total_deposited - total_withdrawn + total_fees_earned
-    // omits total_flushed and total_returned.  For trading LP pools (mode 1), flush
-    // operations should not occur (guarded in FlushToInsurance), but if total_flushed
-    // or total_returned are ever non-zero the stale formula produces an incorrect
-    // fee_delta, potentially double-counting or missing fees.
-    // total_pool_value() = deposited - withdrawn - flushed + returned + fees_earned (mode 1)
-    // which is the authoritative expected balance.
-    let pool_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
-
-    // Only accrue fees when there are active LP holders.
-    // If total_lp_supply == 0 and a balance surplus exists, accruing it would set
-    // total_fees_earned > 0 while total_lp_supply == 0.  The first depositor check in
-    // calc_lp_for_deposit (total_lp_supply==0 && pool_value==0) would then fail, blocking
-    // ALL future deposits and permanently locking the pool.  An attacker can trigger this
-    // by sending even 1 token directly to the vault before the first deposit.
-    if current_balance > pool_value && pool.total_lp_supply > 0 {
-        let fee_delta = current_balance - pool_value;
-
-        // Snapshot pre-fee tranche balances BEFORE incrementing total_fees_earned.
-        // senior_balance() derives from total_pool_value() which includes
-        // total_fees_earned.  Reading it after the increment inflates the senior
-        // weight in distribute_fees, systematically shortchanging the junior
-        // tranche (~6% per cycle on equal balances with a 2x multiplier).
-        let distribute_to_junior =
-            pool.tranche_enabled() && pool.junior_total_lp() > 0;
-        let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
-            (
-                pool.junior_balance(),
-                pool.senior_balance().ok_or(StakeError::Overflow)?,
-            )
-        } else {
-            (0, 0)
-        };
-
-        pool.total_fees_earned = pool
-            .total_fees_earned
-            .checked_add(fee_delta)
-            .ok_or(StakeError::Overflow)?;
-
-        // PERC-303: If tranches are active, distribute the fee delta between
-        // junior and senior sub-pools using the junior fee multiplier.
-        // Without this call, junior LPs receive ZERO benefit from junior_fee_mult_bps
-        // — all fees accrue to the global pool and senior LPs capture the entire yield.
-        // distribute_fees returns (junior_fee, senior_fee) that sum to <= fee_delta.
-        if distribute_to_junior {
-            let (junior_fee, _) = crate::math::distribute_fees(
-                snapshot_junior_bal,
-                snapshot_senior_bal,
-                pool.junior_fee_mult_bps(),
-                fee_delta,
-            );
-            // Credit junior sub-pool with its share. Senior implicitly receives
-            // the remainder (fee_delta - junior_fee) since senior_balance is derived
-            // as total_pool_value() - junior_balance and total_fees_earned was already
-            // incremented by the full fee_delta above.
-            pool.set_junior_balance(
-                pool.junior_balance()
-                    .checked_add(junior_fee)
-                    .ok_or(StakeError::Overflow)?,
-            );
-        }
-
-        msg!(
-            "AccrueFees: accrued {} fees, total_fees_earned={}",
-            fee_delta,
-            pool.total_fees_earned
-        );
-    }
+    // Crystallize the un-accrued vault surplus into pool share price. Shared with
+    // the deposit/withdraw pre-accrue guard (see accrue_fees_inner) so the JIT
+    // fee-snipe — minting/burning LP at a stale pre-fee price — is closed everywhere.
+    accrue_fees_inner(pool, current_balance)?;
 
     pool.last_fee_accrual_slot = clock.slot;
     pool.last_vault_snapshot = current_balance;
@@ -1914,6 +1946,22 @@ fn process_deposit_junior(
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
+
+    // JIT fee-snipe fix: crystallize any pending trading-fee surplus into share
+    // price BEFORE pricing this junior deposit, so junior LP cannot be minted at the
+    // stale pre-accrual price and capture the junior tranche's pending fee share.
+    // Mode-1 only; read the vault balance before the user->vault transfer below.
+    if pool.pool_mode == 1 {
+        if *vault.owner != crate::spl_token::id() {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let current_balance = {
+            let vault_data = vault.try_borrow_data()?;
+            crate::spl_token::state::Account::unpack(&vault_data)?.amount
+        };
+        accrue_fees_inner(pool, current_balance)?;
+    }
+
     if pool.admin_transferred != 1 {
         return Err(StakeError::AdminNotTransferred.into());
     }
