@@ -514,21 +514,23 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // cheap and redeem dear after a junior-absorbed loss, extracting value from
     // existing senior LPs.
     //
-    // Bootstrap: when no senior LP is outstanding (senior_total_lp == 0) there is
-    // no senior holder to dilute, so the first senior depositor is seeded 1:1
-    // (standard first-depositor convention). This deliberately covers the case
-    // where junior deposited first and a fee/loss left senior_balance > 0 with
-    // zero senior LP — delegating to the sub-pool helper there would hit the
-    // orphaned-value guard and permanently brick the senior tranche.
+    // First-senior bootstrap and the orphaned-value (C9) guard are handled INSIDE
+    // calc_senior_lp_for_deposit (it delegates to calc_lp_for_deposit) — NOT
+    // special-cased here. A *true* first senior deposit has senior_balance == 0
+    // (an empty pool, or a junior-first pool where junior captures 100% of fees,
+    // so senior_balance stays 0), which mints 1:1. The ONLY state with
+    // senior_total_lp == 0 while senior_balance > 0 is ORPHANED senior value (all
+    // senior LP exited, then insurance was returned post-resolution): there the
+    // C9 guard returns None and we REJECT, exactly as the non-tranche path does.
+    // Seeding 1:1 against an orphan (an earlier version of this branch did) is a
+    // C9 bypass — a 1-token deposit would mint 1 LP against the orphan and redeem
+    // the whole orphaned balance. So senior_total_lp == 0 is NOT bootstrapped 1:1
+    // unconditionally; it defers to the same guard the global path uses.
     let lp_to_mint = if pool.tranche_enabled() {
         let senior_lp = pool.senior_total_lp();
-        if senior_lp == 0 {
-            amount
-        } else {
-            let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
-            crate::math::calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
-                .ok_or(StakeError::Overflow)?
-        }
+        let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+        crate::math::calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
+            .ok_or(StakeError::Overflow)?
     } else {
         pool.calc_lp_for_deposit(amount).ok_or(StakeError::Overflow)?
     };

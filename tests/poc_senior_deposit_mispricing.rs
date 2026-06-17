@@ -11,8 +11,12 @@
 //! ── The fix ──────────────────────────────────────────────────────────────────
 //! `process_deposit` now prices senior deposits against the senior sub-pool via
 //! `math::calc_senior_lp_for_deposit(senior_total_lp(), senior_balance(), amount)`
-//! when `tranche_enabled()`, with a `senior_total_lp() == 0` first-depositor 1:1
-//! bootstrap. This mirrors the junior deposit path and the senior withdraw path.
+//! when `tranche_enabled()`. The first-senior deposit AND the orphaned-value (C9)
+//! guard are handled inside that helper (it delegates to `calc_lp_for_deposit`): a
+//! true first senior (`senior_balance == 0`) mints 1:1, while orphaned senior value
+//! (`senior_total_lp == 0 && senior_balance > 0`) is REJECTED. This mirrors the
+//! junior deposit path and the senior withdraw path. See `poc_senior_bootstrap_orphan`
+//! for the orphan-rejection regression guard.
 //!
 //! These tests model deposits/withdrawals on the pool struct exactly as the repo's
 //! `tests/integration.rs` does (no runtime), exercising the same functions the
@@ -42,15 +46,17 @@ fn senior_deposit_global(pool: &mut StakePool, amount: u64) -> u64 {
 }
 
 /// Fixed senior deposit pricing — mirrors the post-fix `process_deposit` tranche
-/// branch: senior sub-pool ratio, with the `senior_total_lp() == 0` 1:1 bootstrap.
+/// branch: ALWAYS prices against the senior sub-pool via `calc_senior_lp_for_deposit`,
+/// with NO special-case `senior_total_lp() == 0` bootstrap. The helper handles the
+/// true first senior (`senior_balance == 0` → 1:1) and rejects orphaned senior value
+/// (`senior_balance > 0` with no senior LP) itself. `.expect()` here only covers the
+/// legitimate (non-orphan) states these tests build; orphan rejection is exercised in
+/// `poc_senior_bootstrap_orphan`.
 fn senior_deposit_fixed(pool: &mut StakePool, amount: u64) -> u64 {
     let senior_lp = pool.senior_total_lp();
-    let lp = if senior_lp == 0 {
-        amount
-    } else {
-        let senior_bal = pool.senior_balance().expect("senior_balance");
-        calc_senior_lp_for_deposit(senior_lp, senior_bal, amount).expect("calc_senior_lp_for_deposit")
-    };
+    let senior_bal = pool.senior_balance().expect("senior_balance");
+    let lp = calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
+        .expect("calc_senior_lp_for_deposit");
     pool.total_deposited += amount;
     pool.total_lp_supply += lp;
     lp
@@ -121,9 +127,10 @@ fn senior_subpool_pricing_prevents_extraction() {
 
 #[test]
 fn bootstrap_first_senior_deposit_does_not_brick() {
-    // First senior deposit into a junior-only pool (senior_total_lp == 0) must
-    // succeed 1:1 rather than hitting the orphaned-value guard and bricking the
-    // senior tranche.
+    // First senior deposit into a junior-only pool (senior_total_lp == 0,
+    // senior_balance == 0) must succeed 1:1 via the helper's first-depositor path
+    // — NOT be rejected by the orphaned-value guard (which only fires when
+    // senior_balance > 0). A legitimate first senior must not be bricked.
     let mut pool = initialized_pool();
     pool.set_tranche_enabled(true);
     pool.set_junior_balance(1_000_000);

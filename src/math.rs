@@ -135,9 +135,15 @@ pub fn calc_junior_lp_for_deposit(
 /// round-trip cannot profit. Pricing senior deposits at the GLOBAL ratio while
 /// redeeming at the senior ratio lets a depositor mint cheap and redeem dear after
 /// a junior-absorbed loss, extracting value from existing senior LPs. Delegates to
-/// `calc_lp_for_deposit`, inheriting its round-DOWN (pool-favoring) semantics. The
-/// first-senior-deposit bootstrap (`senior_total_lp == 0`) is handled by the caller
-/// (`process_deposit`) so a legitimate orphaned-senior-value state is not bricked.
+/// `calc_lp_for_deposit`, inheriting its round-DOWN (pool-favoring) semantics AND
+/// its first-depositor / orphaned-value (C9) handling: a true first senior deposit
+/// (`senior_total_lp == 0 && senior_balance == 0` — empty pool, or junior-first
+/// where junior captures 100% of fees) mints 1:1, while ORPHANED senior value
+/// (`senior_total_lp == 0 && senior_balance > 0`, e.g. insurance returned after all
+/// senior LP exited) returns `None` so the caller REJECTS the deposit. Minting 1:1
+/// against an orphan would let a dust deposit redeem the whole orphaned balance, so
+/// the caller MUST NOT special-case `senior_total_lp == 0` into an unconditional
+/// 1:1 bootstrap — it defers to this guard, exactly as the non-tranche path does.
 ///
 /// # Returns
 /// * `Some(lp_tokens)` to mint (rounds DOWN — pool-favoring, same as junior/global)
