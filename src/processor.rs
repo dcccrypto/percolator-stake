@@ -22,10 +22,21 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
-/// Validate cooldown_slots parameter: must be > 0 to enforce cooldown.
+/// Upper bound on cooldown_slots (~1 year at ~2.5 slots/sec ≈ 78.84M slots). Long
+/// enough for any realistic withdrawal cooldown, but finite so an admin cannot set
+/// cooldown_slots = u64::MAX (via InitPool/UpdateConfig) and permanently lock
+/// withdrawals — `clock.slot` would never reach the saturating deadline (#121).
+const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
+
+/// Validate cooldown_slots parameter: must be > 0 to enforce cooldown, and bounded
+/// above so it cannot be used to permanently freeze withdrawals.
 fn validate_cooldown_slots(cooldown_slots: u64) -> ProgramResult {
     if cooldown_slots == 0 {
         msg!("Invalid cooldown_slots: cannot be 0 (would disable cooldown protection)");
+        return Err(ProgramError::InvalidArgument);
+    }
+    if cooldown_slots > MAX_COOLDOWN_SLOTS {
+        msg!("Invalid cooldown_slots: exceeds maximum (~1 year of slots); would permanently lock withdrawals");
         return Err(ProgramError::InvalidArgument);
     }
     Ok(())
