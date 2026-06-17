@@ -503,10 +503,35 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         }
     }
 
-    // Calculate LP tokens to mint
-    let lp_to_mint = pool
-        .calc_lp_for_deposit(amount)
-        .ok_or(StakeError::Overflow)?;
+    // Calculate LP tokens to mint.
+    //
+    // When tranches are enabled this is the SENIOR deposit path (junior deposits
+    // go through process_deposit_junior). It MUST price against the senior
+    // sub-pool (senior_balance / senior_total_lp) — the same basis the senior
+    // WITHDRAW path values against (see calc_senior_collateral_for_withdraw) and
+    // mirroring process_deposit_junior. Pricing senior deposits at the GLOBAL
+    // ratio while redeeming at the senior ratio let an unprivileged user mint
+    // cheap and redeem dear after a junior-absorbed loss, extracting value from
+    // existing senior LPs.
+    //
+    // Bootstrap: when no senior LP is outstanding (senior_total_lp == 0) there is
+    // no senior holder to dilute, so the first senior depositor is seeded 1:1
+    // (standard first-depositor convention). This deliberately covers the case
+    // where junior deposited first and a fee/loss left senior_balance > 0 with
+    // zero senior LP — delegating to the sub-pool helper there would hit the
+    // orphaned-value guard and permanently brick the senior tranche.
+    let lp_to_mint = if pool.tranche_enabled() {
+        let senior_lp = pool.senior_total_lp();
+        if senior_lp == 0 {
+            amount
+        } else {
+            let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
+            crate::math::calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
+                .ok_or(StakeError::Overflow)?
+        }
+    } else {
+        pool.calc_lp_for_deposit(amount).ok_or(StakeError::Overflow)?
+    };
     if lp_to_mint == 0 {
         return Err(StakeError::ZeroAmount.into());
     }

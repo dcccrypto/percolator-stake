@@ -124,6 +124,32 @@ pub fn calc_junior_lp_for_deposit(
     calc_lp_for_deposit(junior_total_lp, junior_balance, deposit_amount)
 }
 
+/// Calculate LP tokens for a senior tranche deposit.
+///
+/// The senior tranche has its own sub-pool: `senior_balance / senior_total_lp`,
+/// where `senior_balance = total_pool_value - effective_junior_balance` and
+/// `senior_total_lp = total_lp_supply - junior_total_lp`.
+///
+/// This MUST price against the same basis the senior WITHDRAW path values against
+/// (`calc_senior_collateral_for_withdraw`), so a senior deposit-then-withdraw
+/// round-trip cannot profit. Pricing senior deposits at the GLOBAL ratio while
+/// redeeming at the senior ratio lets a depositor mint cheap and redeem dear after
+/// a junior-absorbed loss, extracting value from existing senior LPs. Delegates to
+/// `calc_lp_for_deposit`, inheriting its round-DOWN (pool-favoring) semantics. The
+/// first-senior-deposit bootstrap (`senior_total_lp == 0`) is handled by the caller
+/// (`process_deposit`) so a legitimate orphaned-senior-value state is not bricked.
+///
+/// # Returns
+/// * `Some(lp_tokens)` to mint (rounds DOWN — pool-favoring, same as junior/global)
+/// * `None` on overflow or blocked state (orphaned value)
+pub fn calc_senior_lp_for_deposit(
+    senior_total_lp: u64,
+    senior_balance: u64,
+    deposit_amount: u64,
+) -> Option<u64> {
+    calc_lp_for_deposit(senior_total_lp, senior_balance, deposit_amount)
+}
+
 /// Calculate collateral for a junior LP token burn.
 ///
 /// Junior withdrawals are valued against the junior sub-pool only.
@@ -612,6 +638,36 @@ mod tests {
     #[test]
     fn test_junior_pro_rata() {
         assert_eq!(calc_junior_lp_for_deposit(1000, 2000, 500), Some(250));
+    }
+
+    #[test]
+    fn test_senior_first_deposit_1_to_1() {
+        // True first senior depositor (empty senior sub-pool) → 1:1.
+        assert_eq!(calc_senior_lp_for_deposit(0, 0, 1000), Some(1000));
+    }
+
+    #[test]
+    fn test_senior_pro_rata() {
+        // Senior sub-pool worth 2x → half the LP per token (rounds down, pool-favoring).
+        assert_eq!(calc_senior_lp_for_deposit(1000, 2000, 500), Some(250));
+    }
+
+    #[test]
+    fn test_senior_deposit_orphaned_value_blocked() {
+        // Senior LP supply 0 but senior balance > 0 (orphaned value): the math
+        // helper blocks (the caller `process_deposit` handles the legitimate
+        // first-senior bootstrap via its `senior_total_lp() == 0` branch).
+        assert_eq!(calc_senior_lp_for_deposit(0, 500, 1000), None);
+    }
+
+    #[test]
+    fn test_senior_deposit_round_trip_no_profit_after_loss() {
+        // Deposit then immediate withdraw on the senior sub-pool must not profit.
+        // Senior sub-pool after a junior-absorbed loss: senior_total_lp=1000, senior_balance=1000.
+        let lp = calc_senior_lp_for_deposit(1000, 1000, 1000).unwrap(); // 1000 LP
+        // After deposit, senior_total_lp=2000, senior_balance=2000.
+        let back = calc_senior_collateral_for_withdraw(2000, 2000, lp).unwrap();
+        assert!(back <= 1000, "senior round-trip must not profit (got {back})");
     }
 
     #[test]
