@@ -469,7 +469,41 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // deposit (mode-1), so LP cannot be minted at the stale pre-accrual price and capture
     // fees earned before the depositor joined. Reads the vault balance before the
     // user->vault transfer below; pool.vault == vault.key was verified above.
+    //
+    // (Rebase note #160: KEEP main's pre_accrue_mode1 (PR #148 refactor) — #160's branch
+    // predated it and carried the old inline accrue block, which is dropped here. The
+    // senior recovery-snipe gate below is added AFTER it.)
     pre_accrue_mode1(pool, vault)?;
+
+    // Insurance recovery-snipe gate (SENIOR path) — completes #150 for the senior tranche
+    // (see #159). When tranches are on and a flushed loss has spilled PAST junior into
+    // senior, the senior sub-pool is marked down (distribute_loss: senior_loss > 0 IFF
+    // net_loss > junior_balance), so senior_balance() is depressed. A late senior depositor
+    // could mint cheap LP here and redeem at the restored price after ReturnInsurance,
+    // stealing the recovery from the incumbent seniors who actually bore the loss. Pause
+    // exactly that window. The condition is PRECISE — not the junior gate's bare
+    // flushed > returned — because senior_balance() is a pure function of current state, so
+    // senior is depressed IFF net_loss > junior_balance(now). A junior-ABSORBED loss
+    // (net_loss <= junior_balance) leaves senior_balance() unchanged and offers nothing to
+    // snipe, so senior deposits stay open; gating it instead would DoS senior deposits for
+    // the entire (possibly never-returned) life of a loss junior fully covers. Self-lifts as
+    // ReturnInsurance raises total_returned. Tranche-only: the non-tranche/global path (#139)
+    // is untouched. The senior WITHDRAW path is intentionally not changed here (separate
+    // finding). junior_balance() is the raw stored balance — the same value distribute_loss
+    // measures absorption against.
+    if pool.tranche_enabled() {
+        let net_loss = pool.total_flushed.saturating_sub(pool.total_returned);
+        if net_loss > pool.junior_balance() {
+            msg!(
+                "DepositSenior paused: insurance loss spilled past junior (net_loss {} > junior_balance {}); flushed {} > returned {}",
+                net_loss,
+                pool.junior_balance(),
+                pool.total_flushed,
+                pool.total_returned
+            );
+            return Err(StakeError::InsuranceLossOutstanding.into());
+        }
+    }
 
     // Calculate LP tokens to mint.
     //
