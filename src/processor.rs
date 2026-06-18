@@ -2124,7 +2124,30 @@ fn process_deposit_junior(
     // them a (multiplier-weighted) share of fees earned before they joined (see #146). Reads
     // the vault balance before the user->vault transfer below; pool.vault + token program
     // were verified above.
+    //
+    // (Rebase note #150: this pre_accrue_mode1 call is from PR #148 — KEEP it. The
+    // InsuranceLossOutstanding gate below is added AFTER it, not in place of it, so #148's
+    // JIT fee-snipe guard stays intact.)
     pre_accrue_mode1(pool, vault)?;
+
+    // Pause junior deposits while an insurance loss is OUTSTANDING (flushed but not
+    // yet returned). effective_junior_balance() applies the pool's CURRENT net_loss
+    // to the junior tranche with no baseline for when the cohort began, so a junior
+    // depositing during an open claim would inherit a loss it was never exposed to
+    // (deterministic theft from the depositor; see the issue), and the mirror case
+    // would snipe the recovery. Both directions require a junior deposit while
+    // total_flushed > total_returned — so gate exactly that. total_flushed/returned
+    // move only via admin Flush/Return (mode-0), so deposits resume once insurance is
+    // returned. The SENIOR path is unaffected: a senior deposit prices against the
+    // current marked-down senior_balance and never perturbs effective_junior_balance.
+    if pool.total_flushed > pool.total_returned {
+        msg!(
+            "DepositJunior paused: insurance loss outstanding (flushed {} > returned {})",
+            pool.total_flushed,
+            pool.total_returned
+        );
+        return Err(StakeError::InsuranceLossOutstanding.into());
+    }
 
     // Use effective_junior_balance() so that LP pricing reflects any insurance
     // losses already absorbed by the junior tranche.  Pricing against the raw
