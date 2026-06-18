@@ -465,21 +465,11 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         }
     }
 
-    // #136: crystallize any pending trading-fee surplus into share price BEFORE pricing
-    // this deposit, so LP cannot be minted at the stale pre-accrual price and capture
-    // fees earned before the depositor joined. Mode-1 only; read the vault balance here
-    // (before the user->vault transfer below) so only the fee surplus — not this deposit's
-    // own collateral — is folded. pool.vault == vault.key was verified above.
-    if pool.pool_mode == 1 {
-        if *vault.owner != crate::spl_token::id() {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let current_balance = {
-            let vault_data = vault.try_borrow_data()?;
-            crate::spl_token::state::Account::unpack(&vault_data)?.amount
-        };
-        accrue_fees_inner(pool, current_balance)?;
-    }
+    // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
+    // deposit (mode-1), so LP cannot be minted at the stale pre-accrual price and capture
+    // fees earned before the depositor joined. Reads the vault balance before the
+    // user->vault transfer below; pool.vault == vault.key was verified above.
+    pre_accrue_mode1(pool, vault)?;
 
     // Calculate LP tokens to mint.
     //
@@ -809,21 +799,11 @@ fn process_withdraw(
         is_junior = deposit._reserved[8] == 1;
     }
 
-    // #136: crystallize any pending trading-fee surplus into share price BEFORE pricing
-    // this withdrawal, so the withdrawer realizes their fair share of earned fees (and the
-    // HWM floor sees true TVL) rather than redeeming at the stale pre-accrual price.
-    // Mode-1 only; pool.vault == vault.key was verified above; read the balance before the
-    // vault->user transfer below.
-    if pool.pool_mode == 1 {
-        if *vault.owner != crate::spl_token::id() {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let current_balance = {
-            let vault_data = vault.try_borrow_data()?;
-            crate::spl_token::state::Account::unpack(&vault_data)?.amount
-        };
-        accrue_fees_inner(pool, current_balance)?;
-    }
+    // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
+    // withdrawal (mode-1), so the withdrawer realizes their fair share of earned fees (and
+    // the HWM floor sees true TVL) rather than redeeming at the stale pre-accrual price.
+    // Reads the vault balance before the vault->user transfer below; pool.vault verified above.
+    pre_accrue_mode1(pool, vault)?;
 
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
@@ -1693,6 +1673,30 @@ fn process_rotate_insurance_authority(
 // PERC-272: LP Vault — Fee Accrual & Trading Pool Init
 // ============================================================================
 
+/// #136 pre-accrue guard — shared by EVERY path that prices against pool balances
+/// (`process_deposit`, `process_withdraw`, `process_deposit_junior`). Crystallizes any
+/// pending mode-1 trading-fee surplus into share price BEFORE pricing, so LP cannot be
+/// minted/redeemed at the stale pre-accrual price and capture fees earned before joining.
+///
+/// MUST be called AFTER the caller has verified `pool.vault == vault.key` and BEFORE the
+/// caller's user<->vault transfer, so the balance read reflects only the fee surplus and
+/// NOT the operation's own collateral. Mode-0 is a no-op; idempotent (a second call folds
+/// zero surplus). Centralized so the pricing paths cannot drift — this guard was previously
+/// inline-duplicated and the junior path was the one that was missed (see #146).
+fn pre_accrue_mode1(pool: &mut state::StakePool, vault: &AccountInfo) -> ProgramResult {
+    if pool.pool_mode == 1 {
+        if *vault.owner != crate::spl_token::id() {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let current_balance = {
+            let vault_data = vault.try_borrow_data()?;
+            crate::spl_token::state::Account::unpack(&vault_data)?.amount
+        };
+        accrue_fees_inner(pool, current_balance)?;
+    }
+    Ok(())
+}
+
 /// Crystallize any un-accrued vault surplus into pool share price. Shared by the
 /// permissionless `AccrueFees` instruction AND the deposit/withdraw pre-accrue guard
 /// (#136) so every pricing path applies byte-identical accounting.
@@ -2066,6 +2070,15 @@ fn process_deposit_junior(
             return Err(StakeError::Unauthorized.into());
         }
     }
+
+    // #136 (junior): crystallize pending trading-fee surplus into share price BEFORE pricing
+    // this junior deposit (mode-1). process_deposit (senior/global) and process_withdraw
+    // already do this; the junior path was the one that was missed — without it a junior
+    // depositor mints at the stale pre-fee price and a later permissionless AccrueFees hands
+    // them a (multiplier-weighted) share of fees earned before they joined (see #146). Reads
+    // the vault balance before the user->vault transfer below; pool.vault + token program
+    // were verified above.
+    pre_accrue_mode1(pool, vault)?;
 
     // Use effective_junior_balance() so that LP pricing reflects any insurance
     // losses already absorbed by the junior tranche.  Pricing against the raw
