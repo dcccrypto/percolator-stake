@@ -55,6 +55,11 @@ pub enum StakeError {
     /// Two-step admin rotation: no pending admin proposal exists (or it was
     /// cancelled), so AcceptAdmin has nothing to accept.
     NoPendingAdmin = 23,
+    /// Junior tranche deposits are paused while an insurance loss is outstanding
+    /// (total_flushed > total_returned). A junior depositing during an open claim
+    /// would inherit a pre-existing loss it was never exposed to (and the mirror
+    /// case could snipe the recovery). Deposits resume once insurance is returned.
+    InsuranceLossOutstanding = 24,
 }
 
 impl From<StakeError> for ProgramError {
@@ -91,6 +96,7 @@ pub fn error_hint(code: u32) -> &'static str {
         21 => "Wrong tranche — deposit already belongs to a different tranche",
         22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
         23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
+        24 => "Insurance loss outstanding — junior tranche deposits are paused until the flushed insurance is returned (total_flushed > total_returned)",
         _ => "Unknown error — check the error code and pool state",
     }
 }
