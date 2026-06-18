@@ -28,6 +28,9 @@ fn test_all_error_codes_unique() {
         StakeError::TrancheNotEnabled as u32,
         StakeError::JuniorBalanceInsufficient as u32,
         StakeError::WrongTranche as u32,
+        StakeError::ZeroSharesMinted as u32,
+        StakeError::NoPendingAdmin as u32,
+        StakeError::InsuranceLossOutstanding as u32,
     ];
 
     // Check uniqueness
@@ -36,7 +39,7 @@ fn test_all_error_codes_unique() {
     sorted.dedup();
     assert_eq!(sorted.len(), codes.len(), "Duplicate error codes detected!");
 
-    // Check sequential (0..21)
+    // Check sequential (0..24)
     for (i, &code) in codes.iter().enumerate() {
         assert_eq!(
             code, i as u32,
@@ -79,6 +82,9 @@ fn test_all_errors_are_custom() {
         StakeError::TrancheNotEnabled,
         StakeError::JuniorBalanceInsufficient,
         StakeError::WrongTranche,
+        StakeError::ZeroSharesMinted,
+        StakeError::NoPendingAdmin,
+        StakeError::InsuranceLossOutstanding,
     ];
 
     for err in &errors {
