@@ -22,6 +22,72 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// Create a program-owned PDA at `target`, robust to an attacker having pre-funded the
+/// (deterministic) address with lamports.
+///
+/// A bare `system_instruction::create_account` aborts with `AccountAlreadyInUse` when the
+/// destination already holds lamports. Because every PDA address here is deterministic,
+/// a griefer could permanently block creation by sending 1 lamport to the address (a plain
+/// `transfer`, which needs no signature from the destination). The *only* state a third
+/// party can force on a not-yet-created PDA is `(lamports >= 0, data empty, System-owned)`:
+/// they cannot `allocate`/`assign`/`create_account` it, because all three require the PDA
+/// itself to sign, and only this program can produce that signature via `invoke_signed`
+/// over the seeds. So:
+///   - unfunded (lamports == 0): a single `create_account` (identical to the old behavior).
+///   - pre-funded: top up to rent-exemption if short, then `allocate` then `assign`. The
+///     order matters — `allocate` requires the account to still be System-owned, and
+///     `assign` hands ownership to this program, so `allocate` MUST precede `assign`.
+/// `allocate` zero-fills the data, so an adopted account is byte-identical to a freshly
+/// created one. `need - have` is computed only under `have < need`, so it cannot underflow;
+/// surplus lamports (over-funding) are simply retained by the PDA. `payer` must be a
+/// transaction signer (the `transfer` uses a plain `invoke`); `signer_seeds` are the PDA
+/// seeds incl. bump (used by every `invoke_signed`). Any sub-step error reverts the whole
+/// transaction, so no half-created account can persist. Callers must run the
+/// wrong-owner-with-data guard and the PDA address-binding check first.
+fn create_or_adopt_pda<'a>(
+    target: &AccountInfo<'a>,
+    payer: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    owner: &Pubkey,
+    space: usize,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let rent = Rent::get()?;
+    let need = rent.minimum_balance(space);
+
+    if target.lamports() == 0 {
+        // Pristine address — single atomic create_account (unchanged fast path).
+        invoke_signed(
+            &system_instruction::create_account(payer.key, target.key, need, space as u64, owner),
+            &[payer.clone(), target.clone(), system_program.clone()],
+            &[signer_seeds],
+        )?;
+        return Ok(());
+    }
+
+    // Pre-funded address (the squat case): the account is still System-owned with zero
+    // data (a griefer can only have transferred lamports), so finish the create manually.
+    let have = target.lamports();
+    if have < need {
+        // Top up the rent shortfall only. payer signs the tx, so a plain invoke suffices.
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, need - have),
+            &[payer.clone(), target.clone(), system_program.clone()],
+        )?;
+    }
+    invoke_signed(
+        &system_instruction::allocate(target.key, space as u64),
+        &[target.clone(), system_program.clone()],
+        &[signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, owner),
+        &[target.clone(), system_program.clone()],
+        &[signer_seeds],
+    )?;
+    Ok(())
+}
+
 /// Upper bound on cooldown_slots (~1 year at ~2.5 slots/sec ≈ 78.84M slots). Long
 /// enough for any realistic withdrawal cooldown, but finite so an admin cannot set
 /// cooldown_slots = u64::MAX (via InitPool/UpdateConfig) and permanently lock
@@ -264,20 +330,21 @@ fn process_init_pool(
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
 
-    let rent = Rent::from_account_info(rent_sysvar)?;
+    // Validate the rent sysvar account early (it is still passed to the LP-mint/vault
+    // initialize CPIs below); create_or_adopt_pda reads rent via Rent::get() internally.
+    let _ = Rent::from_account_info(rent_sysvar)?;
 
-    // Create pool PDA account
+    // Create pool PDA account. Robust against pool-PDA squatting (a griefer pre-funding
+    // this deterministic address would make a bare create_account abort and block InitPool
+    // for this slab). See #163.
     let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
-    invoke_signed(
-        &system_instruction::create_account(
-            admin.key,
-            pool_pda.key,
-            rent.minimum_balance(STAKE_POOL_SIZE),
-            STAKE_POOL_SIZE as u64,
-            program_id,
-        ),
-        &[admin.clone(), pool_pda.clone(), system_program.clone()],
-        &[pool_seeds],
+    create_or_adopt_pda(
+        pool_pda,
+        admin,
+        system_program,
+        program_id,
+        STAKE_POOL_SIZE,
+        pool_seeds,
     )?;
 
     // Create LP mint (mint authority = vault_auth PDA, freeze authority = None).
@@ -597,17 +664,16 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             user.key.as_ref(),
             &[deposit_bump],
         ];
-        let rent = Rent::get()?;
-        invoke_signed(
-            &system_instruction::create_account(
-                user.key,
-                deposit_pda.key,
-                rent.minimum_balance(STAKE_DEPOSIT_SIZE),
-                STAKE_DEPOSIT_SIZE as u64,
-                program_id,
-            ),
-            &[user.clone(), deposit_pda.clone(), system_program.clone()],
-            &[deposit_seeds],
+        // Robust against deposit-PDA squatting: a griefer who pre-funds this
+        // deterministic address with lamports would make a bare create_account abort
+        // (AccountAlreadyInUse) and permanently brick the user's first deposit. See #163.
+        create_or_adopt_pda(
+            deposit_pda,
+            user,
+            system_program,
+            program_id,
+            STAKE_DEPOSIT_SIZE,
+            deposit_seeds,
         )?;
     }
 
@@ -2166,17 +2232,16 @@ fn process_deposit_junior(
             user.key.as_ref(),
             &[deposit_bump],
         ];
-        let rent = Rent::get()?;
-        invoke_signed(
-            &system_instruction::create_account(
-                user.key,
-                deposit_pda.key,
-                rent.minimum_balance(STAKE_DEPOSIT_SIZE),
-                STAKE_DEPOSIT_SIZE as u64,
-                program_id,
-            ),
-            &[user.clone(), deposit_pda.clone(), system_program.clone()],
-            &[deposit_seeds],
+        // Robust against deposit-PDA squatting: a griefer who pre-funds this
+        // deterministic address with lamports would make a bare create_account abort
+        // (AccountAlreadyInUse) and permanently brick the user's first deposit. See #163.
+        create_or_adopt_pda(
+            deposit_pda,
+            user,
+            system_program,
+            program_id,
+            STAKE_DEPOSIT_SIZE,
+            deposit_seeds,
         )?;
     }
 
