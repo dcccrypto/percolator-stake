@@ -1135,6 +1135,24 @@ fn process_flush_to_insurance(
         .checked_add(amount)
         .ok_or(StakeError::Overflow)?;
 
+    // PERC-313 HWM: a flush is a realized insurance LOSS — pool TVL drops by `amount`.
+    // The high-water-mark withdrawal floor must track that loss, or LPs get frozen out
+    // of a pool that just lost money. `refresh_hwm` only RAISES the mark within an epoch
+    // and is never called here, so the mark must be lowered explicitly. Lower it by
+    // exactly the flushed amount (the realized loss) so the floor recomputes against the
+    // loss-adjusted peak (peak − Σ losses). This preserves anti-drain protection:
+    // WITHDRAWALS never lower the mark (only refresh_hwm's raise and this flush do), so a
+    // withdrawal-driven drain is still floored; only a real loss lowers the floor, and only
+    // by the loss amount — no free withdrawal headroom is created (TVL dropped by the same
+    // `amount`). saturating_sub is panic-free; if a stale/zero mark is below `amount` it
+    // floors at 0 (floor 0 = no restriction), and the next withdraw's refresh_hwm re-bases
+    // the mark to live TVL. Left ungated on hwm_enabled(): the mark is only ever READ in the
+    // hwm_enabled branch, and a lowered mark is strictly more permissive, so tracking the
+    // loss unconditionally keeps "mark = peak − losses" true and avoids a stale-high mark
+    // re-freezing if HWM is toggled on mid-epoch after a flush. ReturnInsurance is left
+    // untouched: recovery rides the existing same-epoch refresh_hwm raise (clamped to TVL).
+    pool.set_epoch_high_water_tvl(pool.epoch_high_water_tvl().saturating_sub(amount));
+
     msg!(
         "Flushed {} collateral to percolator insurance via CPI",
         amount
