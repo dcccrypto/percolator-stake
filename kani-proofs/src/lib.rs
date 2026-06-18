@@ -132,9 +132,123 @@ pub fn pool_inv(supply: u32, pv: u32) -> bool {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// KANI PROOFS — 44 harnesses (42 bounded + 2 INDUCTIVE §14)
+// Tranche math (u32/u64 mirror of percolator-stake/src/math.rs tranche
+// helpers and StakePool::{total_pool_value, effective_junior_balance,
+// senior_balance}). Same arithmetic, narrower types for CBMC tractability.
+//
+// The senior/junior deposit + withdraw helpers delegate to the GLOBAL calc_*
+// over their own SUB-pool (supply, balance) — exactly as production does — so
+// they inherit the C9 orphaned-value guard. There is no separate "bootstrap"
+// branch: a true first sub-pool depositor has sub_balance == 0 (→ 1:1), while
+// orphaned sub-pool value (sub_lp == 0, sub_balance > 0) is rejected.
+// ═══════════════════════════════════════════════════════════════
+
+/// Mirror of calc_senior_lp_for_deposit / calc_junior_lp_for_deposit
+/// (both delegate to calc_lp_for_deposit over the sub-pool supply/balance).
+pub fn calc_subpool_lp_for_deposit(sub_lp: u32, sub_balance: u32, deposit: u32) -> Option<u32> {
+    calc_lp_for_deposit(sub_lp, sub_balance, deposit)
+}
+
+/// Mirror of calc_senior/junior_collateral_for_withdraw (delegate to global).
+pub fn calc_subpool_collateral_for_withdraw(sub_lp: u32, sub_balance: u32, lp: u32) -> Option<u32> {
+    calc_collateral_for_withdraw(sub_lp, sub_balance, lp)
+}
+
+/// Mirror of distribute_loss: the junior tranche absorbs loss first, capped at
+/// the combined balance. Returns (junior_loss, senior_loss).
+pub fn distribute_loss(junior_balance: u32, senior_balance: u32, loss: u32) -> (u32, u32) {
+    let total = (junior_balance as u64).saturating_add(senior_balance as u64);
+    let capped = (loss as u64).min(total);
+    if capped <= junior_balance as u64 {
+        (capped as u32, 0)
+    } else {
+        let senior_loss = capped - junior_balance as u64;
+        (junior_balance, senior_loss as u32)
+    }
+}
+
+/// Mirror of distribute_fees (SIMPLE path). Weighted split: junior weight =
+/// junior_balance * mult_bps, senior weight = senior_balance * 10_000; junior_fee
+/// = floor(total_fee * junior_weight / total_weight), senior_fee = remainder.
+///
+/// Production's u128 overflow fallback (when total_fee * junior_weight exceeds
+/// u128) is unreachable at this mirror's bounded scale, so it is not modelled —
+/// the conservation/bounds invariants proven here are the same ones that fallback
+/// must preserve. Returns (junior_fee, senior_fee), summing to <= total_fee.
+pub fn distribute_fees(
+    junior_balance: u32,
+    senior_balance: u32,
+    junior_fee_mult_bps: u32,
+    total_fee: u32,
+) -> (u32, u32) {
+    if total_fee == 0 {
+        return (0, 0);
+    }
+    let jb = junior_balance as u64;
+    let sb = senior_balance as u64;
+    if jb + sb == 0 {
+        return (0, 0);
+    }
+    let junior_weight = jb * junior_fee_mult_bps as u64;
+    let senior_weight = sb * 10_000;
+    let total_weight = junior_weight + senior_weight;
+    if total_weight == 0 {
+        return (0, 0);
+    }
+    let junior_fee = ((total_fee as u64) * junior_weight / total_weight).min(total_fee as u64);
+    let senior_fee = (total_fee as u64).saturating_sub(junior_fee);
+    (junior_fee as u32, senior_fee as u32)
+}
+
+/// Mirror of StakePool::total_pool_value() for pool_mode 0 (insurance LP):
+/// deposited - withdrawn - flushed + returned.
+pub fn total_pool_value_mode0(deposited: u32, withdrawn: u32, flushed: u32, returned: u32) -> Option<u32> {
+    deposited
+        .checked_sub(withdrawn)?
+        .checked_sub(flushed)?
+        .checked_add(returned)
+}
+
+/// Mirror of StakePool::effective_junior_balance(): junior tranche balance after
+/// absorbing outstanding insurance loss (net_loss = flushed - returned) against
+/// the GROSS (pre-loss) balances.
+pub fn effective_junior_balance(
+    deposited: u32,
+    withdrawn: u32,
+    flushed: u32,
+    returned: u32,
+    junior_balance: u32,
+) -> u32 {
+    let jb = junior_balance;
+    let net_loss = flushed.saturating_sub(returned);
+    if net_loss == 0 {
+        return jb;
+    }
+    let gross_pool = deposited.saturating_sub(withdrawn);
+    let gross_senior = gross_pool.saturating_sub(jb);
+    let (junior_loss, _) = distribute_loss(jb, gross_senior, net_loss);
+    jb.saturating_sub(junior_loss)
+}
+
+/// Mirror of StakePool::senior_balance(): total_pool_value - effective_junior_balance.
+pub fn senior_balance(
+    deposited: u32,
+    withdrawn: u32,
+    flushed: u32,
+    returned: u32,
+    junior_balance: u32,
+) -> Option<u32> {
+    let pv = total_pool_value_mode0(deposited, withdrawn, flushed, returned)?;
+    pv.checked_sub(effective_junior_balance(deposited, withdrawn, flushed, returned, junior_balance))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KANI PROOFS — 54 harnesses (52 bounded + 2 INDUCTIVE §14)
 // PERC-783: kani::cover!() added to all symbolic proofs to guard
 // against vacuous satisfaction of kani::assume constraints.
+// §15 (10 proofs) closes the tranche-math coverage gap — prior
+// sections cover only the GLOBAL (non-tranche) path. (Restored here:
+// these proofs were dropped in the v17 convergence.)
 // ═══════════════════════════════════════════════════════════════
 
 #[cfg(kani)]
@@ -1319,5 +1433,199 @@ mod proofs {
             total_out <= total_new_in_with_appr,
             "INDUCTIVE: total withdrawn by A+B ≤ total deposited by A+B + appreciation"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // SECTION 15: Tranche math (10 proofs) — senior/junior sub-pools,
+    // loss & fee distribution, and tranche valuation. Sections 1–14 cover
+    // only the GLOBAL (non-tranche) path; this section closes that gap.
+    //
+    // SAT budget: u16 range (≤ 0xFFFF). With supply,pv ≤ 0xFFFF the products in
+    // calc_*_for_deposit/withdraw stay < u32::MAX, so supply+lp and balance+dep
+    // never overflow (same width argument as §1's bounded proofs).
+    // ════════════════════════════════════════════════════════════
+
+    /// Loss distribution conserves value: junior_loss + senior_loss == the capped
+    /// loss, and neither tranche loses more than it holds.
+    #[kani::proof]
+    fn proof_distribute_loss_conservation() {
+        let jb: u32 = kani::any();
+        let sb: u32 = kani::any();
+        let loss: u32 = kani::any();
+        kani::assume(jb <= 0xFFFF && sb <= 0xFFFF && loss <= 0xFFFF);
+
+        let (jl, sl) = distribute_loss(jb, sb, loss);
+        let capped = (loss as u64).min(jb as u64 + sb as u64);
+        kani::cover!(sl > 0, "COVER: senior-absorbs-loss path is reachable");
+        assert!(jl as u64 + sl as u64 == capped, "loss conserved");
+        assert!(jl <= jb, "junior loss bounded by junior balance");
+        assert!(sl <= sb, "senior loss bounded by senior balance");
+    }
+
+    /// Junior-first: while the loss fits in the junior tranche, senior loses nothing.
+    #[kani::proof]
+    fn proof_distribute_loss_junior_first() {
+        let jb: u32 = kani::any();
+        let sb: u32 = kani::any();
+        let loss: u32 = kani::any();
+        kani::assume(jb <= 0xFFFF && sb <= 0xFFFF && loss <= 0xFFFF);
+        kani::assume(loss <= jb);
+
+        let (jl, sl) = distribute_loss(jb, sb, loss);
+        kani::cover!(sl == 0, "COVER: senior-protected path is reachable");
+        assert!(sl == 0, "senior protected while junior can absorb");
+        assert!(jl == loss, "junior absorbs the full loss");
+    }
+
+    /// Fee distribution conserves value: junior_fee + senior_fee <= total_fee
+    /// always, and == total_fee whenever there is fee and balance to distribute.
+    #[kani::proof]
+    fn proof_distribute_fees_conservation() {
+        let jb: u32 = kani::any();
+        let sb: u32 = kani::any();
+        let mult: u32 = kani::any();
+        let fee: u32 = kani::any();
+        kani::assume(jb <= 0xFFFF && sb <= 0xFFFF && fee <= 0xFFFF);
+        kani::assume(mult > 0 && mult <= 50_000); // production caps junior_fee_mult_bps
+
+        let (jf, sf) = distribute_fees(jb, sb, mult, fee);
+        assert!(jf <= fee, "junior fee bounded by total");
+        assert!(sf <= fee, "senior fee bounded by total");
+        assert!(jf as u64 + sf as u64 <= fee as u64, "fees never exceed total");
+        if fee > 0 && (jb > 0 || sb > 0) {
+            kani::cover!(jf + sf == fee, "COVER: fee-conservation path is reachable");
+            assert!(jf as u64 + sf as u64 == fee as u64, "fee fully conserved when distributable");
+        }
+    }
+
+    /// No fees strand to a phantom senior tranche: with zero senior balance and a
+    /// positive junior balance, the junior captures the entire fee. Underpins the
+    /// first-senior-deposit invariant — senior_balance stays 0 in a junior-only
+    /// pool, so a senior deposit there mints 1:1 (not against an orphan).
+    #[kani::proof]
+    fn proof_distribute_fees_no_senior_all_to_junior() {
+        let jb: u32 = kani::any();
+        let mult: u32 = kani::any();
+        let fee: u32 = kani::any();
+        kani::assume(jb > 0 && jb <= 0xFFFF);
+        kani::assume(fee > 0 && fee <= 0xFFFF);
+        kani::assume(mult > 0 && mult <= 50_000);
+
+        let (jf, sf) = distribute_fees(jb, 0, mult, fee);
+        kani::cover!(jf == fee, "COVER: all-fees-to-junior path is reachable");
+        assert!(jf == fee && sf == 0, "no senior => junior captures all fees");
+    }
+
+    /// C9 for a tranche sub-pool (the bootstrap-bypass fix): a deposit into a
+    /// sub-pool with NO LP but POSITIVE balance (orphaned value) is rejected,
+    /// never minted 1:1.
+    #[kani::proof]
+    fn proof_subpool_deposit_orphan_blocked() {
+        let bal: u32 = kani::any();
+        let dep: u32 = kani::any();
+        kani::assume(bal > 0 && bal <= 0xFFFF);
+        kani::assume(dep > 0 && dep <= 0xFFFF);
+
+        assert!(
+            calc_subpool_lp_for_deposit(0, bal, dep).is_none(),
+            "orphaned sub-pool value must block deposits (C9)"
+        );
+    }
+
+    /// A true first sub-pool depositor (empty sub-pool) mints exactly 1:1.
+    #[kani::proof]
+    fn proof_subpool_first_deposit_one_to_one() {
+        let dep: u32 = kani::any();
+        kani::assume(dep > 0 && dep <= 0xFFFF);
+        kani::cover!(
+            calc_subpool_lp_for_deposit(0, 0, dep) == Some(dep),
+            "COVER: first-subpool-depositor 1:1 path is reachable"
+        );
+        assert_eq!(calc_subpool_lp_for_deposit(0, 0, dep), Some(dep));
+    }
+
+    /// Sub-pool deposit→withdraw round-trip cannot profit (senior and junior both
+    /// price deposit AND withdrawal against the same sub-pool basis — the
+    /// invariant the senior-deposit mispricing fix restored).
+    #[kani::proof]
+    fn proof_subpool_deposit_withdraw_no_profit() {
+        let sub_lp: u32 = kani::any();
+        let sub_bal: u32 = kani::any();
+        let dep: u32 = kani::any();
+        kani::assume(sub_lp > 0 && sub_lp <= 0xFFFF);
+        kani::assume(sub_bal > 0 && sub_bal <= 0xFFFF);
+        kani::assume(dep > 0 && dep <= 0xFFFF);
+
+        let lp = match calc_subpool_lp_for_deposit(sub_lp, sub_bal, dep) {
+            Some(l) if l > 0 => l,
+            _ => return,
+        };
+        let back = match calc_subpool_collateral_for_withdraw(sub_lp + lp, sub_bal + dep, lp) {
+            Some(v) => v,
+            None => return,
+        };
+        kani::cover!(back <= dep, "COVER: subpool round-trip no-profit path is reachable");
+        assert!(back <= dep, "sub-pool deposit-then-withdraw cannot profit");
+    }
+
+    /// Tranche valuation never bricks senior withdrawals: under the pool
+    /// invariants (returns ≤ flushes; junior balance ≤ gross principal),
+    /// effective_junior_balance ≤ total_pool_value, so senior_balance() is always
+    /// Some (its checked_sub never underflows).
+    #[kani::proof]
+    fn proof_senior_balance_never_underflows() {
+        let dep: u32 = kani::any();
+        let wd: u32 = kani::any();
+        let flush: u32 = kani::any();
+        let ret: u32 = kani::any();
+        let jb: u32 = kani::any();
+        kani::assume(dep <= 0xFFFF && wd <= 0xFFFF && flush <= 0xFFFF && ret <= 0xFFFF && jb <= 0xFFFF);
+
+        let pv = match total_pool_value_mode0(dep, wd, flush, ret) {
+            Some(v) => v,
+            None => return, // inconsistent accounting — not a reachable pool state
+        };
+        let gross_pool = match dep.checked_sub(wd) {
+            Some(g) => g,
+            None => return,
+        };
+        // Pool invariants: insurance returns never exceed flushes; junior tranche
+        // balance never exceeds the net principal.
+        kani::assume(ret <= flush);
+        kani::assume(jb <= gross_pool);
+
+        let ejb = effective_junior_balance(dep, wd, flush, ret, jb);
+        kani::cover!(ejb <= pv, "COVER: effective_junior <= pool_value path is reachable");
+        assert!(ejb <= pv, "effective junior balance never exceeds pool value");
+        assert!(
+            senior_balance(dep, wd, flush, ret, jb).is_some(),
+            "senior_balance never underflows under the pool invariants"
+        );
+    }
+
+    /// The two tranches partition the pool exactly:
+    /// senior_balance + effective_junior_balance == total_pool_value.
+    #[kani::proof]
+    fn proof_tranche_decomposition() {
+        let dep: u32 = kani::any();
+        let wd: u32 = kani::any();
+        let flush: u32 = kani::any();
+        let ret: u32 = kani::any();
+        let jb: u32 = kani::any();
+        kani::assume(dep <= 0xFFFF && wd <= 0xFFFF && flush <= 0xFFFF && ret <= 0xFFFF && jb <= 0xFFFF);
+        kani::assume(ret <= flush);
+        kani::assume(jb <= dep.saturating_sub(wd));
+
+        let pv = match total_pool_value_mode0(dep, wd, flush, ret) {
+            Some(v) => v,
+            None => return,
+        };
+        let ejb = effective_junior_balance(dep, wd, flush, ret, jb);
+        let sb = match senior_balance(dep, wd, flush, ret, jb) {
+            Some(v) => v,
+            None => return,
+        };
+        kani::cover!(sb + ejb == pv, "COVER: tranche-decomposition path is reachable");
+        assert!(sb as u64 + ejb as u64 == pv as u64, "senior + effective_junior == pool value");
     }
 }
