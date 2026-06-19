@@ -350,8 +350,18 @@ fn process_init_pool(
     // Create LP mint (mint authority = vault_auth PDA, freeze authority = None).
     // FINDING-4: Passing Some(vault_auth.key) as freeze authority would allow the
     // admin (who controls vault_auth) to freeze any LP holder's token account,
-    // permanently preventing withdrawals. LP tokens must be freely transferable
-    // and withdrawable — freeze authority must not be retained.
+    // permanently preventing withdrawals. Freeze authority must NOT be retained —
+    // the holder must always be able to redeem.
+    //
+    // #167 (LP is a NON-TRANSFERABLE position receipt, by decision): withdrawal is
+    // gated by a per-(pool,user) StakeDeposit record that does NOT move with the LP
+    // token, so transferring/selling the LP strands the underlying collateral (the
+    // new holder has no record to redeem against; the old record is empty). We do
+    // not enforce non-transferability on-chain (no freeze authority — see above; no
+    // Token-2022 transfer hook); leaving freeze=None is purely the FINDING-4
+    // anti-freeze guarantee and is NOT an endorsement of transferring. Clients must
+    // treat the LP as a soulbound receipt. (Enforced non-transferability via a
+    // transfer hook is the future hardening; tracked in #167.)
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
     invoke_signed(
         &crate::spl_token::initialize_mint(
