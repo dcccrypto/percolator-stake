@@ -2115,15 +2115,31 @@ fn process_admin_set_hwm_config(
         return Err(StakeError::Unauthorized.into());
     }
 
-    pool.set_hwm_enabled(enabled);
-    pool.set_hwm_floor_bps(hwm_floor_bps);
+    // #185: only write the floor when ENABLING. Disabling must preserve the
+    // previously stored floor — writing it unconditionally let a disable call
+    // (which carries hwm_floor_bps=0 and skips validate_hwm_floor_bps) clobber
+    // the stored floor, so re-enabling later silently lost the prior value.
+    apply_hwm_config(pool, enabled, hwm_floor_bps);
 
     msg!(
         "HWM config updated: enabled={}, floor_bps={}",
         enabled,
-        hwm_floor_bps
+        pool.hwm_floor_bps()
     );
     Ok(())
+}
+
+/// Apply a HWM config change to `pool`.
+///
+/// The enabled flag always tracks `enabled`. The floor is only written when
+/// enabling — disabling preserves whatever floor was previously stored so a
+/// subsequent re-enable does not silently reset it to the disable call's
+/// (validation-skipped) `hwm_floor_bps` argument (#185).
+fn apply_hwm_config(pool: &mut StakePool, enabled: bool, hwm_floor_bps: u16) {
+    pool.set_hwm_enabled(enabled);
+    if enabled {
+        pool.set_hwm_floor_bps(hwm_floor_bps);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2645,8 +2661,14 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
         return Err(ProgramError::MissingRequiredSignature);
     }
     validate_account_owner(pool_pda, program_id)?;
+    // #184: mirror the #177/#183 fix — reject empty/undersized pool accounts
+    // before bytemuck reinterprets the data (a too-short slice would panic).
+    validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    if pool_data.len() < STAKE_POOL_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
     if pool.is_initialized != 1 {
@@ -2669,4 +2691,56 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
 
     msg!("SetMarketResolved: pool marked as resolved, deposits blocked");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    // #185 regression: disabling HWM must NOT clobber the stored floor, so that
+    // a later re-enable preserves the operator's original floor. The disable
+    // path skips validate_hwm_floor_bps and typically carries hwm_floor_bps=0;
+    // before the fix that 0 overwrote the stored floor.
+    #[test]
+    fn test_apply_hwm_config_disable_preserves_floor() {
+        let mut pool = StakePool::zeroed();
+
+        // Enable with a real floor.
+        apply_hwm_config(&mut pool, true, 5000);
+        assert!(pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 5000);
+
+        // Disable with the validation-skipped sentinel (0): floor must survive.
+        apply_hwm_config(&mut pool, false, 0);
+        assert!(!pool.hwm_enabled(), "disable must clear the enabled flag");
+        assert_eq!(
+            pool.hwm_floor_bps(),
+            5000,
+            "disabling HWM must preserve the previously stored floor"
+        );
+
+        // Re-enable without re-specifying the floor (0 again): the preserved
+        // floor remains in effect because disable never wiped it.
+        apply_hwm_config(&mut pool, true, 0);
+        assert!(pool.hwm_enabled());
+        // Re-enabling with an explicit 0 floor IS an intentional write (the
+        // enable path is validated upstream), so the floor now tracks the arg.
+        assert_eq!(pool.hwm_floor_bps(), 0);
+    }
+
+    // Enabling always writes the supplied (upstream-validated) floor.
+    #[test]
+    fn test_apply_hwm_config_enable_writes_floor() {
+        let mut pool = StakePool::zeroed();
+
+        apply_hwm_config(&mut pool, true, 7500);
+        assert!(pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 7500);
+
+        // Re-enable with a different floor overwrites it.
+        apply_hwm_config(&mut pool, true, 9000);
+        assert!(pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 9000);
+    }
 }
