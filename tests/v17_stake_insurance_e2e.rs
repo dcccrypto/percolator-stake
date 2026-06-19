@@ -16,11 +16,15 @@
 //! kind=ASSET_AUTH_INSURANCE=1). Verified at byte level by cpi_tags.rs tests.
 //!
 //! NOTE on v16 tests in v16_stake_insurance_e2e.rs: those tests use
-//! encode_init_market_default() with MARKET_LEN_CAP1=3107 (v16 layout).
-//! Against the v17 wrapper binary that constant is WRONG (v17 = 2987 bytes),
-//! causing InitMarket to return InvalidAccountData. The tests below use the
-//! correct v17 market size (2987) — confirmed via dump_sizes example in
-//! percolator-prog.
+//! encode_init_market_default() with MARKET_LEN_CAP1=3107 (v16 layout) and are
+//! #[ignore]d against the v17 wrapper binary, where the correct market size is
+//! 3003 bytes (MARKET_ACCOUNT_LEN, confirmed via `cargo run --example dump_sizes`
+//! in percolator-prog). The tests below use 3003.
+//!
+//! NOTE on the heap frame: v17 market instructions exceed the default 32KB BPF
+//! heap during init and abort with "Access violation in heap section" unless the
+//! transaction prepends ComputeBudgetInstruction::request_heap_frame — see send()
+//! and issue #176.
 
 use bytemuck::Zeroable;
 use litesvm::LiteSVM;
@@ -184,8 +188,20 @@ fn send(
 ) -> Result<(), TransactionError> {
     let mut all: Vec<&Keypair> = vec![payer];
     all.extend_from_slice(signers);
+    // The v17 wrapper installs a custom 128KB BumpAllocator (V16_HEAP_FRAME_BYTES,
+    // v16_program.rs:14401) that bumps DOWN from heap_base+128KB. The entrypoint's
+    // deserialize() makes the first allocation on EVERY instruction, so without a
+    // matching heap frame the program aborts with "Access violation in heap section"
+    // (~153 CU). Every transaction to the wrapper MUST request a 128KB heap frame; this
+    // mirrors the production transaction shape. See issue #176 (v17 deploy blocker: no
+    // TS client currently requests this frame).
+    let cb_heap = solana_sdk::compute_budget::ComputeBudgetInstruction::request_heap_frame(
+        128 * 1024,
+    );
+    let cb_cu =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[cb_heap, cb_cu, ix],
         Some(&payer.pubkey()),
         &all,
         svm.latest_blockhash(),
