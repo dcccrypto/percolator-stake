@@ -451,16 +451,36 @@ impl StakePool {
     /// includes the flushed amount. Missing `-flushed` causes phantom inflation
     /// that makes the pool insolvent after any flush+return cycle.
     pub fn total_pool_value(&self) -> Option<u64> {
-        let base = self
-            .total_deposited
-            .checked_sub(self.total_withdrawn)?
-            .checked_sub(self.total_flushed)?
-            .checked_add(self.total_returned)?;
-        // PERC-272: Include accrued trading fees for trading LP pools
-        if self.pool_mode == 1 {
-            base.checked_add(self.total_fees_earned)
+        // Sum every term in a wide signed intermediate (i128) before range-checking, so no
+        // transient intermediate can spuriously underflow OR overflow. In a mode-1 (trading-LP)
+        // pool, withdrawals are fee-INCLUSIVE, so `total_withdrawn` can exceed `total_deposited`
+        // even while the pool is solvent (the surplus is accounted for by `total_fees_earned`).
+        // The previous `total_deposited.checked_sub(total_withdrawn)` underflowed to None in that
+        // case and PERMANENTLY BRICKED the pool — every caller does `.ok_or(Overflow)?` (see #169).
+        // i128 holds the sum/difference of five u64 counters with ~60 bits to spare
+        // (|value| < 5 * 2^64 < 2^67 ≪ 2^127), so the only way to reach None is the explicit
+        // final range check: net < 0 (genuine insolvency / over-flush, e.g. the over-withdraw
+        // guard callers rely on) or net > u64::MAX (genuinely unrepresentable). mode-0 stays
+        // byte-identical to `deposited - withdrawn - flushed + returned`.
+        //
+        // IMPORTANT: the `-flushed` term is essential. Do NOT simplify to
+        // `deposited - withdrawn + returned`: that double-counts, because returned tokens are
+        // already back in the vault while deposited conceptually still includes the flushed
+        // amount — omitting `-flushed` phantom-inflates value after any flush+return cycle.
+        //
+        // PERC-272: accrued trading fees count toward value only in mode 1.
+        let fees = if self.pool_mode == 1 {
+            self.total_fees_earned as i128
         } else {
-            Some(base)
+            0
+        };
+        let value = self.total_deposited as i128 + self.total_returned as i128 + fees
+            - self.total_withdrawn as i128
+            - self.total_flushed as i128;
+        if (0..=u64::MAX as i128).contains(&value) {
+            Some(value as u64)
+        } else {
+            None
         }
     }
 
