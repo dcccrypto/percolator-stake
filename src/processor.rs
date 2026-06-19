@@ -952,12 +952,19 @@ fn process_withdraw(
         pool.calc_collateral_for_withdraw(lp_amount)
             .ok_or(StakeError::Overflow)?
     };
-    if withdrawal_amount == 0 {
+    let fully_wiped_junior_exit = pool.tranche_enabled()
+        && is_junior
+        && pool.effective_junior_balance() == 0
+        && withdrawal_amount == 0;
+
+    if withdrawal_amount == 0 && !fully_wiped_junior_exit {
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // PERC-313: High-water mark floor enforcement
-    if pool.hwm_enabled() {
+    // PERC-313: High-water mark floor enforcement.
+    // A fully-wiped junior exit has zero collateral payout and cannot reduce TVL,
+    // so HWM should not block the LP burn/deposit cleanup path.
+    if pool.hwm_enabled() && !fully_wiped_junior_exit {
         let current_tvl = pool.total_pool_value().ok_or(StakeError::Overflow)?;
         let hwm = pool.refresh_hwm(clock.epoch, current_tvl);
         let post_tvl = current_tvl
@@ -1016,23 +1023,25 @@ fn process_withdraw(
     }
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
-    invoke_signed(
-        &crate::spl_token::transfer(
-            token_program.key,
-            vault.key,
-            user_ata.key,
-            vault_auth.key,
-            &[],
-            withdrawal_amount,
-        )?,
-        &[
-            vault.clone(),
-            user_ata.clone(),
-            vault_auth.clone(),
-            token_program.clone(),
-        ],
-        &[vault_auth_seeds],
-    )?;
+    if withdrawal_amount > 0 {
+        invoke_signed(
+            &crate::spl_token::transfer(
+                token_program.key,
+                vault.key,
+                user_ata.key,
+                vault_auth.key,
+                &[],
+                withdrawal_amount,
+            )?,
+            &[
+                vault.clone(),
+                user_ata.clone(),
+                vault_auth.clone(),
+                token_program.clone(),
+            ],
+            &[vault_auth_seeds],
+        )?;
+    }
 
     // Update pool totals
     pool.total_withdrawn = pool

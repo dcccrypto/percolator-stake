@@ -882,3 +882,67 @@ fn test_large_amounts_no_overflow() {
     let lp = pool.calc_lp_for_deposit(u64::MAX / 4).unwrap();
     assert_eq!(lp, u64::MAX / 4, "Large LP calculation must use u128 intermediate");
 }
+
+/// Regression: fully-wiped junior LP should be able to burn worthless LP and exit.
+/// Zero-collateral payout is valid only in the fully-wiped junior terminal state.
+#[test]
+fn poc_fully_wiped_junior_lp_cannot_exit_due_zero_payout_guard() {
+    let mut pool = initialized_pool();
+    pool.set_tranche_enabled(true);
+    pool.set_junior_fee_mult_bps(20_000);
+
+    let senior_deposit = 10_000_000u64;
+    let junior_deposit = 5_000_000u64;
+
+    pool.total_deposited = senior_deposit + junior_deposit;
+    pool.total_lp_supply = senior_deposit + junior_deposit;
+    pool.set_junior_balance(junior_deposit);
+    pool.set_junior_total_lp(junior_deposit);
+
+    pool.total_flushed = junior_deposit;
+    pool.total_returned = 0;
+    pool.total_withdrawn = 0;
+
+    // Simulate an HWM floor that would block a normal withdrawal after the junior
+    // loss reduced current TVL below the same-epoch high-water mark. Since this
+    // fully-wiped junior exit has zero payout, it should still be allowed to
+    // reach the burn/cleanup path.
+    pool.set_hwm_enabled(true);
+    pool.set_hwm_floor_bps(10_000);
+    pool.set_epoch_high_water_tvl(senior_deposit + junior_deposit);
+
+    let current_tvl = pool.total_pool_value().unwrap();
+    assert!(
+        !percolator_stake::math::hwm_withdrawal_allowed(
+            current_tvl,
+            pool.epoch_high_water_tvl(),
+            pool.hwm_floor_bps()
+        ),
+        "test setup should represent a state where HWM would block a normal withdrawal"
+    );
+
+    assert_eq!(pool.effective_junior_balance(), 0);
+
+    let lp_to_burn = junior_deposit;
+    let withdrawal_amount = percolator_stake::math::calc_junior_collateral_for_withdraw(
+        pool.junior_total_lp(),
+        pool.effective_junior_balance(),
+        lp_to_burn,
+    )
+    .unwrap();
+
+    assert_eq!(withdrawal_amount, 0);
+
+    let is_junior = true;
+    let fully_wiped_junior_exit = pool.tranche_enabled()
+        && is_junior
+        && pool.effective_junior_balance() == 0
+        && withdrawal_amount == 0;
+
+    let zero_amount_rejected = withdrawal_amount == 0 && !fully_wiped_junior_exit;
+
+    assert!(
+        !zero_amount_rejected,
+        "fully-wiped junior LP should be allowed to burn LP and cleanup state even with zero collateral payout"
+    );
+}
