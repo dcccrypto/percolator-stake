@@ -493,7 +493,9 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // the pool once lifetime deposits hit the cap, even if 99% was withdrawn.
     // (H6 fix)
     if pool.deposit_cap > 0 {
-        let current_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+        // #154: enforce the cap on PRINCIPAL TVL (no accrued fees), not total_pool_value();
+        // otherwise fee appreciation on a mode-1 trading pool silently locks out new deposits.
+        let current_value = pool.principal_tvl().ok_or(StakeError::Overflow)?;
         let new_value = current_value
             .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
@@ -1069,6 +1071,19 @@ fn process_withdraw(
         .lp_amount
         .checked_sub(lp_amount)
         .ok_or(StakeError::InsufficientLpTokens)?;
+
+    // #155: once the position is fully withdrawn, reset the record's init + tranche
+    // flag so the (pool,user) PDA can be reused for EITHER tranche on the next deposit.
+    // Without this, _reserved[8] (the junior flag) and is_initialized persist, so PERC-303's
+    // anti-mixing guard permanently blocks the wallet from depositing into the OTHER tranche
+    // (and a junior who fully exits can never go senior, or vice-versa). Safe vs PERC-303:
+    // mixing requires a RESIDUAL liened position; with lp_amount == 0 there is nothing to mix.
+    // Metadata-only — touches no token/LP/accounting field. The deposit re-init path
+    // (process_deposit / process_deposit_junior) correctly re-initializes a zeroed record.
+    if deposit_mut.lp_amount == 0 {
+        deposit_mut.is_initialized = 0;
+        deposit_mut._reserved[8] = 0;
+    }
 
     if pool.tranche_enabled() && is_junior {
         msg!(
@@ -2183,7 +2198,9 @@ fn process_deposit_junior(
     }
 
     if pool.deposit_cap > 0 {
-        let current_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+        // #154: enforce the cap on PRINCIPAL TVL (no accrued fees), not total_pool_value();
+        // otherwise fee appreciation on a mode-1 trading pool silently locks out new deposits.
+        let current_value = pool.principal_tvl().ok_or(StakeError::Overflow)?;
         let new_value = current_value
             .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
