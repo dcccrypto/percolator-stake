@@ -242,6 +242,35 @@ pub fn senior_balance(
     pv.checked_sub(effective_junior_balance(deposited, withdrawn, flushed, returned, junior_balance))
 }
 
+/// Mirror of StakePool::total_pool_value() AFTER the issue-#161 fix: the value a
+/// later insurance return can re-credit is reduced by `realized_junior_loss` —
+/// the loss the junior tranche permanently FORFEITED when its last LP exited
+/// during an outstanding loss. Those recovered tokens become dead (unclaimable)
+/// value so the refund cannot windfall to the protected senior tranche.
+pub fn total_pool_value_mode0_rl(
+    deposited: u32,
+    withdrawn: u32,
+    flushed: u32,
+    returned: u32,
+    realized_junior_loss: u32,
+) -> Option<u32> {
+    total_pool_value_mode0(deposited, withdrawn, flushed, returned)?
+        .checked_sub(realized_junior_loss)
+}
+
+/// Mirror of StakePool::senior_balance() after the #161 fix (RL-aware pool value).
+pub fn senior_balance_rl(
+    deposited: u32,
+    withdrawn: u32,
+    flushed: u32,
+    returned: u32,
+    junior_balance: u32,
+    realized_junior_loss: u32,
+) -> Option<u32> {
+    let pv = total_pool_value_mode0_rl(deposited, withdrawn, flushed, returned, realized_junior_loss)?;
+    pv.checked_sub(effective_junior_balance(deposited, withdrawn, flushed, returned, junior_balance))
+}
+
 // ═══════════════════════════════════════════════════════════════
 // KANI PROOFS — 54 harnesses (52 bounded + 2 INDUCTIVE §14)
 // PERC-783: kani::cover!() added to all symbolic proofs to guard
@@ -1627,5 +1656,67 @@ mod proofs {
         };
         kani::cover!(sb + ejb == pv, "COVER: tranche-decomposition path is reachable");
         assert!(sb as u64 + ejb as u64 == pv as u64, "senior + effective_junior == pool value");
+    }
+
+    /// ISSUE #161 — recovery never windfalls the protected senior tranche.
+    ///
+    /// Models the full lifecycle: senior `sp` + junior `jb0` deposit; an insurance
+    /// flush `nl` marks the junior down (junior-first); the LAST junior LP then
+    /// exits, which under the #161 fix REALIZES its absorbed loss `L`
+    /// (total_returned += L, realized_junior_loss += L); finally a permissionless
+    /// ReturnInsurance of `r` (bounded by the still-outstanding loss) lands.
+    ///
+    /// THEOREM: after all of that, senior_balance() ≤ its original principal `sp`.
+    /// The junior's forfeited loss is dead value — it can never be re-credited to
+    /// the senior tranche that was protected from it. (Pre-fix, the whole refund
+    /// windfalled to senior: senior_balance jumped to sp + L.)
+    #[kani::proof]
+    fn proof_161_recovery_never_windfalls_protected_senior() {
+        let sp: u32 = kani::any(); // senior principal
+        let jb0: u32 = kani::any(); // junior principal
+        let nl: u32 = kani::any(); // insurance flushed (== net_loss while returned==0)
+        kani::assume(sp <= 0xFFFF && jb0 <= 0xFFFF && nl <= 0xFFFF);
+
+        // Initial ledger: both tranches deposited, then `nl` flushed to the market.
+        let deposited = match sp.checked_add(jb0) {
+            Some(d) => d,
+            None => return,
+        };
+        kani::assume(nl <= deposited); // can't flush more principal than exists
+
+        // Junior-first loss split on the GROSS balances (what effective_junior_balance does).
+        let (junior_loss, _senior_loss) = distribute_loss(jb0, sp, nl);
+        let junior_payout = jb0.saturating_sub(junior_loss); // what the exiting junior withdraws
+
+        // --- #161 last-junior-exit booking ---
+        // forfeited L is the junior's absorbed loss, capped at the outstanding net_loss.
+        let l = junior_loss.min(nl);
+        let withdrawn = junior_payout; // junior fully exits
+        let returned_after_book = l; // total_returned += L
+        let rl = l; // realized_junior_loss += L
+        // After booking, junior_balance == 0.
+
+        // --- later permissionless ReturnInsurance of `r` ---
+        // bounded by the still-outstanding loss (flushed - returned_after_book).
+        let outstanding = nl.saturating_sub(returned_after_book);
+        let r: u32 = kani::any();
+        kani::assume(r <= outstanding);
+        let returned_final = match returned_after_book.checked_add(r) {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Senior balance with junior gone (junior_balance == 0) and RL booked.
+        let senior = match senior_balance_rl(deposited, withdrawn, nl, returned_final, 0, rl) {
+            Some(v) => v,
+            None => return, // inconsistent accounting — not a reachable state
+        };
+
+        kani::cover!(senior == sp, "COVER: senior recovers exactly to principal (full senior-share return)");
+        kani::cover!(r > 0, "COVER: a non-trivial return is reachable");
+        assert!(
+            senior <= sp,
+            "#161: insurance recovery must never lift the protected senior above its principal"
+        );
     }
 }

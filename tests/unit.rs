@@ -968,3 +968,76 @@ fn test_154_deposit_cap_enforced_on_principal_not_fees() {
     m0.total_fees_earned = 99_999; // ignored for mode-0
     assert_eq!(m0.principal_tvl(), m0.total_pool_value(), "mode-0: principal_tvl == tpv");
 }
+
+#[test]
+fn test_161_last_junior_exit_does_not_windfall_recovery_to_senior() {
+    // Issue #161: junior 100k + senior 100k, flush 50k (junior-absorbed). The last junior
+    // exits at the marked-down price, then insurance is returned. Pre-fix the return windfalled
+    // entirely to senior (which was PROTECTED from the loss). The fix REALIZES the forfeited
+    // junior loss at exit (total_returned += L; realized_junior_loss += L), so total_pool_value()
+    // excludes it as dead value and senior stays at its principal.
+    let mut pool = new_pool();
+    pool.set_tranche_enabled(true);
+    pool.total_deposited = 200_000;
+    pool.total_lp_supply = 200_000;
+    pool.set_junior_balance(100_000);
+    pool.set_junior_total_lp(100_000);
+    assert_eq!(pool.senior_balance().unwrap(), 100_000, "senior 100k pre-loss");
+
+    // Flush 50k, junior-absorbed: senior protected, junior marked down to 50k.
+    pool.total_flushed = 50_000;
+    assert_eq!(pool.effective_junior_balance(), 50_000);
+    assert_eq!(pool.senior_balance().unwrap(), 100_000, "senior protected by junior first-loss");
+
+    // Last junior exits at eff_jb. Mirror process_withdraw's full-exit updates + the #161 booking.
+    let junior_payout = pool.effective_junior_balance(); // 50k
+    pool.total_withdrawn += junior_payout;
+    pool.total_lp_supply -= 100_000;
+    // ---- #161 booking (mirrors processor.rs last-junior-exit) ----
+    let net_loss = pool.total_flushed.saturating_sub(pool.total_returned);
+    let forfeited = pool
+        .junior_balance()
+        .saturating_sub(pool.effective_junior_balance())
+        .min(net_loss);
+    assert_eq!(forfeited, 50_000, "junior forfeits the 50k loss it absorbed");
+    pool.total_returned += forfeited;
+    pool.set_realized_junior_loss(pool.realized_junior_loss() + forfeited);
+    pool.set_junior_total_lp(0);
+    pool.set_junior_balance(0);
+    // --------------------------------------------------------------
+
+    // Senior is NOT windfalled — stays at its 100k principal.
+    assert_eq!(pool.effective_junior_balance(), 0);
+    assert_eq!(pool.total_pool_value().unwrap(), 100_000, "tpv excludes the dead forfeited loss");
+    assert_eq!(
+        pool.senior_balance().unwrap(),
+        100_000,
+        "#161: senior NOT windfalled by the junior-attributable recovery"
+    );
+    // Loss is settled — nothing left to return to inflate senior.
+    assert_eq!(
+        pool.total_flushed.saturating_sub(pool.total_returned),
+        0,
+        "junior loss realized/settled — no outstanding loss to return"
+    );
+    // Conservation: junior_got + senior_claim + realized_dead == deposited.
+    assert_eq!(
+        junior_payout + pool.senior_balance().unwrap() + pool.realized_junior_loss(),
+        200_000,
+        "conservation: junior payout + senior claim + dead(forfeited) == deposited"
+    );
+}
+
+#[test]
+fn test_161_no_loss_is_a_noop() {
+    // No loss → no forfeit → realized_junior_loss stays 0 → total_pool_value unchanged.
+    let mut pool = new_pool();
+    pool.set_tranche_enabled(true);
+    pool.total_deposited = 200_000;
+    pool.total_lp_supply = 200_000;
+    pool.set_junior_balance(100_000);
+    pool.set_junior_total_lp(100_000);
+    assert_eq!(pool.realized_junior_loss(), 0);
+    assert_eq!(pool.total_pool_value().unwrap(), 200_000);
+    assert_eq!(pool.senior_balance().unwrap(), 100_000);
+}

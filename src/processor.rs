@@ -1031,6 +1031,41 @@ fn process_withdraw(
         pool.set_junior_total_lp(new_junior_lp);
 
         if new_junior_lp == 0 {
+            // #161 (fair-recovery): the LAST junior is exiting. Any insurance loss it
+            // absorbed (L = junior_balance − effective_junior_balance) is now FORFEITED —
+            // the junior took its marked-down payout and left, so a later ReturnInsurance
+            // of that portion must NOT windfall to senior (which was protected). REALIZE it:
+            // settle the junior portion (`total_returned += L`, capped at total_flushed so it
+            // can never exceed it) and record it in `realized_junior_loss` (which
+            // total_pool_value() subtracts). Net effect on total_pool_value() is zero at exit
+            // (the +L from total_returned cancels the −L from realized_junior_loss), so senior
+            // is unchanged here; but it caps any future return so the recovered tokens sit as
+            // DEAD value instead of inflating senior. Also lifts the deposit gate for the
+            // settled portion (net_loss drops). Must compute L BEFORE zeroing junior_balance.
+            let net_loss = pool.total_flushed.saturating_sub(pool.total_returned);
+            if net_loss > 0 {
+                let forfeited = pool
+                    .junior_balance()
+                    .saturating_sub(pool.effective_junior_balance());
+                // forfeited <= junior's share of net_loss <= net_loss, so total_returned + forfeited
+                // <= total_flushed (no over-settle); cap defensively all the same.
+                let forfeited = forfeited.min(net_loss);
+                if forfeited > 0 {
+                    pool.total_returned = pool
+                        .total_returned
+                        .checked_add(forfeited)
+                        .ok_or(StakeError::Overflow)?;
+                    pool.set_realized_junior_loss(
+                        pool.realized_junior_loss()
+                            .checked_add(forfeited)
+                            .ok_or(StakeError::Overflow)?,
+                    );
+                    msg!(
+                        "Last junior exit: realized (forfeited) junior loss {} (settled; not recoverable to senior)",
+                        forfeited
+                    );
+                }
+            }
             // All junior LP withdrawn — zero out the raw balance.
             // withdrawal_amount is derived from effective_junior_balance (loss-adjusted)
             // but junior_balance stores the raw (non-adjusted) value.  Subtracting

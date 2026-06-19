@@ -284,6 +284,28 @@ impl StakePool {
         self.total_lp_supply.saturating_sub(self.junior_total_lp())
     }
 
+    /// Cumulative insurance loss that an exited junior tranche permanently REALIZED
+    /// (issue #161). Stored at `_reserved[51..59]` (LE u64).
+    ///
+    /// When the LAST junior LP exits while a loss is outstanding, the loss it absorbed
+    /// (`junior_balance − effective_junior_balance`) is forfeited: the junior took its
+    /// marked-down payout and walked away, so a later `ReturnInsurance` of that portion
+    /// must NOT flow to senior (which was protected). We settle that portion at exit
+    /// (`total_returned += L`) so it leaves the recoverable-loss ledger, and record it
+    /// here so `total_pool_value()` subtracts it — the recovered tokens then sit as DEAD
+    /// (unclaimable) value rather than windfalling senior. Conservation: vault tokens ==
+    /// junior_claims + senior_claims + realized_junior_loss(dead).
+    pub fn realized_junior_loss(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[51..59]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set the cumulative realized (forfeited) junior loss. See `realized_junior_loss`.
+    pub fn set_realized_junior_loss(&mut self, val: u64) {
+        self._reserved[51..59].copy_from_slice(&val.to_le_bytes());
+    }
+
     /// Loss-adjusted junior tranche balance.
     ///
     /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
@@ -457,11 +479,19 @@ impl StakePool {
             .checked_sub(self.total_flushed)?
             .checked_add(self.total_returned)?;
         // PERC-272: Include accrued trading fees for trading LP pools
-        if self.pool_mode == 1 {
-            base.checked_add(self.total_fees_earned)
+        let with_fees = if self.pool_mode == 1 {
+            base.checked_add(self.total_fees_earned)?
         } else {
-            Some(base)
-        }
+            base
+        };
+        // #161: subtract any realized (forfeited) junior loss. When the last junior exits
+        // during a loss, that portion is settled via `total_returned += L` (so it leaves
+        // the recoverable-loss ledger and lifts the deposit gate), and recorded in
+        // `realized_junior_loss`. The settle inflates the raw `+ total_returned` term by L
+        // without any tokens arriving, so we subtract it back here — the corresponding
+        // tokens (if ever physically returned) sit as DEAD value and are NOT claimable by
+        // senior, preventing the recovery-snipe windfall. Normally 0 (no-op).
+        with_fees.checked_sub(self.realized_junior_loss())
     }
 
     /// Principal-basis TVL: `deposited − withdrawn − flushed + returned`, WITHOUT
@@ -476,7 +506,10 @@ impl StakePool {
         self.total_deposited
             .checked_sub(self.total_withdrawn)?
             .checked_sub(self.total_flushed)?
-            .checked_add(self.total_returned)
+            .checked_add(self.total_returned)?
+            // #161: exclude realized (forfeited) junior loss — it is dead value, not live
+            // principal, so it must not count toward the deposit cap.
+            .checked_sub(self.realized_junior_loss())
     }
 
     /// Calculate LP tokens for a deposit amount.
