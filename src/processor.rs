@@ -362,6 +362,17 @@ fn process_init_pool(
     // anti-freeze guarantee and is NOT an endorsement of transferring. Clients must
     // treat the LP as a soulbound receipt. (Enforced non-transferability via a
     // transfer hook is the future hardening; tracked in #167.)
+    // Read collateral mint decimals before creating the LP mint.
+    // The collateral_mint account is already in scope and its key is
+    // verified above (circular-mint guard + stored in pool state).
+    let collateral_decimals = {
+        let mint_data = collateral_mint.try_borrow_data()?;
+        if mint_data.len() < crate::spl_token::state::Mint::LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        crate::spl_token::state::Mint::unpack(&mint_data)?.decimals
+    };
+
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
     invoke_signed(
         &crate::spl_token::initialize_mint(
@@ -369,7 +380,7 @@ fn process_init_pool(
             lp_mint.key,
             vault_auth.key,
             None, // freeze_authority: None — LP tokens must not be freezable
-            6,
+            collateral_decimals,
         )?,
         &[lp_mint.clone(), rent_sysvar.clone()],
         &[vault_auth_seeds],

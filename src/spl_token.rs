@@ -199,4 +199,29 @@ pub mod state {
             Ok(Self { amount, state })
         }
     }
+
+    /// spl_token::state::Mint::LEN = 82
+    pub const MINT_LEN: usize = 82;
+
+    pub struct Mint {
+        pub decimals: u8,
+        pub is_initialized: bool,
+    }
+
+    impl Mint {
+        pub const LEN: usize = MINT_LEN;
+
+        /// Equivalent to `spl_token::state::Mint::unpack`.
+        pub fn unpack(data: &[u8]) -> Result<Self, ProgramError> {
+            if data.len() < Self::LEN {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let decimals = data[44];
+            let is_initialized = data[45] != 0;
+            Ok(Self {
+                decimals,
+                is_initialized,
+            })
+        }
+    }
 }
