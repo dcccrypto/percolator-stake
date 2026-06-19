@@ -560,6 +560,18 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // is untouched. The senior WITHDRAW path is intentionally not changed here (separate
     // finding). junior_balance() is the raw stored balance — the same value distribute_loss
     // measures absorption against.
+    //
+    // #162 (permanent-loss freeze, BY DESIGN): if a loss is never returned (genuinely
+    // realized — the market consumed the topped-up insurance), net_loss stays positive and
+    // this gate never lifts, so senior deposits stay frozen. This is a deliberate, safe
+    // consequence — the pool is fully backed and existing LPs withdraw at the marked-down
+    // price; only NEW deposits are blocked. We do NOT auto-write-off after a clock/resolution:
+    // (a) admin keys are burned so an admin write-off op is uncallable, (b) resolved markets
+    // already block all deposits (see market_resolved gate above), so a resolution-keyed lift
+    // is moot, and (c) a bare time-box would unfairly realize a still-recoverable loss and kill
+    // the incumbents' legitimate recovery. The perfectly-fair admin-free fix is permissionless
+    // reconciliation against the bound market's real insurance balance (deferred — tight
+    // coupling, needs LiteSVM verification vs a live market). v17 ships Accept-&-document.
     if pool.tranche_enabled() {
         let net_loss = pool.total_flushed.saturating_sub(pool.total_returned);
         if net_loss > pool.junior_balance() {
@@ -2292,6 +2304,14 @@ fn process_deposit_junior(
     // move only via admin Flush/Return (mode-0), so deposits resume once insurance is
     // returned. The SENIOR path is unaffected: a senior deposit prices against the
     // current marked-down senior_balance and never perturbs effective_junior_balance.
+    //
+    // #161 escape (admin-free, permissionless): when the LAST junior exits a junior-absorbed
+    // loss, process_withdraw realizes the forfeited loss (total_returned += L), driving
+    // net_loss to 0 and lifting THIS gate — so a fully-exited junior tranche always re-opens.
+    // #162 residual freeze (BY DESIGN): if a junior keeps holding, or the loss spilled past
+    // junior, net_loss stays positive and the gate stays closed for a permanent loss. Safe
+    // (fully backed; existing LPs withdraw freely) and deliberate — see the senior-gate note
+    // above for why no auto-write-off (admin burned / resolved blocks deposits / time-box unfair).
     if pool.total_flushed > pool.total_returned {
         msg!(
             "DepositJunior paused: insurance loss outstanding (flushed {} > returned {})",
