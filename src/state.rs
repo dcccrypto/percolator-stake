@@ -464,6 +464,21 @@ impl StakePool {
         }
     }
 
+    /// Principal-basis TVL: `deposited − withdrawn − flushed + returned`, WITHOUT
+    /// accrued trading fees. This is the basis the deposit cap is enforced against
+    /// (issue #154): the cap limits contributed principal/exposure, not fee
+    /// appreciation. Using `total_pool_value()` (fee-inclusive) for the cap meant a
+    /// mode-1 trading pool that earned fees would silently lock out new deposits even
+    /// though contributed principal was below the cap. LP pricing still uses
+    /// `total_pool_value()` (fee-inclusive). For mode-0 pools this equals
+    /// `total_pool_value()`.
+    pub fn principal_tvl(&self) -> Option<u64> {
+        self.total_deposited
+            .checked_sub(self.total_withdrawn)?
+            .checked_sub(self.total_flushed)?
+            .checked_add(self.total_returned)
+    }
+
     /// Calculate LP tokens for a deposit amount.
     /// Delegates to pure math module (Kani-verified).
     /// Returns None if pool accounting is broken (total_pool_value() underflows).

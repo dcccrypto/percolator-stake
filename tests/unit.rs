@@ -937,3 +937,34 @@ fn test_pool_stores_percolator_program() {
         "zeroed pool should have zero percolator_program"
     );
 }
+
+#[test]
+fn test_154_deposit_cap_enforced_on_principal_not_fees() {
+    // #154: a mode-1 trading pool that has earned fees. total_pool_value() is fee-inclusive,
+    // principal_tvl() is not. The deposit cap must be enforced on principal_tvl(), or fee
+    // appreciation silently locks out deposits whose contributed principal is under the cap.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.deposit_cap = 1_000_000;
+    pool.total_deposited = 800_000;
+    pool.total_lp_supply = 800_000;
+    pool.total_fees_earned = 300_000; // tpv = 1_100_000 (> cap); principal = 800_000 (< cap)
+
+    assert_eq!(pool.principal_tvl(), Some(800_000), "principal excludes accrued fees");
+    assert_eq!(pool.total_pool_value(), Some(1_100_000), "tpv includes accrued fees");
+
+    // A 150K deposit keeps principal at 950K (<= 1M cap) → admitted under the fixed (principal) basis.
+    let deposit = 150_000u64;
+    let principal_after = pool.principal_tvl().unwrap() + deposit;
+    assert!(principal_after <= pool.deposit_cap, "#154: principal-basis cap admits the deposit");
+    // The old tpv-basis would have (wrongly) rejected it: 1.1M + 150K = 1.25M > cap.
+    let tpv_after = pool.total_pool_value().unwrap() + deposit;
+    assert!(tpv_after > pool.deposit_cap, "old fee-inclusive basis would have rejected it");
+
+    // mode-0: principal_tvl == total_pool_value (no fee term).
+    let mut m0 = new_pool();
+    m0.pool_mode = 0;
+    m0.total_deposited = 500_000;
+    m0.total_fees_earned = 99_999; // ignored for mode-0
+    assert_eq!(m0.principal_tvl(), m0.total_pool_value(), "mode-0: principal_tvl == tpv");
+}
