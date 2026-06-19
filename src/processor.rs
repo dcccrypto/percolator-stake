@@ -2506,6 +2506,7 @@ fn process_return_insurance(
     }
     verify_token_program(token_program)?;
     validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
