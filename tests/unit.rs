@@ -1041,3 +1041,94 @@ fn test_161_no_loss_is_a_noop() {
     assert_eq!(pool.total_pool_value().unwrap(), 200_000);
     assert_eq!(pool.senior_balance().unwrap(), 100_000);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// #169 — mode-1 total_pool_value() / principal_tvl() i128 underflow fix
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_169_mode1_fee_withdrawal_does_not_brick_total_pool_value() {
+    // Issue #169: in a mode-1 trading pool a withdrawer's payout includes their fee
+    // share, so total_withdrawn can exceed total_deposited. Pre-fix, the left-to-right
+    // checked_sub(total_deposited - total_withdrawn) underflowed to None and PERMANENTLY
+    // bricked the pool with LPs still in it. The i128 sum returns the true value.
+    // Scenario: deposit 1000, accrue 500 fees (pv 1500), an 80%-LP withdraw pays
+    // 800*1500/1000 = 1200 -> total_withdrawn 1200 > total_deposited 1000.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000;
+    pool.total_fees_earned = 500;
+    pool.total_withdrawn = 1_200;
+    // true value = 1000 - 1200 - 0 + 0 + 500 - 0 = 300 (the 20% of LP still in the pool)
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(300),
+        "#169: fee-withdrawal must not brick — value is 300, not None"
+    );
+}
+
+#[test]
+fn test_169_principal_tvl_clamps_instead_of_bricking_deposits() {
+    // Same mode-1 fee-withdrawal scenario: principal_tvl's deposited - withdrawn goes
+    // net-negative (-200), which previously bricked DEPOSITS (cap check fails on None).
+    // Now it clamps to 0 so the deposit cap admits new principal.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000;
+    pool.total_fees_earned = 500;
+    pool.total_withdrawn = 1_200;
+    assert_eq!(
+        pool.principal_tvl(),
+        Some(0),
+        "#169: net-negative principal basis clamps to 0, not None"
+    );
+}
+
+#[test]
+fn test_169_insolvency_still_fails_closed() {
+    // The i128 fix must NOT mask genuine insolvency: when the FINAL value is negative
+    // (claims exceed assets), total_pool_value() still returns None (fail-closed).
+    let mut pool = new_pool();
+    pool.pool_mode = 0;
+    pool.total_deposited = 1_000;
+    pool.total_withdrawn = 1_000;
+    pool.total_flushed = 500; // flushed, never returned -> -500 net
+    assert_eq!(
+        pool.total_pool_value(),
+        None,
+        "#169: genuine insolvency must still fail closed"
+    );
+}
+
+#[test]
+fn test_169_mode0_unaffected_and_rl_still_subtracted() {
+    // mode-0 (no fees) value unchanged by the rewrite; #161 realized_junior_loss
+    // still subtracted by both total_pool_value() and principal_tvl().
+    let mut pool = new_pool();
+    pool.pool_mode = 0;
+    pool.total_deposited = 1_000;
+    pool.total_withdrawn = 200;
+    pool.total_flushed = 100;
+    pool.total_returned = 50;
+    assert_eq!(pool.total_pool_value(), Some(750)); // 1000 - 200 - 100 + 50
+    assert_eq!(pool.principal_tvl(), Some(750));
+    pool.set_realized_junior_loss(50);
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(700),
+        "#161 RL still subtracted under the i128 rewrite"
+    );
+    assert_eq!(pool.principal_tvl(), Some(700), "principal_tvl also subtracts RL");
+}
+
+#[test]
+fn test_169_mode1_fees_included_in_value_but_not_principal() {
+    // Healthy mode-1 pool: fees count toward pool value (LP pricing) but NOT toward
+    // the principal cap basis. Verifies the mode split survives the rewrite.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000;
+    pool.total_fees_earned = 250;
+    assert_eq!(pool.total_pool_value(), Some(1_250), "value includes fees in mode 1");
+    assert_eq!(pool.principal_tvl(), Some(1_000), "cap basis excludes fees");
+}

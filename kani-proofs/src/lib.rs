@@ -271,6 +271,29 @@ pub fn senior_balance_rl(
     pv.checked_sub(effective_junior_balance(deposited, withdrawn, flushed, returned, junior_balance))
 }
 
+/// Mirror of StakePool::total_pool_value() AFTER the issue-#169 i128 fix: the mode-1
+/// (fee-inclusive, RL-aware) value summed in a wide SIGNED intermediate. In mode 1 a
+/// withdrawer's payout includes their fee share, so `withdrawn` can exceed `deposited`;
+/// the pre-fix left-to-right `deposited.checked_sub(withdrawn)` underflowed to None and
+/// bricked the pool. Summing signed makes order irrelevant — we fail closed only when the
+/// FINAL value is genuinely out of range (negative = insolvent, or > u32::MAX here).
+pub fn total_pool_value_mode1_rl_i128(
+    deposited: u32,
+    withdrawn: u32,
+    flushed: u32,
+    returned: u32,
+    fees: u32,
+    realized_junior_loss: u32,
+) -> Option<u32> {
+    let v = deposited as i64 - withdrawn as i64 - flushed as i64 + returned as i64 + fees as i64
+        - realized_junior_loss as i64;
+    if v < 0 || v > u32::MAX as i64 {
+        None
+    } else {
+        Some(v as u32)
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // KANI PROOFS — 54 harnesses (52 bounded + 2 INDUCTIVE §14)
 // PERC-783: kani::cover!() added to all symbolic proofs to guard
@@ -1656,6 +1679,40 @@ mod proofs {
         };
         kani::cover!(sb + ejb == pv, "COVER: tranche-decomposition path is reachable");
         assert!(sb as u64 + ejb as u64 == pv as u64, "senior + effective_junior == pool value");
+    }
+
+    /// ISSUE #169 — mode-1 pool value never falsely bricks; insolvency still fails closed.
+    ///
+    /// In a mode-1 trading pool a withdrawer's payout includes accrued fees, so
+    /// `total_withdrawn` can exceed `total_deposited`. The pre-fix left-to-right
+    /// `deposited.checked_sub(withdrawn)` underflowed to None and PERMANENTLY bricked the
+    /// pool (LP funds trapped) even when the true value was positive.
+    ///
+    /// THEOREM: for any ledger, the i128 value equals the true signed sum whenever that
+    /// sum is in range — INCLUDING when withdrawn > deposited (the case that bricked) —
+    /// and returns None exactly when the true value is negative (genuine insolvency).
+    #[kani::proof]
+    fn proof_169_mode1_no_false_underflow_brick() {
+        let dep: u32 = kani::any();
+        let wd: u32 = kani::any();
+        let flush: u32 = kani::any();
+        let ret: u32 = kani::any();
+        let fees: u32 = kani::any();
+        let rl: u32 = kani::any();
+        kani::assume(dep <= 0xFFFF && wd <= 0xFFFF && flush <= 0xFFFF && ret <= 0xFFFF && fees <= 0xFFFF && rl <= 0xFFFF);
+
+        let true_value = dep as i64 - wd as i64 - flush as i64 + ret as i64 + fees as i64 - rl as i64;
+        let got = total_pool_value_mode1_rl_i128(dep, wd, flush, ret, fees, rl);
+
+        if (0..=u32::MAX as i64).contains(&true_value) {
+            kani::cover!(wd > dep, "COVER: the fee-withdrawal (withdrawn>deposited) path is reachable");
+            assert!(
+                got == Some(true_value as u32),
+                "#169: returns the true value even when withdrawn>deposited — no false brick"
+            );
+        } else if true_value < 0 {
+            assert!(got.is_none(), "#169: genuine insolvency still fails closed (None)");
+        }
     }
 
     /// ISSUE #161 — recovery never windfalls the protected senior tranche.

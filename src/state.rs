@@ -473,25 +473,34 @@ impl StakePool {
     /// includes the flushed amount. Missing `-flushed` causes phantom inflation
     /// that makes the pool insolvent after any flush+return cycle.
     pub fn total_pool_value(&self) -> Option<u64> {
-        let base = self
-            .total_deposited
-            .checked_sub(self.total_withdrawn)?
-            .checked_sub(self.total_flushed)?
-            .checked_add(self.total_returned)?;
-        // PERC-272: Include accrued trading fees for trading LP pools
-        let with_fees = if self.pool_mode == 1 {
-            base.checked_add(self.total_fees_earned)?
+        // #169: sum in a wide SIGNED intermediate. In mode 1 a withdrawer's payout
+        // includes their share of accrued fees, so `total_withdrawn` can legitimately
+        // exceed `total_deposited` once fees have been paid out. The old left-to-right
+        // `total_deposited.checked_sub(total_withdrawn)` then underflowed to None and
+        // PERMANENTLY BRICKED the pool (LP funds trapped) even though the true value was
+        // still positive. Computing in i128 makes evaluation order irrelevant; we only
+        // fail closed when the FINAL value is genuinely out of range — i.e. negative
+        // (insolvent: claims exceed assets) or impossibly large. This preserves the
+        // insolvency guard while eliminating the false-underflow brick.
+        //
+        // PERC-272: accrued trading fees count toward a mode-1 trading pool's value.
+        let fees = if self.pool_mode == 1 {
+            self.total_fees_earned as i128
         } else {
-            base
+            0
         };
-        // #161: subtract any realized (forfeited) junior loss. When the last junior exits
-        // during a loss, that portion is settled via `total_returned += L` (so it leaves
-        // the recoverable-loss ledger and lifts the deposit gate), and recorded in
-        // `realized_junior_loss`. The settle inflates the raw `+ total_returned` term by L
-        // without any tokens arriving, so we subtract it back here — the corresponding
-        // tokens (if ever physically returned) sit as DEAD value and are NOT claimable by
-        // senior, preventing the recovery-snipe windfall. Normally 0 (no-op).
-        with_fees.checked_sub(self.realized_junior_loss())
+        // #161: subtract realized (forfeited) junior loss — dead value the exit booking
+        // added to `total_returned` but that is NOT claimable by senior. Normally 0.
+        let value = self.total_deposited as i128 - self.total_withdrawn as i128
+            - self.total_flushed as i128
+            + self.total_returned as i128
+            + fees
+            - self.realized_junior_loss() as i128;
+        if value < 0 || value > u64::MAX as i128 {
+            None
+        } else {
+            Some(value as u64)
+        }
     }
 
     /// Principal-basis TVL: `deposited − withdrawn − flushed + returned`, WITHOUT
@@ -503,13 +512,17 @@ impl StakePool {
     /// `total_pool_value()` (fee-inclusive). For mode-0 pools this equals
     /// `total_pool_value()`.
     pub fn principal_tvl(&self) -> Option<u64> {
-        self.total_deposited
-            .checked_sub(self.total_withdrawn)?
-            .checked_sub(self.total_flushed)?
-            .checked_add(self.total_returned)?
-            // #161: exclude realized (forfeited) junior loss — it is dead value, not live
-            // principal, so it must not count toward the deposit cap.
-            .checked_sub(self.realized_junior_loss())
+        // #169: same i128 widening as total_pool_value(). In mode 1, fee-inclusive
+        // withdrawals can push total_withdrawn past total_deposited; the old checked_sub
+        // underflowed to None and bricked DEPOSITS (the cap check fails closed on None).
+        // A principal basis can't be negative, so clamp a net-negative result to 0 — no
+        // live principal means the cap simply admits new deposits, rather than bricking.
+        // #161: realized (forfeited) junior loss is dead value, excluded from the cap basis.
+        let value = self.total_deposited as i128 - self.total_withdrawn as i128
+            - self.total_flushed as i128
+            + self.total_returned as i128
+            - self.realized_junior_loss() as i128;
+        Some(value.clamp(0, u64::MAX as i128) as u64)
     }
 
     /// Calculate LP tokens for a deposit amount.
