@@ -1284,20 +1284,23 @@ fn process_flush_to_insurance(
         }
     }
 
-    // Verify vault balance — can't flush more than what's available in vault.
-    // Available = total_deposited - total_withdrawn - total_flushed + total_returned
+    // Verify vault balance — can't flush more than the pool's value physically in the vault.
     //
-    // The original formula omitted `+ total_returned`.  After AdminWithdrawInsurance
-    // increases total_returned, the vault physically holds those tokens again, but the
-    // old formula still subtracted the full total_flushed, making the available amount
-    // appear lower (or underflow) even when real tokens exist.  Use the same formula as
-    // total_pool_value() — which already accounts for all four counters correctly.
-    let available = pool
-        .total_deposited
-        .checked_sub(pool.total_withdrawn)
-        .and_then(|v| v.checked_sub(pool.total_flushed))
-        .and_then(|v| v.checked_add(pool.total_returned))
-        .ok_or(StakeError::Overflow)?;
+    // #198: the previous inline chain `((D - W) - F) + R` (u64, left-to-right) UNDERFLOWED
+    // at the intermediate `(D - W) - F` whenever `D - W < F` (equivalently total_pool_value()
+    // < total_returned) and failed the flush with Overflow even though `D - W - F + R` was
+    // positive and the tokens were in the vault — the same false-underflow brick that
+    // total_pool_value() was widened to i128 to avoid (#169); this duplicate was missed.
+    //
+    // It ALSO over-counted by omitting `- realized_junior_loss`: the #161 last-junior-exit
+    // booking raises total_returned by the forfeited loss WITHOUT a token movement (a phantom
+    // return recorded in realized_junior_loss), so `D - W - F + R` exceeds the real vault
+    // balance by realized_junior_loss. The vault physically holds exactly total_pool_value()
+    // (= D - W - F + R - realized_junior_loss for a mode-0 pool; fees are 0 here because flush
+    // is mode-0 only, gated above). Reuse the canonical i128-widened fn: it is the exact
+    // flushable balance, can never report more than the vault holds, and returns None only on
+    // genuine insolvency — which correctly fails the flush closed.
+    let available = pool.total_pool_value().ok_or(StakeError::Overflow)?;
     if amount > available {
         return Err(StakeError::InsufficientVaultBalance.into());
     }
