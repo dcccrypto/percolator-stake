@@ -99,8 +99,8 @@ pub enum StakeInstruction {
     /// otherwise-permanent bind: without it, a stake redeploy to a new program id
     /// would orphan insurance_authority on the dead program and brick the flush.
     /// Migration: rotate to the admin wallet from the OLD program before
-    /// decommissioning it, then re-bind from the NEW program. Only works while the
-    /// PDA is the current authority (i.e. after a bind).
+    /// decommissioning it, then re-bind from the NEW program before BurnAssetAdmin.
+    /// Only works while the PDA is the current authority and before the final burn.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
@@ -114,15 +114,15 @@ pub enum StakeInstruction {
     /// 21: BurnAssetAdmin — irrevocably remove the admin's rotate-back capability.
     /// Calls UpdateAssetAuthority(kind=0, new_pubkey=[0;32]) to burn asset_admin to
     /// zero. After this, no key can rotate any per-asset authority (insurance,
-    /// operator, backing, oracle) back to an admin-controlled key. Only the current
-    /// holder of each authority can self-rotate it.
+    /// operator, backing, oracle) back to an admin-controlled key through stake.
+    /// Stake also records the burn and disables its PDA-signed rotate escapes.
     ///
     /// IRREVERSIBLE. Only call this after BindInsuranceAuthority has completed.
     /// Must NOT be called again if asset_admin is already zero (causes Unauthorized).
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (current asset_admin == pool.admin)
-    ///   1. `[]` Pool PDA
+    ///   1. `[writable]` Pool PDA
     ///   2. `[]` Vault authority PDA (placeholder new_authority slot — not checked for burn)
     ///   3. `[writable]` Slab / market account (wrapper-owned)
     ///   4. `[]` Percolator program
@@ -133,11 +133,11 @@ pub enum StakeInstruction {
     /// kind=2 (ASSET_AUTH_INSURANCE_OPERATOR). The vault_auth PDA signs as the
     /// CURRENT operator (invoke_signed); new_target co-signs the outer tx.
     ///
-    /// Part of the full no-lockout migration sequence:
+    /// Part of the full no-lockout migration sequence, before final burn:
     ///   1. RotateInsuranceAuthority (tag 20): authority PDA → admin wallet
     ///   2. RotateInsuranceOperator  (tag 22): operator  PDA → admin wallet
     ///   3. Re-bind from NEW program (BindInsuranceAuthority, tag 19)
-    ///   4. BurnAssetAdmin (tag 21) — only if not already burned
+    ///   4. BurnAssetAdmin (tag 21) when the new bind is final
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)

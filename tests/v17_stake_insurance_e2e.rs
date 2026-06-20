@@ -8,9 +8,10 @@
 //!    RED before bind (wrapper rejects, auth not set yet).
 //!    GREEN after bind + wrapper D-STAKE-1 guard fires on the drain attempt.
 //!
-//! 2. no-lockout: the full migration round-trip works:
-//!    bind (old program) -> flush -> rotate to admin -> re-bind (new program) -> flush.
-//!    The bind is NOT a permanent weld — the PDA can always recover custody.
+//! 2. no-lockout-before-burn: the full migration round-trip works before the
+//!    final burn:
+//!    bind (old program) -> flush -> rotate to admin -> re-bind (new program)
+//!    -> burn -> flush. The bind can recover custody until BurnAssetAdmin seals it.
 //!
 //! Wire: [65u8][0x00 0x00][0x01][pubkey:32] = 36 bytes (tag 65, asset_index=0,
 //! kind=ASSET_AUTH_INSURANCE=1). Verified at byte level by cpi_tags.rs tests.
@@ -28,6 +29,7 @@
 
 use bytemuck::Zeroable;
 use litesvm::LiteSVM;
+use percolator_stake::error::StakeError;
 use percolator_stake::state::{
     derive_pool_pda, derive_vault_authority, StakePool, STAKE_POOL_SIZE,
 };
@@ -419,7 +421,7 @@ fn withdraw_insurance_asset_ix(args: WithdrawInsuranceArgs) -> Instruction {
 }
 
 /// BurnAssetAdmin (stake tag 21): burns asset_admin to zero via stake CPI.
-/// Accounts: [admin(signer), pool_pda, vault_auth, slab(w), percolator_program]
+/// Accounts: [admin(signer), pool_pda(w), vault_auth, slab(w), percolator_program]
 fn burn_asset_admin_ix(
     ctx: &PoolCtx,
     wrapper_id: Pubkey,
@@ -430,7 +432,7 @@ fn burn_asset_admin_ix(
         program_id: ctx.stake_id,
         accounts: vec![
             AccountMeta::new(*admin, true),
-            AccountMeta::new_readonly(ctx.pool_pda, false),
+            AccountMeta::new(ctx.pool_pda, false),
             AccountMeta::new_readonly(ctx.vault_auth, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(wrapper_id, false),
@@ -646,10 +648,11 @@ fn flush_applies_insurance_after_bind_v17() {
 //   D-STAKE-1 does NOT block path (a) — it only overrides admin_shutdown_authorized.
 //   Result: admin drains insurance even after the bind.
 //
-// THE FIX (secure bind sequence — all three CPIs in one BindInsuranceAuthority tx):
+// THE FIX (secure bind sequence):
 //   CPI 1: insurance_authority (kind=1) → vault_auth PDA (gates FlushToInsurance)
 //   CPI 2: insurance_operator  (kind=2) → vault_auth PDA (blocks path (a))
-//   CPI 3: asset_admin         (kind=0) → [0;32] burn  (blocks rotating op back)
+//   CPI 3: asset_admin         (kind=0) → [0;32] burn  (finalizes the bind and
+//          disables stake's rotate-back escape)
 //
 // OPERATIVE TEST STRUCTURE (non-hollow, no pre-arrangement of secure state):
 //
@@ -657,7 +660,7 @@ fn flush_applies_insurance_after_bind_v17() {
 //   (operator still admin). Admin calls tag-57 → drain SUCCEEDS. This proves the
 //   test bites — without the operator move, the drain works.
 //
-//   GREEN AFTER FULL SECURE BIND: fresh market; full 3-CPI bind issued. Admin calls
+//   GREEN AFTER FULL SECURE BIND: fresh market; bind + burn issued. Admin calls
 //   tag-57 WITHOUT any pre-rotation — drain FAILS (Custom(8) Unauthorized) because
 //   insurance_operator is the PDA (not admin) → local_authorized=false, AND
 //   admin_shutdown_authorized is blocked by asset_index==0 AND D-STAKE-1.
@@ -668,10 +671,9 @@ fn flush_applies_insurance_after_bind_v17() {
 // before the drain attempt (v16_stake_insurance_e2e.rs Phase C), masking the gap
 // in the same way. The gap was present but untested in v16.
 //
-// WIRE NOTE: after the secure bind, asset_admin is burned to [0;32]. The
-// no-lockout RotateInsuranceAuthority (tag 20) remains valid — it signs as the
-// PDA (vault_auth) as the CURRENT insurance_authority, not as asset_admin.
-// So the migration escape is not broken by the burn.
+// WIRE NOTE: after the secure bind, asset_admin is burned to [0;32]. The final
+// burn also sets stake-side state that disables its PDA-signed rotate escapes,
+// so migrations must rotate and re-bind before this step.
 
 /// RED CONTROL: bind insurance_authority ONLY (using a direct tag-65 CPI that
 /// does NOT move the operator or burn asset_admin). Admin still holds operator.
@@ -689,7 +691,7 @@ fn flush_applies_insurance_after_bind_v17() {
 /// Test plan:
 ///   1. Fresh market, no bind at all. Admin has insurance_operator = admin.
 ///      Admin calls tag-57 → drain SUCCEEDS (local_authorized=true). [RED]
-///   2. Second fresh market, full secure bind (3-CPI). Admin calls tag-57 WITHOUT
+///   2. Second fresh market, full secure bind + burn. Admin calls tag-57 WITHOUT
 ///      pre-rotating anything → drain FAILS (Custom(8)). [GREEN]
 #[test]
 fn no_admin_drain_before_and_after_bind() {
@@ -894,6 +896,117 @@ fn no_admin_drain_before_and_after_bind() {
     );
 }
 
+/// Regression for the final secure-bind boundary:
+/// after BurnAssetAdmin succeeds, stake must not use its PDA signer to rotate
+/// insurance_authority or insurance_operator back to the admin wallet.
+///
+/// On the vulnerable implementation, both rotate instructions below succeed
+/// after the burn. Once authority+operator are admin again, the admin can call
+/// wrapper tag 57 (`WithdrawInsuranceAsset`) and drain the flushed insurance via
+/// the local-authorized path. The fixed implementation rejects the first rotate
+/// in stake with StakeError::Unauthorized.
+#[test]
+fn secure_bind_burn_blocks_rotate_back_to_admin() {
+    let mut svm = LiteSVM::new().with_spl_programs();
+    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    svm.add_program_from_file(stake_id, stake_so()).unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
+
+    let admin = Keypair::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+
+    let (market, mint, wrapper_vault) =
+        build_live_market_v17(&mut svm, wrapper_id, token_program, &admin, &payer);
+    let pool = add_stake_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        FLUSH_AMOUNT,
+    );
+
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&pool, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("bind authority+operator to PDA");
+
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        burn_asset_admin_ix(&pool, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("burn asset_admin and seal stake rotate escapes");
+
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        flush_ix(
+            &pool,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            FLUSH_AMOUNT,
+        ),
+    )
+    .expect("flush insurance into wrapper vault");
+    assert_eq!(token_amount(&svm, &wrapper_vault), FLUSH_AMOUNT);
+
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        rotate_ix(&pool, wrapper_id, market, &admin.pubkey(), &admin.pubkey()),
+    )
+    .expect_err("post-burn rotate-back must be rejected by stake");
+    assert!(
+        matches!(
+            err,
+            TransactionError::InstructionError(_, InstructionError::Custom(code))
+                if code == StakeError::Unauthorized as u32
+        ),
+        "expected stake Unauthorized=2, got {err:?}"
+    );
+
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        rotate_operator_stake_ix(&pool, wrapper_id, market, &admin.pubkey(), &admin.pubkey()),
+    )
+    .expect_err("post-burn operator rotate-back must be rejected by stake");
+    assert!(
+        matches!(
+            err,
+            TransactionError::InstructionError(_, InstructionError::Custom(code))
+                if code == StakeError::Unauthorized as u32
+        ),
+        "expected stake Unauthorized=2, got {err:?}"
+    );
+
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        FLUSH_AMOUNT,
+        "post-burn rotate attempts did not move funds"
+    );
+}
+
 /// No-admin-drain: a third-party attacker (not admin, not insurance_operator) also
 /// cannot drain. This is an independent check from the admin case above.
 #[test]
@@ -994,20 +1107,18 @@ fn no_attacker_drain_after_bind() {
 
 // ── NO-LOCKOUT ─────────────────────────────────────────────────────────────────
 //
-// The secure bind is NOT a permanent weld. Full migration round-trip (v17):
-//   1. OLD program: BindInsuranceAuthority (CPI 1+2) + BurnAssetAdmin (CPI 3)
-//      + flush (works)
+// The secure bind allows migration until the final burn. Full migration round-trip (v17):
+//   1. OLD program: BindInsuranceAuthority (CPI 1+2) + flush (works)
 //   2. ROTATE: RotateInsuranceAuthority (tag 20) + RotateInsuranceOperator (tag 22)
 //      → both to admin wallet. Old PDA is now no longer the authority or operator.
 //   3. OLD program flush now REJECTED (PDA no longer the insurance_authority)
 //   4. NEW program: BindInsuranceAuthority (CPI 1+2) — re-binds authority+operator
-//      to new vault_auth_B PDA. BurnAssetAdmin NOT called again (already burned).
-//   5. flush B works.
+//      to new vault_auth_B PDA.
+//   5. BurnAssetAdmin (CPI 3) once the new bind is final.
+//   6. flush B works.
 //
-// The asset_admin burn is a ONCE-per-market operation. After the burn, re-binding
-// from a new program still works because BindInsuranceAuthority only uses CPI 1+2
-// (not CPI 3). The admin IS the current authority+operator after the rotation, so
-// both CPIs succeed.
+// The asset_admin burn is a ONCE-per-market operation and disables stake's
+// PDA-signed rotate escape. Redeploy migrations must rotate before this final step.
 //
 // This proves the no-lockout guarantee holds under the v17 tag-65 wire.
 
@@ -1050,16 +1161,6 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
     )
     .expect("bind A (old program): authority+operator → PDA_A");
 
-    // Step 1b: BurnAssetAdmin — burns asset_admin to zero (once per market).
-    svm.expire_blockhash();
-    send(
-        &mut svm,
-        &payer,
-        &[&admin],
-        burn_asset_admin_ix(&pool_a, wrapper_id, market, &admin.pubkey()),
-    )
-    .expect("burn asset_admin (once per market)");
-
     // Locate insurance_authority in market data to track it across rotations.
     // After bind, insurance_authority == vault_auth_A. We find its offset.
     // Note: insurance_operator is also vault_auth_A — find_pubkey_offset returns
@@ -1088,7 +1189,8 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
     .expect("flush A");
     assert_eq!(token_amount(&svm, &wrapper_vault), 40_000, "flush A applied");
 
-    // Step 2a: ROTATE insurance_authority off PDA_A to the admin wallet (tag 20).
+    // Step 2a: ROTATE insurance_authority off PDA_A to the admin wallet (tag 20)
+    // before the final asset_admin burn.
     // The PDA signs as current insurance_authority; admin co-signs as new target.
     svm.expire_blockhash();
     send(
@@ -1105,7 +1207,8 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
     )
     .expect("rotate insurance_authority: PDA_A → admin wallet");
 
-    // Step 2b: ROTATE insurance_operator off PDA_A to the admin wallet (tag 22).
+    // Step 2b: ROTATE insurance_operator off PDA_A to the admin wallet (tag 22)
+    // before the final asset_admin burn.
     // The PDA signs as current operator; admin co-signs as new target.
     svm.expire_blockhash();
     send(
@@ -1148,7 +1251,7 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
 
     // Step 4: NEW program re-bind. Admin is the current insurance_authority AND
     // insurance_operator (from the rotation in step 2a+2b). BindInsuranceAuthority
-    // issues CPI 1+2 to move both to PDA_B. No BurnAssetAdmin (already burned).
+    // issues CPI 1+2 to move both to PDA_B.
     svm.expire_blockhash();
     let pool_b = add_stake_pool(
         &mut svm,
@@ -1179,7 +1282,41 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
         "insurance_authority re-bound to NEW PDA_B"
     );
 
-    // Step 5: flush B works (PDA_B is the insurance_authority).
+    // Step 5: final burn. After this, stake refuses to rotate authority/operator
+    // back to admin through PDA_B.
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        burn_asset_admin_ix(&pool_b, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("burn asset_admin after final re-bind");
+
+    svm.expire_blockhash();
+    let err_after_burn = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        rotate_ix(
+            &pool_b,
+            wrapper_id,
+            market,
+            &admin.pubkey(),
+            &admin.pubkey(),
+        ),
+    )
+    .expect_err("post-burn rotate from new program must reject");
+    assert!(
+        matches!(
+            err_after_burn,
+            TransactionError::InstructionError(_, InstructionError::Custom(code))
+                if code == StakeError::Unauthorized as u32
+        ),
+        "expected stake Unauthorized=2 after final burn, got {err_after_burn:?}"
+    );
+
+    // Step 6: flush B works (PDA_B is still the insurance_authority).
     svm.expire_blockhash();
     send(
         &mut svm,

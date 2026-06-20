@@ -214,7 +214,9 @@ impl StakePool {
     //   [33..41] = junior_balance: u64 (LE)
     //   [41..49] = junior_total_lp: u64 (LE)
     //   [49..51] = junior_fee_mult_bps: u16 (LE, default 20000 = 2x)
-    //   [51..64] = free
+    //   [51..59] = realized_junior_loss: u64 (LE)
+    //   [59]     = asset_admin_burned (0=false, 1=true)
+    //   [60..64] = free
     // ════════════════════════════════════════════════════════════
 
     /// Whether the market has been resolved (blocks new deposits).
@@ -306,6 +308,19 @@ impl StakePool {
         self._reserved[51..59].copy_from_slice(&val.to_le_bytes());
     }
 
+    /// Whether BurnAssetAdmin has completed for this pool's market.
+    ///
+    /// Once true, stake-side rotate escapes stay disabled so the wrapper roles
+    /// cannot be moved back to an admin-controlled key after the final burn.
+    pub fn asset_admin_burned(&self) -> bool {
+        self._reserved[59] == 1
+    }
+
+    /// Set the BurnAssetAdmin completion flag. Stored at `_reserved[59]`.
+    pub fn set_asset_admin_burned(&mut self, burned: bool) {
+        self._reserved[59] = if burned { 1 } else { 0 };
+    }
+
     /// Loss-adjusted junior tranche balance.
     ///
     /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
@@ -389,7 +404,8 @@ impl StakePool {
     // Bytes 13-15: reserved padding
     // Bytes 16-23: epoch_high_water_tvl (u64 LE)
     // Bytes 24-31: hwm_last_epoch (u64 LE)
-    // Bytes 32-63: used by PERC-303 tranche state (see layout above)
+    // Bytes 32-63: used by PERC-303 tranche state + asset_admin_burned
+    //              (see layout above)
     //
     // CRITICAL: hwm_enabled was previously at byte 9 — the same byte used by
     // market_resolved (PERC-303).  That collision meant enabling HWM caused the
@@ -925,6 +941,28 @@ mod tests {
         pool.set_hwm_enabled(true);
         assert_eq!(pool._reserved[9], 0, "byte 9 should be untouched");
         assert_eq!(pool._reserved[10], 1, "hwm_enabled should be at byte 10");
+    }
+
+    #[test]
+    fn test_asset_admin_burned_flag_uses_reserved_byte_59() {
+        let mut pool = StakePool::zeroed();
+        assert!(!pool.asset_admin_burned());
+
+        pool.set_realized_junior_loss(0x0102_0304_0506_0708);
+        pool.set_asset_admin_burned(true);
+
+        assert!(pool.asset_admin_burned());
+        assert_eq!(pool._reserved[59], 1, "asset_admin_burned should be byte 59");
+        assert_eq!(
+            pool.realized_junior_loss(),
+            0x0102_0304_0506_0708,
+            "asset_admin_burned must not clobber realized_junior_loss"
+        );
+
+        pool.set_asset_admin_burned(false);
+        assert!(!pool.asset_admin_burned());
+        assert_eq!(pool._reserved[59], 0);
+        assert_eq!(pool.realized_junior_loss(), 0x0102_0304_0506_0708);
     }
 
     #[test]

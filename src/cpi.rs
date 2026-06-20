@@ -11,9 +11,11 @@
 //!   * UpdateAssetAuthority (tag 65)      — burn `asset_admin` (kind=0,
 //!     new_pubkey=[0;32]) so the admin cannot rotate any authority back.
 //!
-//! The last three CPIs are issued atomically in BindInsuranceAuthority (tag 19)
-//! to guarantee the STRONG no-admin-drain property: after bind, no admin key
-//! can drain insurance via WithdrawInsuranceAsset (tag 57).
+//! The authority and operator CPIs are issued together in BindInsuranceAuthority
+//! (tag 19); the asset_admin burn is a separate finalization step
+//! (BurnAssetAdmin, tag 21). Together they guarantee the STRONG no-admin-drain
+//! property: after bind + burn, no admin key can drain insurance via
+//! WithdrawInsuranceAsset (tag 57), and stake will not rotate the PDA roles back.
 //!
 //! V17 WIRE CHANGE (collision row 43): the v16 wire used tag 32 `UpdateAuthority`
 //! with kind byte = 2 (AUTHORITY_INSURANCE) and a 34-byte payload. The v17 auth

@@ -1531,11 +1531,9 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 /// BindInsuranceAuthority + BurnAssetAdmin form the COMPLETE secure-bind sequence.
 ///
 /// NOTE: the two CPIs are split from the admin-burn because BurnAssetAdmin is
-/// irreversible and only needed once per market. On a re-bind after a redeploy
-/// (RotateInsuranceAuthority + RotateInsuranceOperator back to admin, then re-bind
-/// from the new program), the admin burn is already done — calling BurnAssetAdmin
-/// again would fail (asset_admin already zero). Two separate instructions avoids
-/// that footgun while preserving atomicity of the authority moves.
+/// irreversible and only needed once per market. On a redeploy, rotate authority
+/// and operator back to admin first, bind from the new program, and only then call
+/// BurnAssetAdmin when the new bind is final.
 fn process_bind_insurance_authority(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1632,13 +1630,14 @@ fn process_bind_insurance_authority(
 ///
 /// This is the FINAL HARDENING step of the secure-bind sequence:
 ///   1. BindInsuranceAuthority — moves authority + operator to PDA
-///   2. BurnAssetAdmin         — burns the admin's rotate-back escape hatch
+///   2. BurnAssetAdmin         — burns the admin's rotate-back escape hatch and
+///      records the finality in stake state
 ///
 /// After BurnAssetAdmin:
 ///   - asset_admin == [0;32] (no key can rotate per-asset authorities for this asset)
 ///   - Only the current holder of each authority can self-rotate it
-///   - The PDA (vault_auth) is permanently the insurance_authority and insurance_operator
-///     until a RotateInsuranceAuthority / RotateInsuranceOperator escape is exercised
+///   - The PDA (vault_auth) stays the insurance_authority and insurance_operator
+///     unless rotation happened before the burn
 ///
 /// IRREVERSIBILITY: asset_admin [0;32] can never be restored. This is intentional.
 /// Once burned, the secure state is locked. Only call this when committed.
@@ -1649,7 +1648,7 @@ fn process_bind_insurance_authority(
 ///
 /// Accounts:
 ///   0. `[signer, writable]` Admin (current asset_admin == pool.admin)
-///   1. `[]` Pool PDA (read, validates admin)
+///   1. `[writable]` Pool PDA (records that asset_admin has been burned)
 ///   2. `[]` Vault authority PDA (placeholder new_authority slot — not checked for burn)
 ///   3. `[writable]` Slab / market account (wrapper-owned)
 ///   4. `[]` Percolator program
@@ -1668,6 +1667,7 @@ fn process_burn_asset_admin(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    validate_account_writable(pool_pda)?;
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
 
@@ -1682,6 +1682,10 @@ fn process_burn_asset_admin(
         }
         validate_pool_version(pool)?;
         if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        if pool.asset_admin_burned() {
+            msg!("BurnAssetAdmin: asset_admin already burned for this pool");
             return Err(StakeError::Unauthorized.into());
         }
         (pool.slab, pool.percolator_program)
@@ -1710,7 +1714,13 @@ fn process_burn_asset_admin(
         slab,       // market
     )?;
 
-    msg!("BurnAssetAdmin: asset_admin burned to zero — admin's rotate-back capability permanently removed");
+    {
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+        pool.set_asset_admin_burned(true);
+    }
+
+    msg!("BurnAssetAdmin: asset_admin burned to zero — stake rotate-back escape permanently disabled");
     Ok(())
 }
 
@@ -1729,7 +1739,7 @@ fn process_burn_asset_admin(
 ///   1. RotateInsuranceAuthority (tag 20): insurance_authority PDA_A → admin wallet
 ///   2. RotateInsuranceOperator  (tag 22): insurance_operator  PDA_A → admin wallet
 ///   3. Re-bind from NEW program: BindInsuranceAuthority (tags 19) binds both to PDA_B
-///   4. BurnAssetAdmin only if not already burned (idempotent guard applies)
+///   4. BurnAssetAdmin once the new bind is final
 ///
 /// Accounts:
 ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
@@ -1774,6 +1784,10 @@ fn process_rotate_insurance_operator(
         if pool.admin != admin.key.to_bytes() {
             return Err(StakeError::Unauthorized.into());
         }
+        if pool.asset_admin_burned() {
+            msg!("RotateInsuranceOperator: asset_admin burn is final; rotate-back is disabled");
+            return Err(StakeError::Unauthorized.into());
+        }
         (pool.slab, pool.percolator_program)
     };
 
@@ -1813,8 +1827,8 @@ fn process_rotate_insurance_operator(
 /// `new_target` co-signing the outer tx as the NEW authority. The escape from the
 /// otherwise-permanent bind (a stake redeploy must rotate to the admin wallet from
 /// the old program before decommissioning, then re-bind from the new program).
-/// Only succeeds while the PDA is the current authority (i.e. after a bind);
-/// otherwise the wrapper rejects with Unauthorized.
+/// Only succeeds before BurnAssetAdmin has completed and while the PDA is the
+/// current authority; otherwise stake or the wrapper rejects with Unauthorized.
 fn process_rotate_insurance_authority(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1851,6 +1865,10 @@ fn process_rotate_insurance_authority(
         validate_pool_version(pool)?;
         // Admin-gated: only the pool admin may rotate the insurance authority.
         if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        if pool.asset_admin_burned() {
+            msg!("RotateInsuranceAuthority: asset_admin burn is final; rotate-back is disabled");
             return Err(StakeError::Unauthorized.into());
         }
         (pool.slab, pool.percolator_program)
