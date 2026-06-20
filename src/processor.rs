@@ -94,6 +94,19 @@ fn create_or_adopt_pda<'a>(
 /// withdrawals — `clock.slot` would never reach the saturating deadline (#121).
 const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 
+/// Upper bound on `hwm_floor_bps` (90%). The high-water-mark floor is a per-epoch
+/// drain RATE LIMITER, not a withdrawal kill switch. At 10_000 (100%) the floor
+/// equals the full water mark, and because `refresh_hwm` keeps the mark at or above
+/// current TVL (and re-anchors it to current TVL on every new epoch), ANY positive
+/// withdrawal lands below the floor — a permanent, pool-wide withdrawal freeze that
+/// even survives epoch rollover. Capping strictly below 100% guarantees the floor is
+/// always below the mark; 90% in particular keeps at least 10% of peak TVL
+/// withdrawable per epoch, so the feature stays a rate limiter while still allowing a
+/// very aggressive anti-drain posture. This mirrors `MAX_COOLDOWN_SLOTS` (#121),
+/// which finitely bounds the cooldown for the same "an admin must never be able to
+/// permanently lock withdrawals" reason.
+const MAX_HWM_FLOOR_BPS: u16 = 9_000;
+
 /// Pool PDA account index in the InitPool-compatible account layout:
 /// admin=0, slab=1, pool_pda=2.
 const INIT_POOL_POOL_PDA_INDEX: usize = 2;
@@ -112,11 +125,17 @@ fn validate_cooldown_slots(cooldown_slots: u64) -> ProgramResult {
     Ok(())
 }
 
-/// Validate HWM floor basis points: must be in range [1, 10000].
+/// Validate HWM floor basis points: must be in range [1, MAX_HWM_FLOOR_BPS].
+///
+/// The upper bound is strictly below 100% (10_000): a 100% floor would equal the
+/// high-water mark and, because `refresh_hwm` keeps the mark at or above current TVL
+/// each epoch, would permanently freeze every withdrawal. Bounding it below 100%
+/// keeps the floor a per-epoch drain rate limiter that always leaves exit headroom.
 fn validate_hwm_floor_bps(hwm_floor_bps: u16) -> ProgramResult {
-    if hwm_floor_bps == 0 || hwm_floor_bps > 10_000 {
+    if hwm_floor_bps == 0 || hwm_floor_bps > MAX_HWM_FLOOR_BPS {
         msg!(
-            "Invalid hwm_floor_bps: must be 1-10000, got {}",
+            "Invalid hwm_floor_bps: must be 1-{}, got {}",
+            MAX_HWM_FLOOR_BPS,
             hwm_floor_bps
         );
         return Err(ProgramError::InvalidArgument);
@@ -2746,5 +2765,73 @@ mod tests {
         apply_hwm_config(&mut pool, true, 9000);
         assert!(pool.hwm_enabled());
         assert_eq!(pool.hwm_floor_bps(), 9000);
+    }
+
+    // ── #196: hwm_floor_bps must be bounded strictly below 100% ──
+    //
+    // The HWM floor is a per-epoch drain rate limiter, not a kill switch. At exactly
+    // 10_000 (100%) the floor equals the high-water mark and — because refresh_hwm
+    // keeps the mark >= current TVL and re-anchors it every new epoch — EVERY positive
+    // withdrawal is permanently blocked (a pool-wide freeze that survives epoch
+    // rollover). validate_hwm_floor_bps must therefore reject 100% (and anything above
+    // the cap) while still accepting the full legitimate rate-limiter range.
+
+    #[test]
+    fn test_validate_hwm_floor_bps_rejects_100_percent_and_above_cap() {
+        // The exact freeze value from #196.
+        assert!(
+            validate_hwm_floor_bps(10_000).is_err(),
+            "100% floor must be rejected: it permanently freezes all withdrawals (#196)"
+        );
+        // One basis point past the cap, and the u16 extreme, must also be rejected.
+        assert!(validate_hwm_floor_bps(MAX_HWM_FLOOR_BPS + 1).is_err());
+        assert!(validate_hwm_floor_bps(u16::MAX).is_err());
+    }
+
+    #[test]
+    fn test_validate_hwm_floor_bps_rejects_zero() {
+        // Unchanged: a 0 floor offers no anti-drain protection and is rejected on the
+        // (validated) enable path.
+        assert!(validate_hwm_floor_bps(0).is_err());
+    }
+
+    #[test]
+    fn test_validate_hwm_floor_bps_accepts_legitimate_range_up_to_cap() {
+        // Every legitimate rate-limiter floor, including the new maximum, is accepted.
+        for bps in [1u16, 5_000, 7_500, MAX_HWM_FLOOR_BPS] {
+            assert!(
+                validate_hwm_floor_bps(bps).is_ok(),
+                "{bps} bps is a valid non-freezing floor and must be accepted"
+            );
+        }
+        // The cap is strictly below 100%, so a withdrawal margin always exists.
+        assert!(MAX_HWM_FLOOR_BPS < 10_000);
+    }
+
+    // Behavioral proof through the same math the withdraw gate calls
+    // (processor.rs withdraw path -> math::hwm_floor / hwm_withdrawal_allowed): at the
+    // capped maximum a healthy pool still permits a positive withdrawal (the feature
+    // stays a limiter), whereas the now-rejected 100% value blocked even a 1-unit exit.
+    #[test]
+    fn test_capped_floor_preserves_a_withdrawal_margin() {
+        use crate::math::{hwm_floor, hwm_withdrawal_allowed};
+
+        let tvl: u64 = 1_000_000;
+        let hwm = tvl; // refresh_hwm invariant: hwm >= current_tvl
+
+        let floor = hwm_floor(hwm, MAX_HWM_FLOOR_BPS).expect("floor computes");
+        assert!(floor < tvl, "capped floor must leave a withdrawable margin");
+        let margin = tvl - floor; // 100_000 at 9_000 bps (10% of peak)
+        assert!(margin > 0);
+        assert!(
+            hwm_withdrawal_allowed(tvl - margin, hwm, MAX_HWM_FLOOR_BPS),
+            "a withdrawal down to the floor must be allowed at the cap"
+        );
+
+        // Contrast: the rejected 100% value blocks even a single unit.
+        assert!(
+            !hwm_withdrawal_allowed(tvl - 1, hwm, 10_000),
+            "100% floor (now rejected by the setter) would block every withdrawal"
+        );
     }
 }
