@@ -94,6 +94,10 @@ fn create_or_adopt_pda<'a>(
 /// withdrawals — `clock.slot` would never reach the saturating deadline (#121).
 const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 
+/// Pool PDA account index in the InitPool-compatible account layout:
+/// admin=0, slab=1, pool_pda=2.
+const INIT_POOL_POOL_PDA_INDEX: usize = 2;
+
 /// Validate cooldown_slots parameter: must be > 0 to enforce cooldown, and bounded
 /// above so it cannot be used to permanently freeze withdrawals.
 fn validate_cooldown_slots(cooldown_slots: u64) -> ProgramResult {
@@ -2517,7 +2521,7 @@ fn process_init_trading_pool(
 
     // Now update pool_mode to 1 (trading LP)
     // AUDIT HIGH-4: Validate pool_pda ownership instead of trusting hardcoded index
-    let pool_ai = &accounts[2]; // Pool PDA is account [2] in InitPool (admin=0, slab=1, pool_pda=2)
+    let pool_ai = &accounts[INIT_POOL_POOL_PDA_INDEX];
     validate_account_owner(pool_ai, program_id)?;
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
     let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
