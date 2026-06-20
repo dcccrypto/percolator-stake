@@ -211,6 +211,52 @@ use crate::state::{
     self, derive_vault_authority, StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE,
 };
 
+// ─────────────────────────────────────────────────────────────────────────
+// #199: length-checked bytemuck reinterpretation helpers.
+//
+// Every handler reinterprets an account's data as a StakePool / StakeDeposit by
+// slicing `data[..SIZE]`. A program-owned but undersized account (e.g. an
+// attacker's own StakeDeposit PDA, which is STAKE_DEPOSIT_SIZE < STAKE_POOL_SIZE,
+// passed where a pool is expected) makes that bare slice PANIC instead of
+// returning a clean ProgramError. These helpers centralize the `len() >= SIZE`
+// guard so it can never be forgotten at a call site, and use `try_from_bytes` so
+// they are also alignment-safe (never panic). Each takes the ALREADY-BORROWED
+// slice (from `try_borrow_mut_data()` / `try_borrow_data()`), so the RefMut/Ref
+// guard stays at the call site and the returned reference borrows that slice for
+// the same scope — identical codegen to the previous inline form on the happy
+// path, with an added early Err for short/misaligned data.
+fn pool_from_data_mut(data: &mut [u8]) -> Result<&mut StakePool, ProgramError> {
+    if data.len() < STAKE_POOL_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes_mut::<StakePool>(&mut data[..STAKE_POOL_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+fn pool_from_data(data: &[u8]) -> Result<&StakePool, ProgramError> {
+    if data.len() < STAKE_POOL_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes::<StakePool>(&data[..STAKE_POOL_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+fn deposit_from_data_mut(data: &mut [u8]) -> Result<&mut StakeDeposit, ProgramError> {
+    if data.len() < STAKE_DEPOSIT_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes_mut::<StakeDeposit>(&mut data[..STAKE_DEPOSIT_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
+fn deposit_from_data(data: &[u8]) -> Result<&StakeDeposit, ProgramError> {
+    if data.len() < STAKE_DEPOSIT_SIZE {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    bytemuck::try_from_bytes::<StakeDeposit>(&data[..STAKE_DEPOSIT_SIZE])
+        .map_err(|_| ProgramError::InvalidAccountData)
+}
+
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -428,7 +474,7 @@ fn process_init_pool(
 
     // Write pool state
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     pool.is_initialized = 1;
     pool.bump = pool_bump;
@@ -505,7 +551,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
 
     // Read and validate pool state
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -760,8 +806,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     }
 
     let mut deposit_data = deposit_pda.try_borrow_mut_data()?;
-    let deposit: &mut StakeDeposit =
-        bytemuck::from_bytes_mut(&mut deposit_data[..STAKE_DEPOSIT_SIZE]);
+    let deposit = deposit_from_data_mut(&mut deposit_data[..])?;
 
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
@@ -836,7 +881,7 @@ fn process_withdraw(
     validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -935,7 +980,7 @@ fn process_withdraw(
     let is_junior;
     {
         let deposit_data_ref = deposit_pda.try_borrow_data()?;
-        let deposit: &StakeDeposit = bytemuck::from_bytes(&deposit_data_ref[..STAKE_DEPOSIT_SIZE]);
+        let deposit = deposit_from_data(&deposit_data_ref[..])?;
 
         if deposit.is_initialized != 1
             || deposit.user != user.key.to_bytes()
@@ -1165,8 +1210,7 @@ fn process_withdraw(
 
     // Update deposit PDA
     let mut deposit_data_mut = deposit_pda.try_borrow_mut_data()?;
-    let deposit_mut: &mut StakeDeposit =
-        bytemuck::from_bytes_mut(&mut deposit_data_mut[..STAKE_DEPOSIT_SIZE]);
+    let deposit_mut = deposit_from_data_mut(&mut deposit_data_mut[..])?;
     deposit_mut.lp_amount = deposit_mut
         .lp_amount
         .checked_sub(lp_amount)
@@ -1244,7 +1288,7 @@ fn process_flush_to_insurance(
 
     // Read pool
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -1404,7 +1448,7 @@ fn process_update_config(
     validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -1461,7 +1505,7 @@ fn process_propose_admin(
     validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -1505,7 +1549,7 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -1579,7 +1623,7 @@ fn process_bind_insurance_authority(
     // fields we need so the borrow is released before the CPIs.
     let (pool_slab, pool_percolator) = {
         let pool_data = pool_pda.try_borrow_data()?;
-        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
             return Err(StakeError::NotInitialized.into());
         }
@@ -1695,7 +1739,7 @@ fn process_burn_asset_admin(
 
     let (pool_slab, pool_percolator) = {
         let pool_data = pool_pda.try_borrow_data()?;
-        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
             return Err(StakeError::NotInitialized.into());
         }
@@ -1795,7 +1839,7 @@ fn process_rotate_insurance_operator(
 
     let (pool_slab, pool_percolator) = {
         let pool_data = pool_pda.try_borrow_data()?;
-        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
             return Err(StakeError::NotInitialized.into());
         }
@@ -1877,7 +1921,7 @@ fn process_rotate_insurance_authority(
 
     let (pool_slab, pool_percolator) = {
         let pool_data = pool_pda.try_borrow_data()?;
-        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
             return Err(StakeError::NotInitialized.into());
         }
@@ -2045,8 +2089,7 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
 
     // Validate pool PDA
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
-    let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
-        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -2144,7 +2187,7 @@ fn process_admin_set_hwm_config(
     }
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -2209,7 +2252,7 @@ fn process_admin_set_tranche_config(
     validate_account_not_empty(pool_ai)?;
 
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -2306,7 +2349,7 @@ fn process_deposit_junior(
     validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -2524,8 +2567,7 @@ fn process_deposit_junior(
     }
 
     let mut deposit_data = deposit_pda.try_borrow_mut_data()?;
-    let deposit: &mut StakeDeposit =
-        bytemuck::from_bytes_mut(&mut deposit_data[..STAKE_DEPOSIT_SIZE]);
+    let deposit = deposit_from_data_mut(&mut deposit_data[..])?;
 
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
@@ -2580,8 +2622,7 @@ fn process_init_trading_pool(
     let pool_ai = &accounts[INIT_POOL_POOL_PDA_INDEX];
     validate_account_owner(pool_ai, program_id)?;
     let mut pool_data = pool_ai.try_borrow_mut_data()?;
-    let pool = bytemuck::try_from_bytes_mut::<state::StakePool>(&mut pool_data[..STAKE_POOL_SIZE])
-        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
     if !pool.validate_discriminator() {
         return Err(StakeError::InvalidAccount.into());
     }
@@ -2619,10 +2660,7 @@ fn process_return_insurance(
     validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    if pool_data.len() < STAKE_POOL_SIZE {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -2710,10 +2748,7 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
     validate_account_not_empty(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    if pool_data.len() < STAKE_POOL_SIZE {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
 
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
@@ -2854,5 +2889,56 @@ mod tests {
             !hwm_withdrawal_allowed(tvl - 1, hwm, 10_000),
             "100% floor (now rejected by the setter) would block every withdrawal"
         );
+    }
+
+    // ── #199: length-checked bytemuck reinterpretation helpers ──
+    //
+    // Every handler reinterprets account data via these helpers. They must return a
+    // clean ProgramError on an undersized/zero-length buffer instead of panicking on
+    // the `[..SIZE]` slice (the #199 bug), and must succeed on a correctly-sized buffer.
+    // The attack shape: a StakeDeposit-sized buffer (STAKE_DEPOSIT_SIZE < STAKE_POOL_SIZE)
+    // passed where a pool is expected.
+
+    #[test]
+    fn test_pool_helpers_reject_undersized_without_panic() {
+        assert!(STAKE_DEPOSIT_SIZE < STAKE_POOL_SIZE, "deposit-sized buffer is a valid undersize");
+        let mut deposit_sized = vec![0u8; STAKE_DEPOSIT_SIZE];
+        assert!(pool_from_data_mut(&mut deposit_sized).is_err(), "mut: undersized -> Err, not panic");
+        assert!(pool_from_data(&deposit_sized).is_err(), "ro: undersized -> Err, not panic");
+
+        let mut one_short = vec![0u8; STAKE_POOL_SIZE - 1];
+        assert!(pool_from_data_mut(&mut one_short).is_err());
+        assert!(pool_from_data(&one_short).is_err());
+
+        let mut empty: Vec<u8> = Vec::new();
+        assert!(pool_from_data_mut(&mut empty).is_err());
+        assert!(pool_from_data(&empty).is_err());
+    }
+
+    #[test]
+    fn test_pool_helpers_accept_exact_and_oversized() {
+        let mut buf = vec![0u8; STAKE_POOL_SIZE];
+        let pool = pool_from_data_mut(&mut buf).expect("exact-size buffer must be Ok (mut)");
+        assert_eq!(pool.is_initialized, 0);
+        assert!(pool_from_data(&buf).is_ok(), "exact-size buffer must be Ok (ro)");
+        // Real Solana accounts may carry trailing bytes; only the first SIZE are read.
+        let mut over = vec![0u8; STAKE_POOL_SIZE + 32];
+        assert!(pool_from_data_mut(&mut over).is_ok(), "oversized buffer must be Ok");
+    }
+
+    #[test]
+    fn test_deposit_helpers_reject_undersized_without_panic() {
+        let mut short = vec![0u8; STAKE_DEPOSIT_SIZE - 1];
+        assert!(deposit_from_data_mut(&mut short).is_err());
+        assert!(deposit_from_data(&short).is_err());
+        let empty: Vec<u8> = Vec::new();
+        assert!(deposit_from_data(&empty).is_err());
+    }
+
+    #[test]
+    fn test_deposit_helpers_accept_exact_size() {
+        let mut buf = vec![0u8; STAKE_DEPOSIT_SIZE];
+        assert!(deposit_from_data_mut(&mut buf).is_ok());
+        assert!(deposit_from_data(&buf).is_ok());
     }
 }
