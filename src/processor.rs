@@ -601,6 +601,13 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // Verify user_ata is owned by user (not just delegated) and holds the correct mint.
     // SPL token account layout: bytes [0..32] = mint, bytes [32..64] = owner.
     {
+        // #195: the account must be SPL-Token-program-owned before we read its raw
+        // layout — otherwise a non-token account with crafted bytes could satisfy the
+        // mint/owner field checks below (the SPL CPI would later revert, but fail fast).
+        if *user_ata.owner != crate::spl_token::id() {
+            msg!("Error: user_ata is not owned by the SPL Token program");
+            return Err(StakeError::InvalidAccount.into());
+        }
         let ata_data = user_ata.try_borrow_data()?;
         if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
             return Err(StakeError::InvalidAccount.into());
@@ -810,6 +817,10 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
 
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
+    } else if !deposit.validate_discriminator() {
+        // #194: an already-initialized record must carry the correct StakeDeposit
+        // discriminator; reject a forged account that set is_initialized without init.
+        return Err(StakeError::InvalidAccount.into());
     }
 
     // PERC-303: Prevent mixing senior and junior LP in the same deposit PDA.
@@ -943,6 +954,13 @@ fn process_withdraw(
         return Err(StakeError::InvalidAccount.into());
     }
     {
+        // #195: the account must be SPL-Token-program-owned before we read its raw
+        // layout — otherwise a non-token account with crafted bytes could satisfy the
+        // mint/owner field checks below (the SPL CPI would later revert, but fail fast).
+        if *user_ata.owner != crate::spl_token::id() {
+            msg!("Error: user_ata is not owned by the SPL Token program");
+            return Err(StakeError::InvalidAccount.into());
+        }
         let ata_data = user_ata.try_borrow_data()?;
         if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
             return Err(StakeError::InvalidAccount.into());
@@ -982,6 +1000,10 @@ fn process_withdraw(
         let deposit_data_ref = deposit_pda.try_borrow_data()?;
         let deposit = deposit_from_data(&deposit_data_ref[..])?;
 
+        // #194: validate the StakeDeposit discriminator before trusting the record.
+        if !deposit.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
         if deposit.is_initialized != 1
             || deposit.user != user.key.to_bytes()
             || deposit.pool != pool_pda.key.to_bytes()
@@ -2394,6 +2416,13 @@ fn process_deposit_junior(
     // Verify user_ata mint matches pool collateral and is owned by user.
     // AUDIT MED-3: DepositJunior was missing mint check (present in process_deposit).
     {
+        // #195: the account must be SPL-Token-program-owned before we read its raw
+        // layout — otherwise a non-token account with crafted bytes could satisfy the
+        // mint/owner field checks below (the SPL CPI would later revert, but fail fast).
+        if *user_ata.owner != crate::spl_token::id() {
+            msg!("Error: user_ata is not owned by the SPL Token program");
+            return Err(StakeError::InvalidAccount.into());
+        }
         let ata_data = user_ata.try_borrow_data()?;
         if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
             return Err(StakeError::InvalidAccount.into());
@@ -2571,6 +2600,10 @@ fn process_deposit_junior(
 
     if deposit.is_initialized != 1 {
         deposit.set_discriminator();
+    } else if !deposit.validate_discriminator() {
+        // #194: an already-initialized record must carry the correct StakeDeposit
+        // discriminator; reject a forged account that set is_initialized without init.
+        return Err(StakeError::InvalidAccount.into());
     }
 
     // PERC-303: Prevent mixing. If deposit PDA is NOT flagged as junior

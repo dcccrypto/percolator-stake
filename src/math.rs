@@ -401,15 +401,11 @@ pub fn hwm_withdrawal_allowed(
     }
 }
 
-/// Calculate available flush amount.
-///
-/// `available = deposited - withdrawn - already_flushed`
-/// Uses saturating arithmetic (can't go negative).
-pub fn flush_available(total_deposited: u64, total_withdrawn: u64, total_flushed: u64) -> u64 {
-    total_deposited
-        .saturating_sub(total_withdrawn)
-        .saturating_sub(total_flushed)
-}
+// #200: `flush_available()` removed. It was dead code (no production callers) and
+// buggy (omitted total_returned + used saturating arithmetic that could mask an
+// accounting error). The live FlushToInsurance path computes available capacity via
+// StakePool::total_pool_value() (i128-widened, total_returned- and
+// realized_junior_loss-aware) — see process_flush_to_insurance / #202.
 
 #[cfg(test)]
 mod tests {
@@ -572,30 +568,6 @@ mod tests {
     #[test]
     fn test_pool_value_exact() {
         assert_eq!(pool_value(100, 100), Some(0));
-    }
-
-    // ── Flush ──
-
-    #[test]
-    fn test_flush_available_normal() {
-        assert_eq!(flush_available(1000, 200, 300), 500);
-    }
-
-    #[test]
-    fn test_flush_available_overdrawn() {
-        // withdrawn > deposited → saturates to 0
-        assert_eq!(flush_available(100, 200, 0), 0);
-    }
-
-    #[test]
-    fn test_flush_available_fully_flushed() {
-        assert_eq!(flush_available(1000, 200, 800), 0);
-    }
-
-    #[test]
-    fn test_flush_available_over_flushed() {
-        // More flushed than available → saturates to 0
-        assert_eq!(flush_available(1000, 200, 900), 0);
     }
 
     // ── Rounding Direction ──
