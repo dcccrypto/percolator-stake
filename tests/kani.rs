@@ -28,7 +28,7 @@
 #[cfg(kani)]
 mod kani_proofs {
     use percolator_stake::math::{
-        calc_collateral_for_withdraw, calc_lp_for_deposit, flush_available, pool_value,
+        calc_collateral_for_withdraw, calc_lp_for_deposit, pool_value,
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -181,14 +181,6 @@ mod kani_proofs {
         let _ = pool_value(deposited, withdrawn);
     }
 
-    /// PROOF: flush_available never panics.
-    #[kani::proof]
-    fn proof_flush_available_no_panic() {
-        let deposited: u64 = kani::any();
-        let withdrawn: u64 = kani::any();
-        let flushed: u64 = kani::any();
-        let _ = flush_available(deposited, withdrawn, flushed);
-    }
 
     // ═══════════════════════════════════════════════════════════
     // 3. Fairness — Monotonicity
@@ -325,33 +317,9 @@ mod kani_proofs {
     // 5. Flush Bounds
     // ═══════════════════════════════════════════════════════════
 
-    /// PROOF: flush_available ≤ deposited (can't flush more than total).
-    #[kani::proof]
-    fn proof_flush_bounded_by_deposited() {
-        let deposited: u64 = kani::any();
-        let withdrawn: u64 = kani::any();
-        let flushed: u64 = kani::any();
-
-        let avail = flush_available(deposited, withdrawn, flushed);
-        assert!(avail <= deposited);
-    }
-
-    /// PROOF: After flushing available amount, flush_available = 0.
-    #[kani::proof]
-    fn proof_flush_max_then_zero() {
-        let deposited: u64 = kani::any();
-        let withdrawn: u64 = kani::any();
-        let flushed: u64 = kani::any();
-
-        kani::assume(withdrawn <= deposited);
-        kani::assume(flushed <= deposited.saturating_sub(withdrawn));
-
-        let avail = flush_available(deposited, withdrawn, flushed);
-        let new_flushed = flushed + avail;
-
-        let remaining = flush_available(deposited, withdrawn, new_flushed);
-        assert_eq!(remaining, 0);
-    }
+    // #200: proof_flush_bounded_by_deposited / proof_flush_max_then_zero removed
+    // along with the dead math::flush_available() they proved. The live flush path's
+    // safety is covered by total_pool_value()'s proofs (see #169).
 
     // ═══════════════════════════════════════════════════════════
     // 6. Pool Value
