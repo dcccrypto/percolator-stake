@@ -12,6 +12,9 @@
 //! `SetMarketResolved` against a stake-program-owned account whose data is
 //! shorter than `STAKE_POOL_SIZE`, asserting the program returns
 //! `Custom(16)` (StakeError::InvalidAccount) rather than aborting.
+// Because this regression executes `target/deploy/percolator_stake.so`, rebuild
+// the SBF artifact with `cargo build-sbf --no-default-features` after changing
+// source code; otherwise a stale local artifact can report stale results.
 
 use litesvm::LiteSVM;
 use percolator_stake::state::STAKE_POOL_SIZE;
