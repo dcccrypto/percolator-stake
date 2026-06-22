@@ -244,6 +244,14 @@ pub enum StakeInstruction {
 }
 
 impl StakeInstruction {
+    fn expect_exact_len(rest: &[u8], expected: usize) -> Result<(), ProgramError> {
+        if rest.len() != expected {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        Ok(())
+    }
+
     pub fn unpack(data: &[u8]) -> Result<Self, ProgramError> {
         let (&tag, rest) = data
             .split_first()
@@ -251,9 +259,8 @@ impl StakeInstruction {
 
         match tag {
             0 => {
-                if rest.len() < 16 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 16)?;
+
                 let cooldown_slots = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
@@ -264,48 +271,48 @@ impl StakeInstruction {
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::InitPool {
                     cooldown_slots,
                     deposit_cap,
                 })
             }
             1 => {
-                if rest.len() < 8 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 8)?;
+
                 let amount = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::Deposit { amount })
             }
             2 => {
-                if rest.len() < 8 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 8)?;
+
                 let lp_amount = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::Withdraw { lp_amount })
             }
             3 => {
-                if rest.len() < 8 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 8)?;
+
                 let amount = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::FlushToInsurance { amount })
             }
             4 => {
-                if rest.len() < 18 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 18)?;
+
                 let has_cooldown = rest[0] != 0;
                 let cooldown = u64::from_le_bytes(
                     rest[1..9]
@@ -318,42 +325,67 @@ impl StakeInstruction {
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::UpdateConfig {
                     new_cooldown_slots: if has_cooldown { Some(cooldown) } else { None },
                     new_deposit_cap: if has_cap { Some(cap) } else { None },
                 })
             }
             5 => {
-                if rest.len() < 32 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 32)?;
+
                 let new_admin: [u8; 32] = rest[0..32]
                     .try_into()
                     .map_err(|_| ProgramError::InvalidInstructionData)?;
+
                 Ok(Self::ProposeAdmin { new_admin })
             }
-            6 => Ok(Self::AcceptAdmin),
+            6 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::AcceptAdmin)
+            }
+
             // Tags 7-9, 11 tombstoned — were admin CPI proxies, now removed.
-            19 => Ok(Self::BindInsuranceAuthority),
-            20 => Ok(Self::RotateInsuranceAuthority),
-            21 => Ok(Self::BurnAssetAdmin),
-            22 => Ok(Self::RotateInsuranceOperator),
+            19 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::BindInsuranceAuthority)
+            }
+            20 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::RotateInsuranceAuthority)
+            }
+            21 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::BurnAssetAdmin)
+            }
+            22 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::RotateInsuranceOperator)
+            }
             10 => {
-                if rest.len() < 8 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 8)?;
+
                 let amount = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::ReturnInsurance { amount })
             }
-            12 => Ok(Self::AccrueFees),
+            12 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::AccrueFees)
+            }
             13 => {
-                if rest.len() < 16 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 16)?;
+
                 let cooldown_slots = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
@@ -364,51 +396,56 @@ impl StakeInstruction {
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::InitTradingPool {
                     cooldown_slots,
                     deposit_cap,
                 })
             }
             14 => {
-                if rest.len() < 3 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 3)?;
+
                 let enabled = rest[0] != 0;
                 let hwm_floor_bps = u16::from_le_bytes(
                     rest[1..3]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::AdminSetHwmConfig {
                     enabled,
                     hwm_floor_bps,
                 })
             }
             15 => {
-                if rest.len() < 2 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 2)?;
+
                 let junior_fee_mult_bps = u16::from_le_bytes(
                     rest[0..2]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::AdminSetTrancheConfig {
                     junior_fee_mult_bps,
                 })
             }
             16 => {
-                if rest.len() < 8 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
+                Self::expect_exact_len(rest, 8)?;
+
                 let amount = u64::from_le_bytes(
                     rest[0..8]
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+
                 Ok(Self::DepositJunior { amount })
             }
-            18 => Ok(Self::SetMarketResolved),
+            18 => {
+                Self::expect_exact_len(rest, 0)?;
+
+                Ok(Self::SetMarketResolved)
+            }
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -475,19 +512,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tombstoned_tags_rejected() {
-        // Tags 7-9, 11, 17 remain tombstoned (5/6 reclaimed for admin rotation).
-        for tag in [7u8, 8, 9, 11, 17] {
-            let data = vec![tag];
-            assert!(
-                StakeInstruction::unpack(&data).is_err(),
-                "tag {} should be rejected",
-                tag
-            );
-        }
-    }
-
-    #[test]
     fn test_unpack_propose_admin() {
         let new_admin = [7u8; 32];
         let mut data = vec![5u8];
@@ -519,11 +543,6 @@ mod tests {
     #[test]
     fn test_unpack_bind_insurance_authority() {
         match StakeInstruction::unpack(&[19u8]).unwrap() {
-            StakeInstruction::BindInsuranceAuthority => {}
-            _ => panic!("wrong variant"),
-        }
-        // trailing bytes are ignored (no payload); still decodes.
-        match StakeInstruction::unpack(&[19u8, 0, 0]).unwrap() {
             StakeInstruction::BindInsuranceAuthority => {}
             _ => panic!("wrong variant"),
         }
@@ -592,4 +611,124 @@ mod tests {
     fn test_unpack_empty() {
         assert!(StakeInstruction::unpack(&[]).is_err());
     }
-}
+
+    #[test]
+    fn instruction_unpack_rejects_trailing_bytes() {
+        use solana_program::program_error::ProgramError;
+
+        let mut init_pool = vec![0u8];
+        init_pool.extend_from_slice(&1u64.to_le_bytes());
+        init_pool.extend_from_slice(&100u64.to_le_bytes());
+        init_pool.push(0x99);
+
+        let mut deposit = vec![1u8];
+        deposit.extend_from_slice(&1u64.to_le_bytes());
+        deposit.push(0x99);
+
+        let mut withdraw = vec![2u8];
+        withdraw.extend_from_slice(&1u64.to_le_bytes());
+        withdraw.push(0x99);
+
+        let mut flush_to_insurance = vec![3u8];
+        flush_to_insurance.extend_from_slice(&1u64.to_le_bytes());
+        flush_to_insurance.push(0x99);
+
+        let mut update_config = vec![4u8];
+        update_config.push(1u8);
+        update_config.extend_from_slice(&1u64.to_le_bytes());
+        update_config.push(1u8);
+        update_config.extend_from_slice(&100u64.to_le_bytes());
+        update_config.push(0x99);
+    
+        let mut propose_admin = vec![5u8];
+        propose_admin.extend_from_slice(&[7u8; 32]);
+        propose_admin.push(0x99);
+
+        let accept_admin = vec![6u8, 0x99];
+
+        let mut return_insurance = vec![10u8];
+        return_insurance.extend_from_slice(&1u64.to_le_bytes());
+        return_insurance.push(0x99);
+
+        let accrue_fees = vec![12u8, 0x99];
+
+        let mut init_trading_pool = vec![13u8];
+        init_trading_pool.extend_from_slice(&1u64.to_le_bytes());
+        init_trading_pool.extend_from_slice(&100u64.to_le_bytes());
+        init_trading_pool.push(0x99);
+
+        let admin_set_hwm_config = vec![14u8, 1u8, 0x88, 0x13, 0x99];
+        let admin_set_tranche_config = vec![15u8, 0x10, 0x27, 0x99];
+
+        let mut deposit_junior = vec![16u8];
+        deposit_junior.extend_from_slice(&1u64.to_le_bytes());
+        deposit_junior.push(0x99);
+ 
+        let set_market_resolved = vec![18u8, 0x99];
+        let bind_insurance_authority = vec![19u8, 0x99];
+        let rotate_insurance_authority = vec![20u8, 0x99];
+        let burn_asset_admin = vec![21u8, 0x99];
+        let rotate_insurance_operator = vec![22u8, 0x99];
+
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("InitPool", init_pool),
+            ("Deposit", deposit),
+            ("Withdraw", withdraw),
+            ("FlushToInsurance", flush_to_insurance),
+            ("UpdateConfig", update_config),
+            ("ProposeAdmin", propose_admin),
+            ("AcceptAdmin", accept_admin),
+            ("ReturnInsurance", return_insurance),
+            ("AccrueFees", accrue_fees),
+            ("InitTradingPool", init_trading_pool),
+            ("AdminSetHwmConfig", admin_set_hwm_config),
+            ("AdminSetTrancheConfig", admin_set_tranche_config),
+            ("DepositJunior", deposit_junior),
+            ("SetMarketResolved", set_market_resolved),
+            ("BindInsuranceAuthority", bind_insurance_authority),
+            ("RotateInsuranceAuthority", rotate_insurance_authority),
+            ("BurnAssetAdmin", burn_asset_admin),
+            ("RotateInsuranceOperator", rotate_insurance_operator),
+        ];
+
+        for (name, data) in cases {
+            let result = StakeInstruction::unpack(data);
+
+            assert!(
+                matches!(result, Err(ProgramError::InvalidInstructionData)),
+                "{} should reject trailing bytes, got {:?}",
+                name,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_unpack_accepts_exact_payloads() {
+        let mut init_pool = vec![0u8];
+        init_pool.extend_from_slice(&1u64.to_le_bytes());
+        init_pool.extend_from_slice(&100u64.to_le_bytes());
+        assert!(StakeInstruction::unpack(&init_pool).is_ok());
+
+        let mut deposit = vec![1u8];
+        deposit.extend_from_slice(&1u64.to_le_bytes());
+        assert!(StakeInstruction::unpack(&deposit).is_ok());
+
+        let mut withdraw = vec![2u8];
+        withdraw.extend_from_slice(&1u64.to_le_bytes());
+        assert!(StakeInstruction::unpack(&withdraw).is_ok());
+
+        let mut return_insurance = vec![10u8];
+        return_insurance.extend_from_slice(&1u64.to_le_bytes());
+        assert!(StakeInstruction::unpack(&return_insurance).is_ok());
+
+        assert!(StakeInstruction::unpack(&[6u8]).is_ok());
+        assert!(StakeInstruction::unpack(&[12u8]).is_ok());
+        assert!(StakeInstruction::unpack(&[18u8]).is_ok());
+        assert!(StakeInstruction::unpack(&[19u8]).is_ok());
+        assert!(StakeInstruction::unpack(&[20u8]).is_ok());
+        assert!(StakeInstruction::unpack(&[21u8]).is_ok());
+        assert!(StakeInstruction::unpack(&[22u8]).is_ok());
+    }
+}    
+    
