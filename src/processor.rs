@@ -2779,6 +2779,9 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
     // #184: mirror the #177/#183 fix — reject empty/undersized pool accounts
     // before bytemuck reinterprets the data (a too-short slice would panic).
     validate_account_not_empty(pool_pda)?;
+    // #210: require the pool account be writable before mutating it, matching
+    // every other state-mutating handler.
+    validate_account_writable(pool_pda)?;
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -2973,5 +2976,58 @@ mod tests {
         let mut buf = vec![0u8; STAKE_DEPOSIT_SIZE];
         assert!(deposit_from_data_mut(&mut buf).is_ok());
         assert!(deposit_from_data(&buf).is_ok());
+    }
+
+    /// #210 PoC: `SetMarketResolved` must reject a non-writable pool account
+    /// before mutating its state, like every other state-mutating handler.
+    #[test]
+    fn poc_set_market_resolved_should_reject_readonly_pool_account() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.set_discriminator();
+        pool.set_market_resolved(false);
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+
+        let mut admin_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &pool_key,
+                false,
+                false, // intentionally NOT writable
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[18u8]);
+
+        assert!(
+            result.is_err(),
+            "SetMarketResolved should reject a non-writable pool account before mutating state"
+        );
     }
 }
