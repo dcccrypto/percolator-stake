@@ -2720,20 +2720,38 @@ fn process_return_insurance(
         return Err(ProgramError::InvalidArgument);
     }
 
-    // Validate admin_ata mint matches pool collateral
-    let ata_data = admin_ata.try_borrow_data()?;
-    if ata_data.len() < 72 {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    // Check ATA is owned by SPL Token
+    // Validate admin_ata is an SPL Token account for the pool collateral mint
+    // and is owned by the admin signer.
     if *admin_ata.owner != crate::spl_token::id() {
+        msg!("Error: admin_ata is not owned by the SPL Token program");
         return Err(StakeError::InvalidAccount.into());
     }
-    let ata_mint = &ata_data[0..32];
-    if ata_mint != pool.collateral_mint {
-        return Err(StakeError::InvalidMint.into());
+
+    {
+        let ata_data = admin_ata.try_borrow_data()?;
+
+        if ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+            return Err(StakeError::InvalidAccount.into());
+        }
+
+        let ata_mint: &[u8; 32] = ata_data[0..32]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+
+        if ata_mint != &pool.collateral_mint {
+            msg!("Error: admin_ata mint does not match pool collateral_mint");
+            return Err(StakeError::InvalidMint.into());
+        }
+
+        let owner_bytes: &[u8; 32] = ata_data[32..64]
+            .try_into()
+            .map_err(|_| StakeError::InvalidAccount)?;
+
+        if owner_bytes != admin.key.as_ref() {
+            msg!("Error: admin_ata is not owned by the admin signer");
+            return Err(StakeError::Unauthorized.into());
+        }
     }
-    drop(ata_data);
 
     // SPL Token transfer: admin_ata → vault (admin signs as token owner)
     let transfer_ix = crate::spl_token::transfer(
@@ -2809,6 +2827,115 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
+    use solana_program::account_info::AccountInfo;
+
+    let program_id = Pubkey::new_from_array([9u8; 32]);
+    let admin_key = Pubkey::new_from_array([1u8; 32]);
+    let pool_key = Pubkey::new_from_array([2u8; 32]);
+    let admin_ata_key = Pubkey::new_from_array([3u8; 32]);
+    let vault_key = Pubkey::new_from_array([4u8; 32]);
+    let collateral_mint = Pubkey::new_from_array([5u8; 32]);
+    let other_owner = Pubkey::new_from_array([6u8; 32]);
+
+    let mut pool = StakePool::zeroed();
+    pool.is_initialized = 1;
+    pool.admin = admin_key.to_bytes();
+    pool.vault = vault_key.to_bytes();
+    pool.collateral_mint = collateral_mint.to_bytes();
+    pool.total_flushed = 100;
+    pool.total_returned = 0;
+    pool.set_discriminator();
+
+    let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+
+    let mut admin_ata_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
+    admin_ata_data[0..32].copy_from_slice(collateral_mint.as_ref());
+    admin_ata_data[32..64].copy_from_slice(other_owner.as_ref());
+
+    let mut vault_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
+
+    let mut admin_lamports = 0u64;
+    let mut pool_lamports = 0u64;
+    let mut admin_ata_lamports = 0u64;
+    let mut vault_lamports = 0u64;
+    let mut token_program_lamports = 0u64;
+
+    let mut admin_data = vec![];
+    let mut token_program_data = vec![];
+
+    let token_program_id = crate::spl_token::id();
+    let system_program_id = solana_program::system_program::id();
+
+    let accounts = vec![
+        AccountInfo::new(
+            &admin_key,
+            true,
+            false,
+            &mut admin_lamports,
+            &mut admin_data,
+            &system_program_id,
+            false,
+            0,
+        ),
+        AccountInfo::new(
+            &pool_key,
+            false,
+            true,
+            &mut pool_lamports,
+            &mut pool_data,
+            &program_id,
+            false,
+            0,
+        ),
+        AccountInfo::new(
+            &admin_ata_key,
+            false,
+            true,
+            &mut admin_ata_lamports,
+            &mut admin_ata_data,
+            &token_program_id,
+            false,
+            0,
+        ),
+        AccountInfo::new(
+            &vault_key,
+            false,
+            true,
+            &mut vault_lamports,
+            &mut vault_data,
+            &token_program_id,
+            false,
+            0,
+        ),
+        AccountInfo::new(
+            &token_program_id,
+            false,
+            false,
+            &mut token_program_lamports,
+            &mut token_program_data,
+            &system_program_id,
+            false,
+            0,
+        ),
+    ];
+
+    let result = process(
+        &program_id,
+        &accounts,
+        &[
+            10u8, // ReturnInsurance
+            10, 0, 0, 0, 0, 0, 0, 0, // amount = 10u64 little-endian
+        ],
+    );
+
+    assert!(
+        matches!(result, Err(e) if e == StakeError::Unauthorized.into()),
+        "ReturnInsurance should reject admin_ata when the token account owner is not the admin signer"
+    );
+}
 
     // #185 regression: disabling HWM must NOT clobber the stored floor, so that
     // a later re-enable preserves the operator's original floor. The disable
