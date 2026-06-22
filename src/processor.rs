@@ -3025,9 +3025,10 @@ mod tests {
 
         let result = process(&program_id, &accounts, &[18u8]);
 
-        assert!(
-            result.is_err(),
-            "SetMarketResolved should reject a non-writable pool account before mutating state"
+        assert_eq!(
+            result,
+            Err(StakeError::InvalidAccount.into()),
+            "SetMarketResolved should fail with InvalidAccount for a read-only pool account"
         );
     }
 }
