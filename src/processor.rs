@@ -872,7 +872,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // of current LP balance. Without the lp_amount > 0 check bypass, an attacker
     // could: deposit junior → withdraw all → deposit senior into same PDA →
     // withdraw using junior rates (reserved[8] still set).
-    if deposit._reserved[8] == 1 {
+    if deposit.is_junior_deposit() {
         return Err(StakeError::WrongTranche.into());
     }
 
@@ -1065,7 +1065,7 @@ fn process_withdraw(
             return Err(StakeError::InsufficientLpTokens.into());
         }
         // Read tranche flag while we have the borrow
-        is_junior = deposit._reserved[8] == 1;
+        is_junior = deposit.is_junior_deposit();
     }
 
     // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
@@ -2117,6 +2117,11 @@ fn accrue_fees_inner(pool: &mut state::StakePool, current_balance: u64) -> Progr
                     .checked_add(junior_fee)
                     .ok_or(StakeError::Overflow)?,
             );
+            // M-2: guard — reject accrual if it would push junior_balance above pool value.
+            let pv = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+            if pool.junior_balance() > pv {
+                return Err(StakeError::Overflow.into());
+            }
         }
 
         msg!(
@@ -2522,11 +2527,16 @@ fn process_deposit_junior(
     // junior, net_loss stays positive and the gate stays closed for a permanent loss. Safe
     // (fully backed; existing LPs withdraw freely) and deliberate — see the senior-gate note
     // above for why no auto-write-off (admin burned / resolved blocks deposits / time-box unfair).
-    if pool.total_flushed > pool.total_returned {
+    // M-3: use PHYSICAL net loss — exclude realized_junior_loss (bookkeeping-only settlement)
+    // so paper-settled forfeitures from exited juniors don't prematurely reopen the gate.
+    let physical_net_loss = pool.total_flushed
+        .saturating_sub(pool.total_returned.saturating_sub(pool.realized_junior_loss()));
+    if physical_net_loss > 0 {
         msg!(
-            "DepositJunior paused: insurance loss outstanding (flushed {} > returned {})",
+            "DepositJunior paused: physical insurance loss outstanding (flushed {} > returned {} - realized_loss {})",
             pool.total_flushed,
-            pool.total_returned
+            pool.total_returned,
+            pool.realized_junior_loss()
         );
         return Err(StakeError::InsuranceLossOutstanding.into());
     }
@@ -2657,7 +2667,7 @@ fn process_deposit_junior(
     // PERC-303: Prevent mixing. If deposit PDA is NOT flagged as junior
     // and was previously used for senior deposits, reject. Check regardless
     // of lp_amount to prevent bypass via full withdrawal then re-deposit.
-    if deposit._reserved[8] != 1 && deposit.is_initialized == 1 {
+    if !deposit.is_junior_deposit() && deposit.is_initialized == 1 {
         return Err(StakeError::WrongTranche.into());
     }
 
@@ -2668,7 +2678,7 @@ fn process_deposit_junior(
     // the junior flag, permanently bricking it: any future DepositJunior would
     // reject it (wrong tranche) and process_deposit would also reject it (senior
     // PDA already initialized without junior flag).
-    deposit._reserved[8] = 1;
+    deposit.set_junior_deposit(true);
     deposit.is_initialized = 1;
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
@@ -2756,9 +2766,18 @@ fn process_return_insurance(
     if pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
+    // L-1: vault owner check — matches every other vault-touching handler.
+    if *vault.owner != crate::spl_token::id() {
+        return Err(ProgramError::IllegalOwner);
+    }
 
-    // Validate amount doesn't exceed outstanding insurance
-    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    // M-1: physical outstanding = (flushed - returned) + realized_junior_loss.
+    // realized_junior_loss was added to total_returned as a bookkeeping settlement
+    // when the last junior exited; adding it back exposes the full physical recovery
+    // capacity that senior holders are entitled to.
+    let outstanding = pool.total_flushed
+        .saturating_sub(pool.total_returned)
+        .saturating_add(pool.realized_junior_loss());
     if amount > outstanding {
         msg!(
             "ReturnInsurance: amount {} exceeds outstanding insurance {}",

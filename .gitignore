@@ -4,3 +4,5 @@ Cargo.lock
 kani-proofs/Cargo.lock
 node_modules/
 dist/
+*.md
+

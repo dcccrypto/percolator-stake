@@ -166,6 +166,21 @@ impl StakeDeposit {
         let disc = &self._reserved[..8];
         disc == STAKE_DEPOSIT_DISCRIMINATOR
     }
+
+    // L-3: Named tranche-flag accessor. The junior flag occupies _reserved[8]
+    // (bytes [0..8] are the discriminator). Using a named method rather than a
+    // raw index means any future _reserved layout change surfaces at compile time
+    // instead of silently corrupting tranche isolation.
+
+    /// Whether this deposit belongs to the junior tranche.
+    pub fn is_junior_deposit(&self) -> bool {
+        self._reserved[8] == 1
+    }
+
+    /// Set or clear the junior-tranche flag.
+    pub fn set_junior_deposit(&mut self, v: bool) {
+        self._reserved[8] = if v { 1 } else { 0 };
+    }
 }
 
 impl StakePool {
