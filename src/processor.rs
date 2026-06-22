@@ -193,6 +193,45 @@ fn validate_account_not_empty(account: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// #211: Validate the LP receipt destination on deposit the same way withdraw
+/// already validates its LP source — SPL-Token-owned, correct mint, and owned
+/// by the depositor. Without this, LP tokens can be minted to a token account
+/// the depositor does not own while the deposit record is still derived from
+/// the depositor's key, stranding the receipt from the record that can redeem it.
+fn validate_lp_recipient_account(
+    user_lp_ata: &AccountInfo,
+    expected_lp_mint: &[u8; 32],
+    expected_owner: &Pubkey,
+) -> ProgramResult {
+    if *user_lp_ata.owner != crate::spl_token::id() {
+        msg!("Error: user_lp_ata is not owned by the SPL Token program");
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let lp_ata_data = user_lp_ata.try_borrow_data()?;
+    if lp_ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let mint_bytes: &[u8; 32] = lp_ata_data[0..32]
+        .try_into()
+        .map_err(|_| StakeError::InvalidAccount)?;
+    if mint_bytes != expected_lp_mint {
+        msg!("Error: user_lp_ata mint does not match pool lp_mint");
+        return Err(StakeError::InvalidMint.into());
+    }
+
+    let owner_bytes: &[u8; 32] = lp_ata_data[32..64]
+        .try_into()
+        .map_err(|_| StakeError::InvalidAccount)?;
+    if owner_bytes != expected_owner.as_ref() {
+        msg!("Error: user_lp_ata is not owned by the depositor — delegation/griefing blocked");
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    Ok(())
+}
+
 /// Validate that an account is empty (no data, ready for creation).
 /// Returns AlreadyInitialized error if account already has data.
 #[allow(dead_code)]
@@ -630,6 +669,12 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             return Err(StakeError::Unauthorized.into());
         }
     }
+
+    // #211: user_lp_ata is the LP mint destination — it must be owned by the
+    // depositor, mirroring the check process_withdraw already does on its LP
+    // source. Otherwise LP receipts can land in a token account the depositor
+    // does not control while the deposit record stays keyed to the depositor.
+    validate_lp_recipient_account(user_lp_ata, &pool.lp_mint, user.key)?;
 
     // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
     // deposit (mode-1), so LP cannot be minted at the stale pre-accrual price and capture
@@ -2443,6 +2488,10 @@ fn process_deposit_junior(
         }
     }
 
+    // #211: same LP-recipient-ownership gap as process_deposit — DepositJunior
+    // also mints LP to user_lp_ata without checking the depositor owns it.
+    validate_lp_recipient_account(user_lp_ata, &pool.lp_mint, user.key)?;
+
     // #136 (junior): crystallize pending trading-fee surplus into share price BEFORE pricing
     // this junior deposit (mode-1). process_deposit (senior/global) and process_withdraw
     // already do this; the junior path was the one that was missed — without it a junior
@@ -2973,5 +3022,191 @@ mod tests {
         let mut buf = vec![0u8; STAKE_DEPOSIT_SIZE];
         assert!(deposit_from_data_mut(&mut buf).is_ok());
         assert!(deposit_from_data(&buf).is_ok());
+    }
+
+    /// #211 PoC: `Deposit` must reject an LP recipient token account that is
+    /// not owned by the depositor, even when its mint matches `pool.lp_mint`.
+    /// Without this, LP receipts can be minted to a third party while the
+    /// deposit record (and cooldown) stays keyed to the depositor — stranding
+    /// the receipt from the only key that can redeem it.
+    #[test]
+    fn poc_deposit_should_reject_lp_recipient_not_owned_by_depositor() {
+        let program_id = Pubkey::new_unique();
+        let pool_key = Pubkey::new_unique();
+        let user_key = Pubkey::new_unique();
+        let third_party_key = Pubkey::new_unique();
+        let collateral_mint_key = Pubkey::new_unique();
+        let lp_mint_key = Pubkey::new_unique();
+        let vault_key = Pubkey::new_unique();
+        let user_ata_key = Pubkey::new_unique();
+        let user_lp_ata_key = Pubkey::new_unique();
+        let deposit_pda_key = Pubkey::new_unique();
+        let clock_key = Pubkey::new_unique();
+        let (vault_auth_key, _bump) = derive_vault_authority(&program_id, &pool_key);
+        let token_program_id = crate::spl_token::id();
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.set_discriminator();
+        pool.collateral_mint = collateral_mint_key.to_bytes();
+        pool.lp_mint = lp_mint_key.to_bytes();
+        pool.vault = vault_key.to_bytes();
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+
+        // user_ata: correctly owned by the depositor, correct collateral mint.
+        let mut user_ata_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
+        user_ata_data[0..32].copy_from_slice(collateral_mint_key.as_ref());
+        user_ata_data[32..64].copy_from_slice(user_key.as_ref());
+
+        // user_lp_ata: correct LP mint, but owned by a THIRD PARTY, not the depositor.
+        let mut user_lp_ata_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
+        user_lp_ata_data[0..32].copy_from_slice(lp_mint_key.as_ref());
+        user_lp_ata_data[32..64].copy_from_slice(third_party_key.as_ref());
+
+        let mut user_data = vec![];
+        let mut pool_lamports = 0u64;
+        let mut user_lamports = 0u64;
+        let mut user_ata_lamports = 0u64;
+        let mut vault_lamports = 0u64;
+        let mut lp_mint_lamports = 0u64;
+        let mut user_lp_ata_lamports = 0u64;
+        let mut vault_auth_lamports = 0u64;
+        let mut deposit_pda_lamports = 0u64;
+        let mut token_program_lamports = 0u64;
+        let mut clock_lamports = 0u64;
+        let mut system_program_lamports = 0u64;
+
+        let mut vault_data = vec![];
+        let mut lp_mint_data = vec![];
+        let mut vault_auth_data = vec![];
+        let mut deposit_pda_data = vec![];
+        let mut token_program_data = vec![];
+        let mut clock_data = vec![];
+        let mut system_program_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &user_key,
+                true,
+                false,
+                &mut user_lamports,
+                &mut user_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &pool_key,
+                false,
+                true,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &user_ata_key,
+                false,
+                true,
+                &mut user_ata_lamports,
+                &mut user_ata_data,
+                &token_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &vault_key,
+                false,
+                true,
+                &mut vault_lamports,
+                &mut vault_data,
+                &token_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &lp_mint_key,
+                false,
+                true,
+                &mut lp_mint_lamports,
+                &mut lp_mint_data,
+                &token_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &user_lp_ata_key,
+                false,
+                true,
+                &mut user_lp_ata_lamports,
+                &mut user_lp_ata_data,
+                &token_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &vault_auth_key,
+                false,
+                false,
+                &mut vault_auth_lamports,
+                &mut vault_auth_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &deposit_pda_key,
+                false,
+                true,
+                &mut deposit_pda_lamports,
+                &mut deposit_pda_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &token_program_id,
+                false,
+                false,
+                &mut token_program_lamports,
+                &mut token_program_data,
+                &system_program_id,
+                true,
+                0,
+            ),
+            AccountInfo::new(
+                &clock_key,
+                false,
+                false,
+                &mut clock_lamports,
+                &mut clock_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &system_program_id,
+                false,
+                false,
+                &mut system_program_lamports,
+                &mut system_program_data,
+                &system_program_id,
+                true,
+                0,
+            ),
+        ];
+
+        let mut data = vec![1u8]; // Deposit
+        data.extend_from_slice(&100u64.to_le_bytes());
+
+        let result = process(&program_id, &accounts, &data);
+
+        assert!(
+            matches!(&result, Err(e) if *e == StakeError::Unauthorized.into() || *e == StakeError::InvalidAccount.into()),
+            "Deposit should reject an LP recipient token account not owned by the depositor, got {:?}",
+            result
+        );
     }
 }
