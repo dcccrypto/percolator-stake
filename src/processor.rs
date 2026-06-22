@@ -193,6 +193,45 @@ fn validate_account_not_empty(account: &AccountInfo) -> ProgramResult {
     Ok(())
 }
 
+/// #211: validate that the LP-mint recipient token account is owned by the
+/// depositor (and has the pool's lp_mint). Without this, a deposit can mint LP
+/// receipts to a token account the depositor does not control while the deposit
+/// record stays keyed to the depositor — stranding the receipt / enabling
+/// delegation-griefing. Mirrors the withdraw-side recipient checks.
+fn validate_lp_recipient_account(
+    user_lp_ata: &AccountInfo,
+    expected_lp_mint: &[u8; 32],
+    expected_owner: &Pubkey,
+) -> ProgramResult {
+    if *user_lp_ata.owner != crate::spl_token::id() {
+        msg!("Error: user_lp_ata is not owned by the SPL Token program");
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let lp_ata_data = user_lp_ata.try_borrow_data()?;
+    if lp_ata_data.len() < crate::spl_token::state::ACCOUNT_LEN {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let mint_bytes: &[u8; 32] = lp_ata_data[0..32]
+        .try_into()
+        .map_err(|_| StakeError::InvalidAccount)?;
+    if mint_bytes != expected_lp_mint {
+        msg!("Error: user_lp_ata mint does not match pool lp_mint");
+        return Err(StakeError::InvalidMint.into());
+    }
+
+    let owner_bytes: &[u8; 32] = lp_ata_data[32..64]
+        .try_into()
+        .map_err(|_| StakeError::InvalidAccount)?;
+    if owner_bytes != expected_owner.as_ref() {
+        msg!("Error: user_lp_ata is not owned by the depositor — delegation/griefing blocked");
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    Ok(())
+}
+
 /// Validate that an account is empty (no data, ready for creation).
 /// Returns AlreadyInitialized error if account already has data.
 #[allow(dead_code)]
@@ -630,6 +669,11 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             return Err(StakeError::Unauthorized.into());
         }
     }
+
+    // #211: the LP mint destination (user_lp_ata) must be owned by the depositor
+    // source. Otherwise LP receipts can land in a token account the depositor
+    // does not control while the deposit record stays keyed to the depositor.
+    validate_lp_recipient_account(user_lp_ata, &pool.lp_mint, user.key)?;
 
     // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
     // deposit (mode-1), so LP cannot be minted at the stale pre-accrual price and capture
@@ -2442,6 +2486,10 @@ fn process_deposit_junior(
             return Err(StakeError::Unauthorized.into());
         }
     }
+
+    // #211: same LP-recipient-ownership gap as process_deposit — DepositJunior
+    // also mints LP to user_lp_ata without checking the depositor owns it.
+    validate_lp_recipient_account(user_lp_ata, &pool.lp_mint, user.key)?;
 
     // #136 (junior): crystallize pending trading-fee surplus into share price BEFORE pricing
     // this junior deposit (mode-1). process_deposit (senior/global) and process_withdraw
