@@ -464,6 +464,49 @@ fn rotate_operator_stake_ix(
     }
 }
 
+/// RecoverFlushedInsurance (stake tag 23): PDA-signed recovery of wrapper insurance to pool vault.
+///
+/// Accounts:
+///   0. `[]`          caller (permissionless)
+///   1. `[writable]`  pool PDA
+///   2. `[writable]`  pool vault token account (dest = pool.vault)
+///   3. `[]`          vault_auth PDA (signs as insurance_operator)
+///   4. `[writable]`  wrapper market account
+///   5. `[writable]`  wrapper vault token account (insurance source)
+///   6. `[]`          wrapper vault authority PDA
+///   7. `[]`          token program
+///   8. `[]`          percolator program
+///
+/// Wire: [23u8][amount: u64 LE] = 9 bytes
+fn recover_flushed_insurance_ix(
+    ctx: &PoolCtx,
+    wrapper_id: Pubkey,
+    token_program: Pubkey,
+    market: Pubkey,
+    wrapper_vault: Pubkey,
+    wrapper_vault_auth: Pubkey,
+    caller: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut data = vec![23u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: ctx.stake_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*caller, false),            // 0: caller (permissionless)
+            AccountMeta::new(ctx.pool_pda, false),                // 1: pool PDA (writable)
+            AccountMeta::new(ctx.stake_vault, false),             // 2: pool vault (dest; writable)
+            AccountMeta::new_readonly(ctx.vault_auth, false),     // 3: vault_auth PDA
+            AccountMeta::new(market, false),                      // 4: wrapper market (writable)
+            AccountMeta::new(wrapper_vault, false),               // 5: wrapper vault (source; writable)
+            AccountMeta::new_readonly(wrapper_vault_auth, false), // 6: wrapper vault auth
+            AccountMeta::new_readonly(token_program, false),      // 7: token program
+            AccountMeta::new_readonly(wrapper_id, false),         // 8: percolator program
+        ],
+        data,
+    }
+}
+
 /// Rotate insurance_operator (kind=2) directly via tag 65 on the wrapper.
 /// Used in the RED control test (bypasses the stake program to exercise the direct
 /// wrapper path, proving the auth gate is open before secure bind).
@@ -1338,4 +1381,356 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
         40_000 + 25_000,
         "flush B applied — the bind is NOT a permanent weld"
     );
+}
+
+// ── RECOVER FLUSHED INSURANCE (issue #171) ────────────────────────────────────
+//
+// Scenario 1 (happy path + post-burn survival):
+//   bind → flush → simulate BurnAssetAdmin (zero admin field in market) →
+//   RecoverFlushedInsurance → tokens return to pool.vault, total_returned incremented.
+//
+// Scenario 2 (negative: dest != pool.vault rejected before CPI):
+//   attempt recovery with wrong dest_token account → rejected (InvalidPda)
+//   before the CPI fires.
+//
+// Scenario 3 (negative: nothing flushed → rejected):
+//   fresh pool with no flush → RecoverFlushedInsurance with amount=1 → rejected
+//   (InsufficientVaultBalance).
+//
+// Scenario 4 (negative: non-PDA cannot redirect funds):
+//   after bind+flush, an attacker passes their own token account as the dest →
+//   rejected at the DRAIN CHECK (dest != pool.vault) before any CPI.
+
+/// HAPPY PATH: bind → flush → BurnAssetAdmin → RecoverFlushedInsurance.
+/// Proves recovery works AFTER the irreversible burn (no admin can rotate back),
+/// pool.total_returned increases, and tokens land in pool.vault.
+#[test]
+fn recover_flushed_insurance_after_burn() {
+    let mut svm = LiteSVM::new().with_spl_programs();
+    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    svm.add_program_from_file(stake_id, stake_so()).unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
+
+    let admin = Keypair::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
+
+    let (market, mint, wrapper_vault) =
+        build_live_market_v17(&mut svm, wrapper_id, token_program, &admin, &payer);
+
+    let pool = add_stake_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        FLUSH_AMOUNT,
+    );
+
+    let wrapper_vault_auth =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &wrapper_id).0;
+
+    // Step 1: bind (authority + operator → PDA).
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&pool, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("BindInsuranceAuthority (tag 65 CPI 1+2)");
+
+    // Step 2: flush insurance into wrapper vault.
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        flush_ix(
+            &pool,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            FLUSH_AMOUNT,
+        ),
+    )
+    .expect("FlushToInsurance");
+
+    assert_eq!(
+        token_amount(&svm, &pool.stake_vault),
+        0,
+        "stake vault drained by flush"
+    );
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        FLUSH_AMOUNT,
+        "wrapper vault received flush"
+    );
+
+    // Step 3: BurnAssetAdmin — irrevocably removes admin rotate-back capability.
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        burn_asset_admin_ix(&pool, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("BurnAssetAdmin (tag 65 kind=0 burn)");
+
+    // Verify admin can no longer rotate insurance_authority back (post-burn gate).
+    svm.expire_blockhash();
+    let err_rotate_after_burn = send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        rotate_ix(&pool, wrapper_id, market, &admin.pubkey(), &admin.pubkey()),
+    )
+    .expect_err("post-burn rotate-back must be rejected by stake");
+    assert!(
+        matches!(
+            err_rotate_after_burn,
+            TransactionError::InstructionError(_, InstructionError::Custom(code))
+                if code == StakeError::Unauthorized as u32
+        ),
+        "expected stake Unauthorized=2 (post-burn rotate blocked), got {err_rotate_after_burn:?}"
+    );
+
+    // Step 4: RecoverFlushedInsurance — PDA-signed, permissionless caller (use payer).
+    // Reads pool.total_returned before to verify accounting increment.
+    let pool_account_before = svm.get_account(&pool.pool_pda).unwrap();
+    let pool_state_before =
+        bytemuck::try_from_bytes::<percolator_stake::state::StakePool>(
+            &pool_account_before.data[..percolator_stake::state::STAKE_POOL_SIZE],
+        )
+        .unwrap();
+    let total_returned_before = pool_state_before.total_returned;
+
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[],                   // permissionless — payer signs only as fee payer
+        recover_flushed_insurance_ix(
+            &pool,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            wrapper_vault_auth,
+            &payer.pubkey(),   // caller (permissionless, not admin)
+            FLUSH_AMOUNT,
+        ),
+    )
+    .expect("RecoverFlushedInsurance (tag 23 CPI)");
+
+    // Assert: tokens back in pool.vault.
+    assert_eq!(
+        token_amount(&svm, &pool.stake_vault),
+        FLUSH_AMOUNT,
+        "recovered tokens land in pool.vault"
+    );
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        0,
+        "wrapper vault fully drained by recovery"
+    );
+
+    // Assert: pool.total_returned incremented by FLUSH_AMOUNT.
+    let pool_account_after = svm.get_account(&pool.pool_pda).unwrap();
+    let pool_state_after =
+        bytemuck::try_from_bytes::<percolator_stake::state::StakePool>(
+            &pool_account_after.data[..percolator_stake::state::STAKE_POOL_SIZE],
+        )
+        .unwrap();
+    assert_eq!(
+        pool_state_after.total_returned,
+        total_returned_before
+            .checked_add(FLUSH_AMOUNT)
+            .unwrap(),
+        "total_returned incremented by FLUSH_AMOUNT (conservation)"
+    );
+}
+
+/// NEGATIVE: wrong dest_token (not pool.vault) is rejected BEFORE any CPI.
+/// Proves drain-vector is closed at the stake processor level, not the wrapper.
+#[test]
+fn recover_flushed_insurance_wrong_dest_rejected() {
+    let mut svm = LiteSVM::new().with_spl_programs();
+    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    svm.add_program_from_file(stake_id, stake_so()).unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
+
+    let admin = Keypair::new();
+    let payer = Keypair::new();
+    let attacker = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
+
+    let (market, mint, wrapper_vault) =
+        build_live_market_v17(&mut svm, wrapper_id, token_program, &admin, &payer);
+
+    let pool = add_stake_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        FLUSH_AMOUNT,
+    );
+
+    let wrapper_vault_auth =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &wrapper_id).0;
+
+    // Bind and flush to set up state.
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&pool, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("bind");
+
+    svm.expire_blockhash();
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        flush_ix(
+            &pool,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            FLUSH_AMOUNT,
+        ),
+    )
+    .expect("flush");
+
+    // Attacker tries to redirect recovered tokens to their own account.
+    let attacker_dest = Pubkey::new_unique();
+    set_token_account(&mut svm, attacker_dest, &mint, &attacker.pubkey(), 0);
+
+    svm.expire_blockhash();
+    let err = {
+        // Build the ix manually with attacker_dest as account [2] instead of pool.stake_vault.
+        let mut data = vec![23u8];
+        data.extend_from_slice(&FLUSH_AMOUNT.to_le_bytes());
+        let ix = Instruction {
+            program_id: stake_id,
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), false),    // 0: caller
+                AccountMeta::new(pool.pool_pda, false),              // 1: pool PDA
+                AccountMeta::new(attacker_dest, false),              // 2: WRONG dest (not pool.vault)
+                AccountMeta::new_readonly(pool.vault_auth, false),   // 3: vault_auth PDA
+                AccountMeta::new(market, false),                     // 4: market
+                AccountMeta::new(wrapper_vault, false),              // 5: wrapper vault
+                AccountMeta::new_readonly(wrapper_vault_auth, false),// 6: wrapper vault auth
+                AccountMeta::new_readonly(token_program, false),     // 7: token program
+                AccountMeta::new_readonly(wrapper_id, false),        // 8: percolator program
+            ],
+            data,
+        };
+        send(&mut svm, &payer, &[], ix)
+    }
+    .expect_err("wrong dest must be rejected before CPI");
+
+    // Must be InvalidPda (stake error 10), NOT a wrapper error (which would mean the
+    // drain check fired TOO LATE — after the CPI ran on the wrapper).
+    match err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
+            assert_eq!(
+                code,
+                StakeError::InvalidPda as u32,
+                "must be InvalidPda=10 (drain check), not a wrapper error. got code={code}"
+            );
+        }
+        other => panic!("expected Custom(InvalidPda=10), got {other:?}"),
+    }
+    // No tokens moved.
+    assert_eq!(token_amount(&svm, &attacker_dest), 0, "no drain to attacker_dest");
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        FLUSH_AMOUNT,
+        "wrapper vault unchanged — drain blocked"
+    );
+}
+
+/// NEGATIVE: nothing flushed → InsufficientVaultBalance.
+#[test]
+fn recover_flushed_insurance_nothing_flushed_rejected() {
+    let mut svm = LiteSVM::new().with_spl_programs();
+    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    svm.add_program_from_file(stake_id, stake_so()).unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
+
+    let admin = Keypair::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
+
+    let (market, mint, wrapper_vault) =
+        build_live_market_v17(&mut svm, wrapper_id, token_program, &admin, &payer);
+
+    let pool = add_stake_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        FLUSH_AMOUNT,
+    );
+
+    let wrapper_vault_auth =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &wrapper_id).0;
+
+    // Bind so the PDA is set up, but do NOT flush.
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&pool, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("bind");
+
+    // total_flushed == 0 == total_returned → outstanding == 0 → InsufficientVaultBalance.
+    svm.expire_blockhash();
+    let err = send(
+        &mut svm,
+        &payer,
+        &[],
+        recover_flushed_insurance_ix(
+            &pool,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            wrapper_vault_auth,
+            &payer.pubkey(),
+            1,
+        ),
+    )
+    .expect_err("recover with nothing flushed must be rejected");
+
+    match err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
+            assert_eq!(
+                code,
+                StakeError::InsufficientVaultBalance as u32,
+                "expected InsufficientVaultBalance=13, got code={code}"
+            );
+        }
+        other => panic!("expected Custom(InsufficientVaultBalance=13), got {other:?}"),
+    }
 }

@@ -148,6 +148,40 @@ pub enum StakeInstruction {
     ///   5. `[]` Percolator program
     RotateInsuranceOperator,
 
+    /// 23: RecoverFlushedInsurance — PDA-signed permissionless recovery of
+    /// tokens from the wrapper's insurance fund back to the stake pool vault.
+    ///
+    /// After BurnAssetAdmin (tag 21) the admin cannot rotate the insurance_operator
+    /// back to any key it controls, making the stake program the sole path for
+    /// moving insurance tokens out of the wrapper. This instruction issues a CPI
+    /// to wrapper tag 57 `WithdrawInsuranceAsset` — which gates on
+    /// insurance_operator == operator (the vault_auth PDA, set by
+    /// BindInsuranceAuthority tag 19) — and deposits the tokens directly into
+    /// pool.vault. `pool.total_returned` is incremented by `amount` on success,
+    /// maintaining the conservation invariant total_returned <= total_flushed.
+    ///
+    /// PERMISSIONLESS: any caller may trigger recovery; funds can only land in
+    /// pool.vault (the DRAIN CHECK below guarantees this). This survives
+    /// BurnAssetAdmin because tag 57 gates on insurance_operator, not asset_admin.
+    ///
+    /// DRAIN CHECK: the CPI dest_token is verified to equal pool.vault BEFORE
+    /// the CPI is issued, preventing any redirection of recovered tokens.
+    ///
+    /// CAP: `amount` must be non-zero and <= (total_flushed - total_returned);
+    /// the instruction early-rejects if outstanding == 0 (nothing to recover).
+    ///
+    /// Accounts:
+    ///   0. `[]` Caller (permissionless — no signer check required)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Pool vault token account (destination = pool.vault)
+    ///   3. `[]` Vault authority PDA (the insurance_operator; signs via invoke_signed)
+    ///   4. `[writable]` Wrapper market account (the slab)
+    ///   5. `[writable]` Wrapper vault token account (source, insurance fund)
+    ///   6. `[]` Wrapper vault authority PDA
+    ///   7. `[]` Token program
+    ///   8. `[]` Percolator program
+    RecoverFlushedInsurance { amount: u64 },
+
     /// 4: Admin updates pool configuration.
     ///
     /// Accounts:
@@ -417,6 +451,17 @@ impl StakeInstruction {
                 }
                 Ok(Self::RotateInsuranceOperator)
             }
+            23 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::RecoverFlushedInsurance { amount })
+            }
             10 => {
                 if rest.len() != 8 {
                     return Err(ProgramError::InvalidInstructionData);
@@ -683,6 +728,7 @@ mod tests {
             (14, 3),
             (15, 2),
             (16, 8),
+            (23, 8),
         ];
         for &(tag, need) in cases {
             for short_len in 0..need {
@@ -765,6 +811,12 @@ mod tests {
                 payload.push(99);
                 payload
             }, "DepositJunior"),
+            (23, {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&42u64.to_le_bytes());
+                payload.push(99);
+                payload
+            }, "RecoverFlushedInsurance"),
         ];
 
         for (tag, payload, name) in cases {
@@ -792,5 +844,58 @@ mod tests {
                 tag
             );
         }
+    }
+
+    /// Tag 23 RecoverFlushedInsurance: round-trip pack/unpack.
+    #[test]
+    fn test_unpack_recover_flushed_insurance_round_trip() {
+        let amount: u64 = 123_456_789;
+        let mut data = vec![23u8];
+        data.extend_from_slice(&amount.to_le_bytes());
+        assert_eq!(data.len(), 9, "tag 23 payload must be 1 tag + 8 amount bytes");
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::RecoverFlushedInsurance { amount: got } => {
+                assert_eq!(got, amount, "amount round-trips correctly")
+            }
+            _ => panic!("wrong variant"),
+        }
+        // u64::MAX round-trips
+        let mut data_max = vec![23u8];
+        data_max.extend_from_slice(&u64::MAX.to_le_bytes());
+        match StakeInstruction::unpack(&data_max).unwrap() {
+            StakeInstruction::RecoverFlushedInsurance { amount: got } => {
+                assert_eq!(got, u64::MAX)
+            }
+            _ => panic!("wrong variant for u64::MAX"),
+        }
+    }
+
+    /// Tag 23 must reject a short payload (any length < 8 bytes after the tag).
+    #[test]
+    fn test_unpack_recover_flushed_insurance_short_payload_rejected() {
+        for short_len in 0u8..8 {
+            let mut data = vec![23u8];
+            data.extend(std::iter::repeat(0u8).take(short_len as usize));
+            assert!(
+                StakeInstruction::unpack(&data).is_err(),
+                "tag 23 with {} payload bytes must Err",
+                short_len
+            );
+        }
+    }
+
+    /// Tag 23 must reject trailing bytes beyond the required 8-byte payload.
+    #[test]
+    fn test_unpack_recover_flushed_insurance_trailing_bytes_rejected() {
+        let mut data = vec![23u8];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.push(99u8); // trailing byte
+        assert!(
+            matches!(
+                StakeInstruction::unpack(&data),
+                Err(ProgramError::InvalidInstructionData)
+            ),
+            "tag 23 with trailing bytes must reject"
+        );
     }
 }

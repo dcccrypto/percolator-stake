@@ -388,6 +388,75 @@ pub fn cpi_rotate_insurance_authority<'a>(
     )
 }
 
+// ═══════════════════════════════════════════════════════════════
+// WithdrawInsuranceAsset (Tag 57) — PDA-signed insurance recovery
+// ═══════════════════════════════════════════════════════════════
+// Wire: [57u8][asset_index: u16 LE = 0][amount: u128 LE] = 19 bytes.
+// Account order (verified against tests/v17_stake_insurance_e2e.rs
+// withdraw_insurance_asset_ix and wrapper handle_withdraw_insurance_asset):
+//   [0] operator      (vault_auth PDA, signer via invoke_signed) — must == insurance_operator
+//   [1] market        (writable)
+//   [2] dest_token    (writable) — MUST equal pool.vault (drain check enforced by caller)
+//   [3] vault_token   (writable) — wrapper's insurance vault, the token source
+//   [4] vault_authority (read-only) — wrapper vault authority PDA
+//   [5] token_program  (read-only)
+//
+// AUTH: insurance_operator == vault_auth PDA (set by BindInsuranceAuthority tag 19 CPI 2).
+//   After BurnAssetAdmin, no admin key can rotate the operator back — so this CPI
+//   is the ONLY authorized path for extracting insurance tokens from the wrapper.
+//
+// MODE: tag 57 works in LIVE mode (same mode FlushToInsurance uses); the caller
+//   (process_recover_flushed_insurance) enforces LIVE mode via pool_mode == 0.
+//
+// NOTE: vault_auth PDA signs via invoke_signed with the same seeds as all other
+//   stake CPIs: [b"vault_auth", pool_pda.key, &[bump]].
+
+const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
+
+pub fn cpi_withdraw_insurance_asset<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>,   // insurance_operator = our PDA; signs via invoke_signed
+    market: &AccountInfo<'a>,       // wrapper market / slab (writable)
+    dest_token: &AccountInfo<'a>,   // destination token account (MUST be pool.vault; drain check by caller)
+    wrapper_vault: &AccountInfo<'a>, // wrapper insurance vault token account (source)
+    wrapper_vault_auth: &AccountInfo<'a>, // wrapper vault authority PDA (read-only)
+    token_program: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    // tag(1) + asset_index(2, u16 LE = 0) + amount(16, u128 LE) = 19 bytes.
+    let mut data = Vec::with_capacity(19);
+    data.push(TAG_WITHDRAW_INSURANCE_ASSET);
+    data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
+    data.extend_from_slice(&(amount as u128).to_le_bytes()); // 16 bytes u128 LE
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true),      // operator (PDA), signer via invoke_signed
+            AccountMeta::new(*market.key, false),                   // market, writable
+            AccountMeta::new(*dest_token.key, false),               // dest_token (pool.vault), writable
+            AccountMeta::new(*wrapper_vault.key, false),            // vault_token (source), writable
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false), // vault_authority, read-only
+            AccountMeta::new_readonly(*token_program.key, false),  // token_program, read-only
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            vault_auth.clone(),
+            market.clone(),
+            dest_token.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            token_program.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
 #[cfg(test)]
 mod tag_tests {
     use super::*;
@@ -540,5 +609,38 @@ mod tag_tests {
         assert_ne!(ASSET_AUTH_ADMIN, ASSET_AUTH_INSURANCE);
         assert_ne!(ASSET_AUTH_ADMIN, ASSET_AUTH_INSURANCE_OPERATOR);
         assert_ne!(ASSET_AUTH_INSURANCE, ASSET_AUTH_INSURANCE_OPERATOR);
+    }
+
+    /// CANARY: pin the WithdrawInsuranceAsset (tag 57) wire shape =
+    /// tag(57) + asset_index(2, u16 LE = 0) + amount(16, u128 LE) = 19 bytes.
+    ///
+    /// Verified against:
+    ///   - tests/v17_stake_insurance_e2e.rs encode_withdraw_insurance_asset()
+    ///   - spec: "Wire: [57u8][asset_index: u16 LE = 0][amount: u128 LE] (= 19 bytes)"
+    ///
+    /// The amount is ALWAYS widened to u128 on the wire (matching the tag-9
+    /// TopUpInsurance convention from v16 read_u128). Narrowing back to u64
+    /// would cause the wrapper to reject the CPI with InvalidInstructionData.
+    #[test]
+    fn test_cpi_withdraw_insurance_asset_wire_shape() {
+        let amount: u64 = 250_000;
+        let mut data = Vec::with_capacity(19);
+        data.push(TAG_WITHDRAW_INSURANCE_ASSET);               // byte 0: tag = 57
+        data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2: asset_index = 0
+        data.extend_from_slice(&(amount as u128).to_le_bytes()); // bytes 3-18: amount u128 LE
+
+        assert_eq!(data.len(), 19, "tag-57 wire must be 19 bytes");
+        assert_eq!(data[0], 57, "tag must be 57 (WithdrawInsuranceAsset)");
+        assert_eq!(data[1], 0x00, "asset_index low byte must be 0");
+        assert_eq!(data[2], 0x00, "asset_index high byte must be 0");
+
+        // Amount occupies bytes [3..19] as u128 LE.
+        let decoded = u128::from_le_bytes(data[3..19].try_into().unwrap());
+        assert_eq!(decoded, amount as u128, "amount round-trips as u128 LE");
+
+        // Guard: must NOT be the 9-byte u64 wire (would be rejected by wrapper read_u128).
+        assert_ne!(data.len(), 9, "9-byte u64 wire would be rejected by wrapper");
+        // Guard: tag 57, not tag 9 (TopUpInsurance) — different directions.
+        assert_ne!(data[0], TAG_TOP_UP_INSURANCE, "must be tag 57, not tag 9");
     }
 }

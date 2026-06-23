@@ -384,6 +384,9 @@ pub fn process(
         StakeInstruction::ReturnInsurance { amount } => {
             process_return_insurance(program_id, accounts, amount)
         }
+        StakeInstruction::RecoverFlushedInsurance { amount } => {
+            process_recover_flushed_insurance(program_id, accounts, amount)
+        }
         StakeInstruction::AccrueFees => process_accrue_fees(program_id, accounts),
         StakeInstruction::InitTradingPool {
             cooldown_slots,
@@ -3128,6 +3131,148 @@ fn process_return_insurance(
 
     msg!(
         "ReturnInsurance: {} tokens returned to pool vault (total_returned: {})",
+        amount,
+        pool.total_returned
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 23: RecoverFlushedInsurance — PDA-signed insurance recovery
+// ═══════════════════════════════════════════════════════════════
+//
+// Issues a CPI to wrapper tag 57 `WithdrawInsuranceAsset`, signing as the
+// vault_auth PDA (which is the insurance_operator after BindInsuranceAuthority).
+// Tokens flow from the wrapper insurance vault into pool.vault directly.
+//
+// PERMISSIONLESS: no admin gate. Funds can only reach pool.vault (the DRAIN
+// CHECK below guarantees this), so any caller can trigger recovery.
+//
+// CONSERVATION: on success `pool.total_returned += amount` (post-CPI, so
+// the accounting update only happens when tokens actually moved).
+//
+// Accounts:
+//   0. `[]`          Caller (permissionless)
+//   1. `[writable]`  Pool PDA
+//   2. `[writable]`  Pool vault token account (dest; must equal pool.vault)
+//   3. `[]`          Vault authority PDA (signs the CPI as insurance_operator)
+//   4. `[writable]`  Wrapper market account
+//   5. `[writable]`  Wrapper vault token account (insurance source)
+//   6. `[]`          Wrapper vault authority PDA
+//   7. `[]`          Token program
+//   8. `[]`          Percolator program
+
+fn process_recover_flushed_insurance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let _caller = next_account_info(accounts_iter)?;       // 0: permissionless caller
+    let pool_pda = next_account_info(accounts_iter)?;      // 1: pool PDA (writable)
+    let vault = next_account_info(accounts_iter)?;         // 2: pool vault (dest; writable)
+    let vault_auth = next_account_info(accounts_iter)?;    // 3: vault_auth PDA (signer for CPI)
+    let market = next_account_info(accounts_iter)?;        // 4: wrapper market (writable)
+    let wrapper_vault = next_account_info(accounts_iter)?; // 5: wrapper insurance vault (source)
+    let wrapper_vault_auth = next_account_info(accounts_iter)?; // 6: wrapper vault auth
+    let token_program = next_account_info(accounts_iter)?; // 7: token program
+    let percolator_program = next_account_info(accounts_iter)?; // 8: wrapper program
+
+    // Standard guards — mirror process_flush_to_insurance / process_return_insurance.
+    verify_token_program(token_program)?;
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+
+    // Insurance LP pools only (pool_mode == 0). Mirror FlushToInsurance and ReturnInsurance.
+    if pool.pool_mode != 0 {
+        msg!("RecoverFlushedInsurance: not valid for trading LP pools (mode 1)");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+
+    // Amount must be non-zero.
+    if amount == 0 {
+        return Err(StakeError::ZeroAmount.into());
+    }
+
+    // CAP: amount must not exceed outstanding = total_flushed - total_returned.
+    // Use saturating_sub so a stale / already-fully-returned pool yields 0 outstanding.
+    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    if outstanding == 0 {
+        msg!(
+            "RecoverFlushedInsurance: nothing to recover (total_flushed={} total_returned={})",
+            pool.total_flushed,
+            pool.total_returned
+        );
+        return Err(StakeError::InsufficientVaultBalance.into());
+    }
+    if (amount as u128) > (outstanding as u128) {
+        msg!(
+            "RecoverFlushedInsurance: amount {} exceeds outstanding {}",
+            amount,
+            outstanding
+        );
+        return Err(StakeError::InsufficientVaultBalance.into());
+    }
+
+    // Wrapper program must match pool.percolator_program.
+    if pool.percolator_program != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // DRAIN CHECK: the CPI destination MUST be pool.vault.
+    // This prevents any caller from redirecting recovered tokens to an attacker-controlled
+    // account. Mirror process_return_insurance's `pool.vault != vault.key` guard.
+    if pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    // Derive vault authority PDA and verify it matches the passed account.
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+
+    // CPI: WithdrawInsuranceAsset (wrapper tag 57).
+    // vault_auth PDA signs as insurance_operator (set by BindInsuranceAuthority tag 19).
+    // Tokens flow: wrapper_vault → vault (= pool.vault). The drain check above ensures
+    // vault == pool.vault so tokens can only land in the stake pool's own vault.
+    cpi::cpi_withdraw_insurance_asset(
+        percolator_program,
+        vault_auth,
+        market,
+        vault,         // dest_token = pool.vault (drain-check-verified above)
+        wrapper_vault, // source = wrapper insurance vault
+        wrapper_vault_auth,
+        token_program,
+        amount,
+        vault_auth_seeds,
+    )?;
+
+    // CONSERVATION: total_returned += amount. Update AFTER the CPI so the accounting
+    // only advances when the token movement actually succeeded.
+    pool.total_returned = pool
+        .total_returned
+        .checked_add(amount)
+        .ok_or(StakeError::Overflow)?;
+
+    msg!(
+        "RecoverFlushedInsurance: {} tokens recovered to pool vault (total_returned: {})",
         amount,
         pool.total_returned
     );
