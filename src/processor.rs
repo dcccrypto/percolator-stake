@@ -1399,6 +1399,13 @@ fn process_flush_to_insurance(
     // The percolator CPI also validates this, but an explicit check here gives a clear
     // error and prevents tokens of the wrong type from being routed to the insurance vault.
     // SPL token account layout: bytes [0..32] = mint.
+    // N-5: verify SPL Token ownership before reading raw bytes — mirrors the guard in
+    // pre_accrue_mode1 (line ~1902) and process_return_insurance (line ~2618). Without
+    // this, a crafted non-token account with forged bytes at [0..32] passes the mint check.
+    if *wrapper_vault.owner != crate::spl_token::id() {
+        msg!("Error: wrapper_vault is not owned by the SPL Token program");
+        return Err(StakeError::InvalidAccount.into());
+    }
     {
         let wv_data = wrapper_vault.try_borrow_data()?;
         if wv_data.len() < crate::spl_token::state::ACCOUNT_LEN {
