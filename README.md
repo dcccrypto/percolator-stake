@@ -236,6 +236,31 @@ cd kani-proofs && cargo kani --lib
 - [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md) — Proof-by-proof analysis
 - [`docs/WRAPPER-HARDENING.md`](docs/WRAPPER-HARDENING.md) — Wrapper foot gun limits
 
+## Deployment Security
+
+### Upgrade Authority
+
+The BPF upgrade authority controls whether the deployed program binary can be replaced. A compromised upgrade authority key allows an attacker to deploy an arbitrary replacement program at the same program ID, bypassing all on-chain checks.
+
+**Requirement:** The upgrade authority for `percolator_stake.so` MUST be held by an N-of-M multisig (e.g., [Squads](https://squads.so/)) or burned (immutable) before mainnet use.
+
+To verify the current upgrade authority:
+```bash
+solana program show <PROGRAM_ID>
+```
+
+To transfer to a multisig:
+```bash
+solana program set-upgrade-authority <PROGRAM_ID> --new-upgrade-authority <MULTISIG_PUBKEY>
+```
+
+To make the program immutable (no further upgrades possible):
+```bash
+solana program set-upgrade-authority <PROGRAM_ID> --final
+```
+
+The current deployment upgrade authority pubkey and governance process should be documented here by the maintainers.
+
 ## Related Repositories
 
 | Repository | Description |
