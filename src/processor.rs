@@ -1036,6 +1036,10 @@ fn process_withdraw(
     if deposit_pda.data_len() < STAKE_DEPOSIT_SIZE {
         return Err(StakeError::InvalidAccount.into());
     }
+    // N-10: deposit_pda is mutated later (lp_amount update); verify writability here
+    // to match pool_pda (checked at line ~817) and give a clear StakeError rather than
+    // an opaque runtime WritableAccountIsReadonly on a client-side bug.
+    validate_account_writable(deposit_pda)?;
 
     // Check cooldown + read tranche flag in same borrow
     let clock = Clock::from_account_info(clock_sysvar)?;
