@@ -727,9 +727,31 @@ fn test_all_standard_instruction_tags_decode() {
         _ => panic!("Expected FlushToInsurance"),
     }
 
-    // Tags 5, 9 removed (were admin CPI proxies)
-    assert!(StakeInstruction::unpack(&[5u8]).is_err());
-    assert!(StakeInstruction::unpack(&[9u8]).is_err());
+    // Tag 5: ProposeAdmin (reclaimed for admin rotation).
+    let mut data = vec![5u8];
+    data.extend_from_slice(&[3u8; 32]);
+    assert!(matches!(
+        StakeInstruction::unpack(&data).unwrap(),
+        StakeInstruction::ProposeAdmin { .. }
+    ));
+
+    // Tags 7/8/9: #242 cooldown-increase timelock (reclaimed from tombstones).
+    let mut data = vec![7u8];
+    data.extend_from_slice(&999u64.to_le_bytes());
+    assert!(matches!(
+        StakeInstruction::unpack(&data).unwrap(),
+        StakeInstruction::ProposeCooldownIncrease {
+            new_cooldown_slots: 999
+        }
+    ));
+    assert!(matches!(
+        StakeInstruction::unpack(&[8u8]).unwrap(),
+        StakeInstruction::CommitCooldownIncrease
+    ));
+    assert!(matches!(
+        StakeInstruction::unpack(&[9u8]).unwrap(),
+        StakeInstruction::CancelCooldownIncrease
+    ));
 
     // Tag 10: ReturnInsurance (was AdminWithdrawInsurance)
     let mut data = vec![10u8];

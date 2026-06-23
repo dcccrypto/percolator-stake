@@ -509,16 +509,21 @@ fn test_decode_update_config_none() {
 
 #[test]
 fn test_tombstoned_admin_tags_rejected() {
-    // Tags 7, 8, 9, 11 remain tombstoned (former admin CPI proxies).
-    // Tags 5/6 were RECLAIMED for two-step admin rotation (ProposeAdmin/AcceptAdmin)
-    // in v2 — see instruction.rs tests for their positive decode coverage.
-    for tag in [7u8, 8, 9, 11] {
+    // Tag 11 remains tombstoned (former admin CPI proxy).
+    // Tags 5/6 were RECLAIMED for two-step admin rotation (ProposeAdmin/AcceptAdmin) in v2;
+    // tags 7/8/9 were RECLAIMED for the #242 cooldown-increase timelock
+    // (ProposeCooldownIncrease/CommitCooldownIncrease/CancelCooldownIncrease) — see
+    // instruction.rs tests for their positive decode coverage.
+    for tag in [11u8] {
         assert!(
             StakeInstruction::unpack(&[tag]).is_err(),
             "tag {} should be rejected",
             tag
         );
     }
+    // Tags 7/8/9 now decode successfully (empty-data forms for 8/9).
+    assert!(StakeInstruction::unpack(&[8u8]).is_ok());
+    assert!(StakeInstruction::unpack(&[9u8]).is_ok());
 }
 
 #[test]

@@ -94,21 +94,42 @@ fn create_or_adopt_pda<'a>(
 /// withdrawals — `clock.slot` would never reach the saturating deadline (#121).
 const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 
-/// Minimum delay before a proposed config change takes effect (≈48 hours at 2.5 slots/sec).
+/// Minimum delay before a proposed cooldown increase takes effect (≈48 hours at 2.5 slots/sec).
 ///
-/// N-2 — Timelock requirement: UpdateConfig, FlushToInsurance, and SetMarketResolved
-/// can all be called atomically today. A compromised admin can combine them in one tx
-/// to: set cooldown = MAX_COOLDOWN_SLOTS (~1 year), drain vault via FlushToInsurance,
-/// and resolve the market — permanently locking LP capital. A two-phase commit on
-/// these instructions, enforced by this constant, would require a 48-hour window
-/// before the change takes effect, giving LP holders time to exit.
+/// N-2 — Timelock (#242). The capital-LOCK vector is a `cooldown_slots` INCREASE: a
+/// compromised admin could set cooldown = MAX_COOLDOWN_SLOTS (~1 year) in a single
+/// UpdateConfig tx and lock LP withdrawals. That increase is now IMPLEMENTED as a
+/// two-phase timelock — ProposeCooldownIncrease (tag 7) records the pending value and
+/// proposal slot in StakePool (`pending_cooldown_slots` / `cooldown_proposed_at_slot`,
+/// stored in the previously-free `_reserved[10..26]` — no struct-size change / version
+/// bump), and CommitCooldownIncrease (tag 8) applies it only after TIMELOCK_SLOTS have
+/// elapsed, giving LP holders a guaranteed ≥48h exit window. CancelCooldownIncrease
+/// (tag 9) withdraws a pending proposal. UpdateConfig now REJECTS a cooldown increase
+/// (`CooldownIncreaseRequiresTimelock`); decreases (LP-friendly) and `deposit_cap`
+/// changes remain immediate.
 ///
-/// IMPLEMENTATION NOTE: Full two-phase commit requires `pending_cooldown_slots: u64`
-/// and `proposed_at_slot: u64` fields in StakePool state (a protocol version bump).
-/// This constant defines the minimum delay for that implementation. See issue #242.
-/// The full implementation is deferred to a protocol upgrade; this constant
-/// documents the required value and guards future implementations.
+/// FlushToInsurance and SetMarketResolved are intentionally NOT timelocked: flush moves
+/// collateral into the PDA-custodied insurance fund (recoverable via ReturnInsurance,
+/// and guarded by #227 vault-ownership + #229 post-resolve block — it is not an
+/// admin-extractable drain), and resolution is a one-way operational action. Delaying
+/// either would trade real operational liveness for no capital-lock protection beyond
+/// what the cooldown timelock already provides.
 pub const TIMELOCK_SLOTS: u64 = 432_000; // ~48 hours at 2.5 slots/sec
+
+/// #242: returns whether the timelock window has elapsed for a proposal made at slot
+/// `proposed_at`, given the current slot `now` and `timelock_slots`. Pure + checked
+/// (a `proposed_at + timelock_slots` overflow ⇒ `Err`, never a panic). The caller is
+/// responsible for confirming an active proposal (`proposed_at != 0`) before calling.
+pub fn timelock_window_elapsed(
+    proposed_at: u64,
+    timelock_slots: u64,
+    now: u64,
+) -> Result<bool, ProgramError> {
+    let earliest = proposed_at
+        .checked_add(timelock_slots)
+        .ok_or(StakeError::Overflow)?;
+    Ok(now >= earliest)
+}
 
 /// Upper bound on `hwm_floor_bps` (90%). The high-water-mark floor is a per-epoch
 /// drain RATE LIMITER, not a withdrawal kill switch. At 10_000 (100%) the floor
@@ -339,6 +360,15 @@ pub fn process(
             process_propose_admin(program_id, accounts, new_admin)
         }
         StakeInstruction::AcceptAdmin => process_accept_admin(program_id, accounts),
+        StakeInstruction::ProposeCooldownIncrease { new_cooldown_slots } => {
+            process_propose_cooldown_increase(program_id, accounts, new_cooldown_slots)
+        }
+        StakeInstruction::CommitCooldownIncrease => {
+            process_commit_cooldown_increase(program_id, accounts)
+        }
+        StakeInstruction::CancelCooldownIncrease => {
+            process_cancel_cooldown_increase(program_id, accounts)
+        }
         StakeInstruction::BindInsuranceAuthority => {
             process_bind_insurance_authority(program_id, accounts)
         }
@@ -1580,6 +1610,13 @@ fn process_update_config(
 
     if let Some(cooldown) = new_cooldown_slots {
         validate_cooldown_slots(cooldown)?;
+        // #242: a cooldown INCREASE is the capital-lock vector — route it through the
+        // two-phase timelock (ProposeCooldownIncrease → CommitCooldownIncrease) so LP
+        // holders get a ≥48h exit window. Decreases / unchanged are LP-friendly and stay
+        // immediate.
+        if cooldown > pool.cooldown_slots {
+            return Err(StakeError::CooldownIncreaseRequiresTimelock.into());
+        }
         pool.cooldown_slots = cooldown;
     }
     if let Some(cap) = new_deposit_cap {
@@ -1689,6 +1726,184 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     pool.pending_admin = [0u8; 32];
 
     msg!("AcceptAdmin: admin rotation complete");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 7: ProposeCooldownIncrease — step 1 of the #242 cooldown-increase timelock
+// ═══════════════════════════════════════════════════════════════
+
+/// The admin proposes a NEW (larger) `cooldown_slots`. Records the pending value and
+/// the current slot; the increase does not take effect until CommitCooldownIncrease is
+/// called after TIMELOCK_SLOTS have elapsed — guaranteeing LP holders a ≥48h exit window
+/// before withdrawals can be slowed. Re-proposing overwrites the pending value AND resets
+/// the timer (the new, longer window applies). A decrease/unchanged value is rejected here
+/// (those go through UpdateConfig immediately).
+///
+/// Accounts:
+///   0. `[signer]` Admin
+///   1. `[writable]` Pool PDA
+///   2. `[]` Clock sysvar
+fn process_propose_cooldown_increase(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    new_cooldown_slots: u64,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let clock_sysvar = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+
+    let clock = Clock::from_account_info(clock_sysvar)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    // Same absolute cap as the immediate path.
+    validate_cooldown_slots(new_cooldown_slots)?;
+    // Propose is ONLY for increases; a decrease/unchanged value goes through UpdateConfig.
+    if new_cooldown_slots <= pool.cooldown_slots {
+        return Err(StakeError::CooldownIncreaseRequiresTimelock.into());
+    }
+
+    pool.set_pending_cooldown_slots(new_cooldown_slots);
+    // clock.slot is never 0 on a live chain, so it is a safe "active proposal" sentinel.
+    pool.set_cooldown_proposed_at_slot(clock.slot);
+
+    msg!("ProposeCooldownIncrease: pending; commit after TIMELOCK_SLOTS");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 8: CommitCooldownIncrease — step 2 of the #242 cooldown-increase timelock
+// ═══════════════════════════════════════════════════════════════
+
+/// Applies a previously-proposed cooldown increase, but ONLY after TIMELOCK_SLOTS have
+/// elapsed since the proposal. Clears the pending state on success.
+///
+/// Accounts:
+///   0. `[signer]` Admin
+///   1. `[writable]` Pool PDA
+///   2. `[]` Clock sysvar
+fn process_commit_cooldown_increase(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let clock_sysvar = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+
+    let clock = Clock::from_account_info(clock_sysvar)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    let proposed_at = pool.cooldown_proposed_at_slot();
+    if proposed_at == 0 {
+        return Err(StakeError::NoPendingCooldownProposal.into());
+    }
+    if !timelock_window_elapsed(proposed_at, TIMELOCK_SLOTS, clock.slot)? {
+        return Err(StakeError::TimelockNotElapsed.into());
+    }
+
+    let pending = pool.pending_cooldown_slots();
+    // Defensive re-validation: the cap may matter even though propose enforced it.
+    validate_cooldown_slots(pending)?;
+
+    pool.cooldown_slots = pending;
+    pool.set_pending_cooldown_slots(0);
+    pool.set_cooldown_proposed_at_slot(0);
+
+    msg!("CommitCooldownIncrease: applied");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 9: CancelCooldownIncrease — withdraw a pending #242 cooldown proposal
+// ═══════════════════════════════════════════════════════════════
+
+/// The admin cancels an outstanding cooldown-increase proposal, clearing the pending
+/// state. No clock needed.
+///
+/// Accounts:
+///   0. `[signer]` Admin
+///   1. `[writable]` Pool PDA
+fn process_cancel_cooldown_increase(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    if pool.cooldown_proposed_at_slot() == 0 {
+        return Err(StakeError::NoPendingCooldownProposal.into());
+    }
+    pool.set_pending_cooldown_slots(0);
+    pool.set_cooldown_proposed_at_slot(0);
+
+    msg!("CancelCooldownIncrease: pending proposal cleared");
     Ok(())
 }
 
@@ -2968,6 +3183,77 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    // ── #242 timelock_window_elapsed (pure helper) ──────────────────────────
+    #[test]
+    fn timelock_not_elapsed_before_window() {
+        // proposed at 1000, 432_000-slot window ⇒ earliest = 433_000.
+        assert_eq!(
+            timelock_window_elapsed(1_000, TIMELOCK_SLOTS, 1_000).unwrap(),
+            false
+        );
+        assert_eq!(
+            timelock_window_elapsed(1_000, TIMELOCK_SLOTS, 433_000 - 1).unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn timelock_elapsed_at_or_after_window() {
+        // Boundary is inclusive: now == proposed + window ⇒ elapsed.
+        assert_eq!(
+            timelock_window_elapsed(1_000, TIMELOCK_SLOTS, 1_000 + TIMELOCK_SLOTS).unwrap(),
+            true
+        );
+        assert_eq!(
+            timelock_window_elapsed(1_000, TIMELOCK_SLOTS, 1_000 + TIMELOCK_SLOTS + 5).unwrap(),
+            true
+        );
+    }
+
+    #[test]
+    fn timelock_overflow_is_error_not_panic() {
+        assert_eq!(
+            timelock_window_elapsed(u64::MAX, TIMELOCK_SLOTS, u64::MAX),
+            Err(StakeError::Overflow.into())
+        );
+    }
+
+    // ── #242 StakePool pending-cooldown accessors round-trip ────────────────
+    #[test]
+    fn pending_cooldown_accessors_roundtrip_and_default_zero() {
+        let mut pool = StakePool::zeroed();
+        // Fresh (zeroed) pool ⇒ no active proposal.
+        assert_eq!(pool.pending_cooldown_slots(), 0);
+        assert_eq!(pool.cooldown_proposed_at_slot(), 0);
+        pool.set_pending_cooldown_slots(987_654);
+        pool.set_cooldown_proposed_at_slot(42);
+        assert_eq!(pool.pending_cooldown_slots(), 987_654);
+        assert_eq!(pool.cooldown_proposed_at_slot(), 42);
+        // Clearing the proposal slot restores the sentinel.
+        pool.set_cooldown_proposed_at_slot(0);
+        assert_eq!(pool.cooldown_proposed_at_slot(), 0);
+    }
+
+    #[test]
+    fn pending_cooldown_bytes_do_not_collide_with_neighbors() {
+        // _reserved[10..26] must not disturb the discriminator/version[0..9],
+        // market_resolved[9], tranche[32+], or realized_junior_loss[51..59].
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        pool.set_market_resolved(true);
+        pool.set_realized_junior_loss(7_777);
+        pool.set_tranche_enabled(true);
+        pool.set_pending_cooldown_slots(u64::MAX);
+        pool.set_cooldown_proposed_at_slot(123);
+        assert!(pool.validate_discriminator());
+        assert_eq!(pool.version(), StakePool::CURRENT_VERSION);
+        assert!(pool.market_resolved());
+        assert!(pool.tranche_enabled());
+        assert_eq!(pool.realized_junior_loss(), 7_777);
+        assert_eq!(pool.pending_cooldown_slots(), u64::MAX);
+        assert_eq!(pool.cooldown_proposed_at_slot(), 123);
+    }
 
     #[test]
 fn return_insurance_rejects_admin_ata_not_owned_by_admin() {

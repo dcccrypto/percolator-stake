@@ -768,4 +768,28 @@ mod kani_proofs {
         // Ratio should be 50_000 : 10_000 = 5:1
         kani::cover!(jf > sf);
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // #242 — cooldown-increase timelock window (exhaustive, non-vacuous)
+    // ═══════════════════════════════════════════════════════════
+
+    /// PROOF: `timelock_window_elapsed` matches its spec over ALL u64 inputs —
+    /// `Err` exactly when `proposed_at + timelock` overflows (never a panic),
+    /// otherwise `Ok(now >= proposed_at + timelock)`. The two `cover!`s prove both
+    /// the elapsed and not-elapsed verdicts are reachable (the gate is neither
+    /// constant-true nor constant-false).
+    #[kani::proof]
+    fn kani_timelock_window_elapsed_matches_spec() {
+        let proposed_at: u64 = kani::any();
+        let timelock: u64 = kani::any();
+        let now: u64 = kani::any();
+        let res =
+            percolator_stake::processor::timelock_window_elapsed(proposed_at, timelock, now);
+        match proposed_at.checked_add(timelock) {
+            None => assert!(res.is_err()),
+            Some(earliest) => assert_eq!(res, Ok(now >= earliest)),
+        }
+        kani::cover!(res == Ok(true));
+        kani::cover!(res == Ok(false));
+    }
 }

@@ -60,6 +60,17 @@ pub enum StakeError {
     /// would inherit a pre-existing loss it was never exposed to (and the mirror
     /// case could snipe the recovery). Deposits resume once insurance is returned.
     InsuranceLossOutstanding = 24,
+    /// #242 timelock: a `cooldown_slots` INCREASE must go through the two-phase
+    /// timelock (ProposeCooldownIncrease → wait TIMELOCK_SLOTS → CommitCooldownIncrease),
+    /// not the immediate UpdateConfig path. A decrease or unchanged value is still
+    /// allowed via UpdateConfig.
+    CooldownIncreaseRequiresTimelock = 25,
+    /// #242 timelock: CommitCooldownIncrease was called before TIMELOCK_SLOTS had
+    /// elapsed since the proposal. LP holders are still inside their exit window.
+    TimelockNotElapsed = 26,
+    /// #242 timelock: CommitCooldownIncrease / CancelCooldownIncrease with no active
+    /// proposal (cooldown_proposed_at_slot == 0).
+    NoPendingCooldownProposal = 27,
 }
 
 impl From<StakeError> for ProgramError {

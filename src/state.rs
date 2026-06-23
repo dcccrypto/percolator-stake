@@ -336,6 +336,36 @@ impl StakePool {
         self._reserved[59] = if burned { 1 } else { 0 };
     }
 
+    /// #242 timelock: the `cooldown_slots` INCREASE awaiting commit. Stored at
+    /// `_reserved[10..18]` (LE u64), in the previously-free `[10..32]` region — no
+    /// struct-size change, no version bump. Meaningful only while
+    /// `cooldown_proposed_at_slot() != 0`.
+    pub fn pending_cooldown_slots(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[10..18]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set the pending cooldown-increase value. See [`pending_cooldown_slots`].
+    pub fn set_pending_cooldown_slots(&mut self, val: u64) {
+        self._reserved[10..18].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// #242 timelock: the slot at which the pending cooldown increase was proposed.
+    /// `0` = no active proposal (the sentinel; a live mainnet slot is never 0). Stored
+    /// at `_reserved[18..26]` (LE u64).
+    pub fn cooldown_proposed_at_slot(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[18..26]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set the cooldown-increase proposal slot (`0` clears the proposal). See
+    /// [`cooldown_proposed_at_slot`].
+    pub fn set_cooldown_proposed_at_slot(&mut self, val: u64) {
+        self._reserved[18..26].copy_from_slice(&val.to_le_bytes());
+    }
+
     /// Loss-adjusted junior tranche balance.
     ///
     /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
