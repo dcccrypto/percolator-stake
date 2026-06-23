@@ -1,0 +1,51 @@
+name: upgrade-authority-gate
+
+# #240 — pre-mainnet gate: every fund-custody program's upgrade authority must be
+# burned or held by an allowlisted governance multisig. Manual / opt-in: it only runs
+# on demand (or other workflows can `uses:`/call it), and no-ops cleanly when the
+# UPGRADE_AUTH_* repo variables are not configured, so it never blocks unrelated PRs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: "RPC cluster URL"
+        required: false
+        default: "https://api.mainnet-beta.solana.com"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Configure these as repo/org Variables (Settings → Secrets and variables → Actions → Variables):
+      #   UPGRADE_AUTH_PROGRAMS  — comma-separated program IDs to check
+      #   UPGRADE_AUTH_ALLOWLIST — comma-separated acceptable governance authorities
+      #                            (empty ⇒ policy is "must be burned")
+      UPGRADE_AUTH_PROGRAMS: ${{ vars.UPGRADE_AUTH_PROGRAMS }}
+      UPGRADE_AUTH_ALLOWLIST: ${{ vars.UPGRADE_AUTH_ALLOWLIST }}
+      SOLANA_CLUSTER: ${{ github.event.inputs.cluster }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip when unconfigured
+        id: guard
+        run: |
+          if [ -z "${UPGRADE_AUTH_PROGRAMS}" ]; then
+            echo "UPGRADE_AUTH_PROGRAMS not set — nothing to check. Configure it to enable the gate."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Solana CLI
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Check upgrade authorities
+        if: steps.guard.outputs.run == 'true'
+        run: bash scripts/check-upgrade-authority.sh

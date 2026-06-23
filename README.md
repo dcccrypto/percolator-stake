@@ -261,6 +261,14 @@ solana program set-upgrade-authority <PROGRAM_ID> --final
 
 The current deployment upgrade authority pubkey and governance process should be documented here by the maintainers.
 
+**Enforcement (#240):** this requirement is gated by
+[`scripts/check-upgrade-authority.sh`](scripts/check-upgrade-authority.sh) — it fails CI
+unless every checked program's authority is burned or held by an allowlisted governance
+multisig. Full runbook (transfer-to-Squads / burn / verify):
+[`docs/SECURITY-UPGRADE-AUTHORITY.md`](docs/SECURITY-UPGRADE-AUTHORITY.md). The opt-in
+[`upgrade-authority-gate`](.github/workflows/upgrade-authority-gate.yml) workflow runs it
+in CI once the `UPGRADE_AUTH_*` repo variables are configured.
+
 ## Related Repositories
 
 | Repository | Description |
