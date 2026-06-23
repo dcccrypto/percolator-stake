@@ -94,6 +94,22 @@ fn create_or_adopt_pda<'a>(
 /// withdrawals — `clock.slot` would never reach the saturating deadline (#121).
 const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 
+/// Minimum delay before a proposed config change takes effect (≈48 hours at 2.5 slots/sec).
+///
+/// N-2 — Timelock requirement: UpdateConfig, FlushToInsurance, and SetMarketResolved
+/// can all be called atomically today. A compromised admin can combine them in one tx
+/// to: set cooldown = MAX_COOLDOWN_SLOTS (~1 year), drain vault via FlushToInsurance,
+/// and resolve the market — permanently locking LP capital. A two-phase commit on
+/// these instructions, enforced by this constant, would require a 48-hour window
+/// before the change takes effect, giving LP holders time to exit.
+///
+/// IMPLEMENTATION NOTE: Full two-phase commit requires `pending_cooldown_slots: u64`
+/// and `proposed_at_slot: u64` fields in StakePool state (a protocol version bump).
+/// This constant defines the minimum delay for that implementation. See issue #242.
+/// The full implementation is deferred to a protocol upgrade; this constant
+/// documents the required value and guards future implementations.
+pub const TIMELOCK_SLOTS: u64 = 432_000; // ~48 hours at 2.5 slots/sec
+
 /// Upper bound on `hwm_floor_bps` (90%). The high-water-mark floor is a per-epoch
 /// drain RATE LIMITER, not a withdrawal kill switch. At 10_000 (100%) the floor
 /// equals the full water mark, and because `refresh_hwm` keeps the mark at or above
