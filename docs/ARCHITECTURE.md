@@ -157,3 +157,23 @@ Pool admin → AdminWithdrawInsurance
 
 4. **Single-slab pools** — Each pool manages one market. Multi-slab pools
    would require different PDA derivation and more complex accounting.
+
+5. **Hardcoded percolator_program allowlist** — `pool.percolator_program` is set once
+   at `InitPool` from two compile-time constants (`PERCOLATOR_MAINNET`, `PERCOLATOR_DEVNET`).
+   If `percolator-prog` is ever redeployed to a new program ID (e.g., due to a critical
+   security patch requiring full redeployment rather than an in-place upgrade), all
+   existing pools' CPI-issuing instructions (`FlushToInsurance`, `BindInsuranceAuthority`,
+   `RotateInsuranceAuthority`, `BurnAssetAdmin`) will fail permanently with
+   `StakeError::InvalidPercolatorProgram`. LP `Withdraw` still works (no CPI needed), but
+   all insurance operations are blocked until the stake program itself is redeployed.
+
+   **Migration procedure** (if wrapper redeployment is required):
+   1. Pause all FlushToInsurance operations.
+   2. Deploy new percolator-prog at a new program ID.
+   3. Redeploy percolator-stake with the new ID in the allowlist.
+   4. Existing pools must be migrated: either re-initialize on the new stake program,
+      or add an admin-callable `UpdatePercolatorProgram` instruction (with timelock)
+      that allows updating `pool.percolator_program` to the new ID.
+
+   Future hardening: store the allowlist in an on-chain governance account so it can
+   be updated without a stake program redeploy.
