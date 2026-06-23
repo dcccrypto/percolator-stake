@@ -182,9 +182,37 @@ pub enum StakeInstruction {
     ///   1. `[writable]` Pool PDA
     AcceptAdmin,
 
-    // Tags 7-9, 11 removed: were admin CPI proxies (SetOracleAuthority,
-    // SetRiskThreshold, SetMaintenanceFee, ResolveMarket, SetInsurancePolicy).
-    // Human admin now calls wrapper directly. Tags 5/6 reclaimed for admin rotation.
+    /// 7: ProposeCooldownIncrease — step 1 of the #242 cooldown-increase timelock.
+    /// The admin proposes a NEW (larger) `cooldown_slots`; it does not take effect until
+    /// CommitCooldownIncrease is called after TIMELOCK_SLOTS (≈48h), guaranteeing LP
+    /// holders an exit window. A decrease/unchanged value is rejected here (use
+    /// UpdateConfig, which applies decreases immediately).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Clock sysvar
+    ProposeCooldownIncrease { new_cooldown_slots: u64 },
+
+    /// 8: CommitCooldownIncrease — step 2 of the #242 timelock. Applies the pending
+    /// cooldown increase, but only after TIMELOCK_SLOTS have elapsed since the proposal.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Clock sysvar
+    CommitCooldownIncrease,
+
+    /// 9: CancelCooldownIncrease — withdraw an outstanding #242 cooldown proposal.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    CancelCooldownIncrease,
+
+    // Tag 11 removed: was an admin CPI proxy (SetInsurancePolicy). Human admin now
+    // calls the wrapper directly. Tags 5/6 reclaimed for admin rotation; tags 7/8/9
+    // reclaimed for the #242 cooldown-increase timelock.
     /// 10: Return insurance funds to the pool vault.
     /// Admin calls WithdrawInsurance on the wrapper directly (gets USDC to admin ATA),
     /// then calls this to transfer from admin ATA to pool vault and update accounting.
@@ -338,7 +366,33 @@ impl StakeInstruction {
                 }
                 Ok(Self::AcceptAdmin)
             }
-            // Tags 7-9, 11 tombstoned — were admin CPI proxies, now removed.
+            7 => {
+                // #242: ProposeCooldownIncrease { new_cooldown_slots: u64 }
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let new_cooldown_slots = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::ProposeCooldownIncrease { new_cooldown_slots })
+            }
+            8 => {
+                // #242: CommitCooldownIncrease
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::CommitCooldownIncrease)
+            }
+            9 => {
+                // #242: CancelCooldownIncrease
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::CancelCooldownIncrease)
+            }
+            // Tag 11 tombstoned — was an admin CPI proxy, now removed.
             19 => {
                 if !rest.is_empty() {
                     return Err(ProgramError::InvalidInstructionData);
@@ -511,8 +565,9 @@ mod tests {
 
     #[test]
     fn test_tombstoned_tags_rejected() {
-        // Tags 7-9, 11, 17 remain tombstoned (5/6 reclaimed for admin rotation).
-        for tag in [7u8, 8, 9, 11, 17] {
+        // Tags 11, 17 remain tombstoned (5/6 reclaimed for admin rotation; 7/8/9
+        // reclaimed for the #242 cooldown-increase timelock).
+        for tag in [11u8, 17] {
             let data = vec![tag];
             assert!(
                 StakeInstruction::unpack(&data).is_err(),
@@ -520,6 +575,36 @@ mod tests {
                 tag
             );
         }
+    }
+
+    #[test]
+    fn test_unpack_propose_cooldown_increase() {
+        let mut data = vec![7u8];
+        data.extend_from_slice(&123_456u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::ProposeCooldownIncrease { new_cooldown_slots } => {
+                assert_eq!(new_cooldown_slots, 123_456)
+            }
+            _ => panic!("wrong variant"),
+        }
+        // wrong length is rejected
+        assert!(StakeInstruction::unpack(&[7u8]).is_err());
+        assert!(StakeInstruction::unpack(&[7u8, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_commit_and_cancel_cooldown_increase() {
+        match StakeInstruction::unpack(&[8u8]).unwrap() {
+            StakeInstruction::CommitCooldownIncrease => {}
+            _ => panic!("wrong variant"),
+        }
+        match StakeInstruction::unpack(&[9u8]).unwrap() {
+            StakeInstruction::CancelCooldownIncrease => {}
+            _ => panic!("wrong variant"),
+        }
+        // trailing bytes rejected
+        assert!(StakeInstruction::unpack(&[8u8, 0]).is_err());
+        assert!(StakeInstruction::unpack(&[9u8, 0]).is_err());
     }
 
     #[test]
