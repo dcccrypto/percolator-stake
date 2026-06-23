@@ -388,14 +388,23 @@ fn process_init_pool(
     // Validate percolator_program against known-good allowlist.
     // Without this, a malicious admin could set percolator_program to an
     // attacker-controlled program, then drain the vault via FlushToInsurance CPI.
+    //
+    // N-3: PERCOLATOR_DEVNET is removed from the mainnet allowlist. Both IDs were
+    // accepted on any network; if the devnet deploy keypair is compromised an attacker
+    // can deploy a malicious binary at the devnet address on mainnet, create a pool
+    // pointing to it, and drain the vault via FlushToInsurance PDA-signer propagation.
+    // The devnet program ID has no legitimate use on mainnet; gate it with the
+    // "devnet" feature flag so it only compiles in when explicitly requested.
     {
         const PERCOLATOR_MAINNET: Pubkey =
             solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+        #[cfg(feature = "devnet")]
         const PERCOLATOR_DEVNET: Pubkey =
             solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
-        if *percolator_program.key != PERCOLATOR_MAINNET
-            && *percolator_program.key != PERCOLATOR_DEVNET
-        {
+        let is_valid = *percolator_program.key == PERCOLATOR_MAINNET;
+        #[cfg(feature = "devnet")]
+        let is_valid = is_valid || *percolator_program.key == PERCOLATOR_DEVNET;
+        if !is_valid {
             msg!(
                 "Error: invalid percolator program {}",
                 percolator_program.key

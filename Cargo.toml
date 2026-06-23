@@ -8,6 +8,7 @@ description = "PDA-admin insurance LP staking program for Percolator"
 no-entrypoint = []
 test = []
 kani = []
+devnet = []
 
 [dependencies]
 solana-program = "=2.2.1"
