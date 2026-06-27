@@ -101,8 +101,9 @@ const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 /// UpdateConfig tx and lock LP withdrawals. That increase is now IMPLEMENTED as a
 /// two-phase timelock — ProposeCooldownIncrease (tag 7) records the pending value and
 /// proposal slot in StakePool (`pending_cooldown_slots` / `cooldown_proposed_at_slot`,
-/// stored in the previously-free `_reserved[10..26]` — no struct-size change / version
-/// bump), and CommitCooldownIncrease (tag 8) applies it only after TIMELOCK_SLOTS have
+/// real struct fields as of #250/#258 (the original packing aliased the PERC-313 HWM
+/// fields that already own that byte range; see the state.rs doc comments),
+/// and CommitCooldownIncrease (tag 8) applies it only after TIMELOCK_SLOTS have
 /// elapsed, giving LP holders a guaranteed ≥48h exit window. CancelCooldownIncrease
 /// (tag 9) withdraws a pending proposal. UpdateConfig now REJECTS a cooldown increase
 /// (`CooldownIncreaseRequiresTimelock`); decreases (LP-friendly) and `deposit_cap`
@@ -3382,13 +3383,21 @@ mod tests {
 
     #[test]
     fn pending_cooldown_bytes_do_not_collide_with_neighbors() {
-        // _reserved[10..26] must not disturb the discriminator/version[0..9],
-        // market_resolved[9], tranche[32+], or realized_junior_loss[51..59].
+        // #250/#258: pending_cooldown_slots/cooldown_proposed_at_slot are now real
+        // struct fields, not packed into _reserved[10..26] — so they can no longer
+        // collide with the discriminator/version[0..9], market_resolved[9],
+        // tranche[32+], realized_junior_loss[51..59], OR (the gap the original
+        // version of this test missed) the PERC-313 HWM fields, which actually
+        // own _reserved[10..32].
         let mut pool = StakePool::zeroed();
         pool.set_discriminator();
         pool.set_market_resolved(true);
         pool.set_realized_junior_loss(7_777);
         pool.set_tranche_enabled(true);
+        pool.set_hwm_enabled(true);
+        pool.set_hwm_floor_bps(5_000);
+        pool.set_epoch_high_water_tvl(1_000_000);
+        pool.set_hwm_last_epoch(10);
         pool.set_pending_cooldown_slots(u64::MAX);
         pool.set_cooldown_proposed_at_slot(123);
         assert!(pool.validate_discriminator());
@@ -3398,6 +3407,12 @@ mod tests {
         assert_eq!(pool.realized_junior_loss(), 7_777);
         assert_eq!(pool.pending_cooldown_slots(), u64::MAX);
         assert_eq!(pool.cooldown_proposed_at_slot(), 123);
+        // The fields the original test never checked against — these are exactly
+        // what #250/#258 showed getting corrupted under the old _reserved packing.
+        assert!(pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 5_000);
+        assert_eq!(pool.epoch_high_water_tvl(), 1_000_000);
+        assert_eq!(pool.hwm_last_epoch(), 10);
     }
 
     #[test]
