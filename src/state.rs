@@ -129,9 +129,13 @@ pub struct StakePool {
     /// a real field rather than packed into `_reserved`.
     pub cooldown_proposed_at_slot: u64,
 
-    /// Reserved for future use. Bytes [10..26] are no longer written by the
-    /// cooldown timelock (see `pending_cooldown_slots`/`cooldown_proposed_at_slot`
-    /// above) and are genuinely free again.
+    /// Reserved for future use. Bytes [10..32] are still owned by the PERC-313
+    /// HWM fields (`hwm_enabled` at [10], `hwm_floor_bps` at [11..13],
+    /// `epoch_high_water_tvl` at [16..24], `hwm_last_epoch` at [24..32]) — that
+    /// ownership is unchanged by this fix. What changed is that the cooldown
+    /// timelock no longer ALSO writes into that range (see
+    /// `pending_cooldown_slots`/`cooldown_proposed_at_slot` above, now real
+    /// fields outside `_reserved` entirely).
     pub _reserved: [u8; 64],
 }
 
