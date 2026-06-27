@@ -6,13 +6,14 @@
 use percolator_stake::state::{StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
 
 #[test]
-fn test_stake_pool_size_is_384() {
-    // v2 layout: prior 352 + pending_admin[32] (two-step admin rotation) = 384.
+fn test_stake_pool_size_is_400() {
+    // v3 layout: prior 384 + pending_cooldown_slots(8) + cooldown_proposed_at_slot(8)
+    // (#250/#258 — promoted out of the colliding _reserved[10..26] packing) = 400.
     // If this changes, existing on-chain data becomes unreadable.
     // NEVER change this without a version bump + (if not fresh-start) a migration.
-    // v16 sync is a fresh-start cutover, so no v1 (352-byte) pools exist.
-    assert_eq!(STAKE_POOL_SIZE, 384);
-    assert_eq!(std::mem::size_of::<StakePool>(), 384);
+    // v17 sync is a fresh-start cutover, so no v2 (384-byte) pools exist.
+    assert_eq!(STAKE_POOL_SIZE, 400);
+    assert_eq!(std::mem::size_of::<StakePool>(), 400);
 }
 
 #[test]
@@ -151,7 +152,12 @@ fn test_stake_pool_field_offsets() {
     assert_eq!(&pool.last_vault_snapshot as *const _ as usize - base, 272);
     assert_eq!(&pool.pool_mode as *const _ as usize - base, 280);
     assert_eq!(&pool._mode_padding as *const _ as usize - base, 281);
-    // v2: pending_admin[32] inserted at 288, pushing _reserved to 320.
+    // v2: pending_admin[32] inserted at 288, pushing the next field to 320.
     assert_eq!(&pool.pending_admin as *const _ as usize - base, 288);
-    assert_eq!(&pool._reserved as *const _ as usize - base, 320);
+    // v3 (#250/#258): pending_cooldown_slots/cooldown_proposed_at_slot promoted out
+    // of the colliding _reserved[10..26] packing into real fields at 320/328,
+    // pushing _reserved to 336.
+    assert_eq!(&pool.pending_cooldown_slots as *const _ as usize - base, 320);
+    assert_eq!(&pool.cooldown_proposed_at_slot as *const _ as usize - base, 328);
+    assert_eq!(&pool._reserved as *const _ as usize - base, 336);
 }
