@@ -323,6 +323,27 @@ impl StakePool {
         self._reserved[51..59].copy_from_slice(&val.to_le_bytes());
     }
 
+    /// Physical insurance outstanding at the wrapper: the amount of previously-flushed
+    /// collateral that can still be moved back into `vault` from the wrapper's insurance
+    /// fund (#259).
+    ///
+    /// This is NOT simply `total_flushed - total_returned`: when the last junior LP
+    /// exits during an outstanding loss, `process_withdraw` settles the forfeited
+    /// portion by adding it to `total_returned` (so `total_pool_value()` stops counting
+    /// it as senior-claimable) WITHOUT moving any tokens back from the wrapper — see
+    /// `realized_junior_loss`. That bookkeeping-only increment to `total_returned`
+    /// must be added back here to recover the true physical recovery capacity, or any
+    /// realized junior loss permanently strands the matching wrapper-held tokens.
+    ///
+    /// Both `ReturnInsurance` (admin) and `RecoverFlushedInsurance` (permissionless,
+    /// post-burn) must use this SAME formula — they previously diverged, which is
+    /// exactly how #259 shipped.
+    pub fn physical_insurance_outstanding(&self) -> u64 {
+        self.total_flushed
+            .saturating_sub(self.total_returned)
+            .saturating_add(self.realized_junior_loss())
+    }
+
     /// Whether BurnAssetAdmin has completed for this pool's market.
     ///
     /// Once true, stake-side rotate escapes stay disabled so the wrapper roles
