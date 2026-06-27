@@ -3060,13 +3060,10 @@ fn process_return_insurance(
         return Err(ProgramError::IllegalOwner);
     }
 
-    // M-1: physical outstanding = (flushed - returned) + realized_junior_loss.
-    // realized_junior_loss was added to total_returned as a bookkeeping settlement
-    // when the last junior exited; adding it back exposes the full physical recovery
-    // capacity that senior holders are entitled to.
-    let outstanding = pool.total_flushed
-        .saturating_sub(pool.total_returned)
-        .saturating_add(pool.realized_junior_loss());
+    // M-1/#259: physical outstanding = (flushed - returned) + realized_junior_loss,
+    // via the shared helper also used by RecoverFlushedInsurance so the two recovery
+    // paths can never diverge again.
+    let outstanding = pool.physical_insurance_outstanding();
     if amount > outstanding {
         msg!(
             "ReturnInsurance: amount {} exceeds outstanding insurance {}",
@@ -3207,9 +3204,14 @@ fn process_recover_flushed_insurance(
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // CAP: amount must not exceed outstanding = total_flushed - total_returned.
-    // Use saturating_sub so a stale / already-fully-returned pool yields 0 outstanding.
-    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    // CAP/#259: amount must not exceed the physical outstanding insurance, via the
+    // same shared helper process_return_insurance uses. The prior formula here
+    // (total_flushed - total_returned alone) omitted realized_junior_loss — the
+    // bookkeeping-only settlement booked when the last junior LP exits during an
+    // outstanding loss — which understated recoverable capacity by exactly that
+    // amount and could report zero outstanding when tokens were still physically
+    // recoverable from the wrapper.
+    let outstanding = pool.physical_insurance_outstanding();
     if outstanding == 0 {
         msg!(
             "RecoverFlushedInsurance: nothing to recover (total_flushed={} total_returned={})",
