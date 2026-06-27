@@ -444,15 +444,28 @@ fn process_init_pool(
     // pointing to it, and drain the vault via FlushToInsurance PDA-signer propagation.
     // The devnet program ID has no legitimate use on mainnet; gate it with the
     // "devnet" feature flag so it only compiles in when explicitly requested.
+    //
+    // #257: the legacy PERCOLATOR_DEVNET address above predates the v17 wrapper cutover.
+    // percolator-sdk's PROGRAM_IDS_V17.percolator ("69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9")
+    // is a SEPARATE, newer devnet-only deployment (SDK comment: "Mainnet addresses are
+    // pending the mainnet cutover (Phase 7 gate)" — there is no canonical v17 MAINNET
+    // address yet). Add it alongside, not in place of, the legacy devnet address, and
+    // keep it under the SAME "devnet" feature gate as PERCOLATOR_DEVNET for the same
+    // N-3 reason: it has no legitimate use on mainnet either.
     {
         const PERCOLATOR_MAINNET: Pubkey =
             solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
         #[cfg(feature = "devnet")]
         const PERCOLATOR_DEVNET: Pubkey =
             solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+        #[cfg(feature = "devnet")]
+        const PERCOLATOR_V17_DEVNET: Pubkey =
+            solana_program::pubkey!("69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9");
         let is_valid = *percolator_program.key == PERCOLATOR_MAINNET;
         #[cfg(feature = "devnet")]
-        let is_valid = is_valid || *percolator_program.key == PERCOLATOR_DEVNET;
+        let is_valid = is_valid
+            || *percolator_program.key == PERCOLATOR_DEVNET
+            || *percolator_program.key == PERCOLATOR_V17_DEVNET;
         if !is_valid {
             msg!(
                 "Error: invalid percolator program {}",

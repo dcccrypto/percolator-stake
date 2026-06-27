@@ -934,6 +934,29 @@ fn test_percolator_program_allowlist_constants_match_nft() {
 }
 
 #[test]
+fn test_v17_devnet_wrapper_allowlist_constant_matches_sdk() {
+    // #257: percolator-sdk's PROGRAM_IDS_V17.percolator is a separate, newer
+    // devnet-only deployment from the legacy PERCOLATOR_DEVNET above (the SDK's
+    // own comment notes mainnet v17 addresses are "pending the mainnet cutover" —
+    // there is no canonical v17 MAINNET address yet, so only a devnet allowlist
+    // entry is correct here). This test encodes the expected value so drift is
+    // caught at test time, mirroring test_percolator_program_allowlist_constants_match_nft.
+    use solana_program::pubkey::Pubkey;
+
+    let mainnet: Pubkey = solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+    let legacy_devnet: Pubkey =
+        solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+    let v17_devnet: Pubkey = solana_program::pubkey!("69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9");
+
+    assert_ne!(v17_devnet, mainnet, "v17 devnet wrapper must differ from mainnet");
+    assert_ne!(
+        v17_devnet, legacy_devnet,
+        "v17 devnet wrapper must differ from the legacy (pre-v17) devnet wrapper"
+    );
+    assert_ne!(v17_devnet, Pubkey::default(), "v17 devnet ID must not be zero");
+}
+
+#[test]
 fn test_pool_stores_percolator_program() {
     // Verify that a StakePool's percolator_program field is a full 32-byte pubkey.
     let pool = StakePool::zeroed();
