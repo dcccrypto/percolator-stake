@@ -108,6 +108,9 @@ pub fn error_hint(code: u32) -> &'static str {
         22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
         23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
         24 => "Insurance loss outstanding — junior tranche deposits are paused until the flushed insurance is returned (total_flushed > total_returned)",
+        25 => "Cooldown increase requires timelock — call ProposeCooldownIncrease, wait TIMELOCK_SLOTS, then CommitCooldownIncrease",
+        26 => "Timelock not elapsed — wait until TIMELOCK_SLOTS slots have passed since ProposeCooldownIncrease before committing",
+        27 => "No pending cooldown proposal — propose a cooldown increase before committing or cancelling one",
         _ => "Unknown error — check the error code and pool state",
     }
 }
