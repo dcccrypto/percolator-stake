@@ -1,6 +1,6 @@
 //! Error code uniqueness and completeness tests.
 
-use percolator_stake::error::StakeError;
+use percolator_stake::error::{error_hint, StakeError};
 use solana_program::program_error::ProgramError;
 
 #[test]
@@ -31,6 +31,9 @@ fn test_all_error_codes_unique() {
         StakeError::ZeroSharesMinted as u32,
         StakeError::NoPendingAdmin as u32,
         StakeError::InsuranceLossOutstanding as u32,
+        StakeError::CooldownIncreaseRequiresTimelock as u32,
+        StakeError::TimelockNotElapsed as u32,
+        StakeError::NoPendingCooldownProposal as u32,
     ];
 
     // Check uniqueness
@@ -39,7 +42,7 @@ fn test_all_error_codes_unique() {
     sorted.dedup();
     assert_eq!(sorted.len(), codes.len(), "Duplicate error codes detected!");
 
-    // Check sequential (0..24)
+    // Check sequential (0..27)
     for (i, &code) in codes.iter().enumerate() {
         assert_eq!(
             code, i as u32,
@@ -85,10 +88,32 @@ fn test_all_errors_are_custom() {
         StakeError::ZeroSharesMinted,
         StakeError::NoPendingAdmin,
         StakeError::InsuranceLossOutstanding,
+        StakeError::CooldownIncreaseRequiresTimelock,
+        StakeError::TimelockNotElapsed,
+        StakeError::NoPendingCooldownProposal,
     ];
 
     for err in &errors {
         let pe: ProgramError = (*err).into();
         assert!(matches!(pe, ProgramError::Custom(_)));
+    }
+}
+
+#[test]
+fn test_timelock_error_hints_are_actionable() {
+    for (code, expected) in [
+        (25, "Cooldown increase requires timelock"),
+        (26, "Timelock not elapsed"),
+        (27, "No pending cooldown proposal"),
+    ] {
+        let hint = error_hint(code);
+        assert_ne!(hint, "Unknown error — check the error code and pool state");
+        assert!(
+            hint.contains(expected),
+            "expected hint for code {} to contain {:?}, got {:?}",
+            code,
+            expected,
+            hint
+        );
     }
 }
