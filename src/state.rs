@@ -6,6 +6,24 @@ pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = [0x53, 0x50, 0x4F, 0x4F, 0x4C, 0x5
 /// 8-byte discriminator for StakeDeposit accounts ("SDEP_V1\0")
 pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 0x56, 0x31, 0x00];
 
+/// N7 (CONSOLIDATED-PLAN §2.2): dead-share floor locked at the pool's true genesis
+/// deposit (`total_lp_supply == 0`, whether reached via `Deposit` or
+/// `DepositJunior` — see `processor.rs::apply_minimum_liquidity_lock`, the single
+/// shared choke point both bootstrap paths route through). `MINIMUM_LIQUIDITY`
+/// worth of LP is counted into `pool.total_lp_supply` but NEVER actually
+/// SPL-minted to any account — it is permanently unredeemable "dead" supply, the
+/// classic Uniswap-V2-style anti-inflation floor. This forces the genesis
+/// depositor (who would otherwise hold 100% of a brand-new pool and could donate
+/// raw collateral + crank `AccrueFees` to inflate the tracked share price at
+/// near-zero cost) to permanently sacrifice a fixed amount of real value with
+/// every pool they bootstrap, in addition to the `VIRTUAL_SHARES`/`VIRTUAL_ASSETS`
+/// offset in `math.rs` (defense-in-depth, not a substitute for it — the offset
+/// bounds the COST of each donate-then-accrue round; the dead-share floor bounds
+/// how cheaply a genesis position can be established in the first place).
+/// Value chosen to match collateral tokens with 6-9 decimals (SPL norm, e.g.
+/// USDC=6, SOL=9) without materially raising the practical minimum pool size.
+pub const MINIMUM_LIQUIDITY: u64 = 1_000;
+
 /// Stake pool state — one per slab (market).
 /// PDA seeds: [b"stake_pool", slab_pubkey]
 ///
@@ -762,8 +780,9 @@ mod tests {
         pool.total_deposited = 2000;
         pool.total_withdrawn = 0;
         pool.total_lp_supply = 1000;
-        // burn 250 LP → 250 * 2000 / 1000 = 500
-        assert_eq!(pool.calc_collateral_for_withdraw(250), Some(500));
+        // N7: burn 250 LP -> 250 * (2000+1) / (1000+1) = 499.75... -> floor 499
+        // (was exact 500 pre-offset; see math::VIRTUAL_SHARES/VIRTUAL_ASSETS).
+        assert_eq!(pool.calc_collateral_for_withdraw(250), Some(499));
     }
 
     #[test]

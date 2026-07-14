@@ -71,6 +71,12 @@ pub enum StakeError {
     /// #242 timelock: CommitCooldownIncrease / CancelCooldownIncrease with no active
     /// proposal (cooldown_proposed_at_slot == 0).
     NoPendingCooldownProposal = 27,
+    /// N7 (CONSOLIDATED-PLAN §2.2): the pool's true genesis deposit (total_lp_supply
+    /// == 0 && total_pool_value == 0) must exceed MINIMUM_LIQUIDITY so the
+    /// permanently-locked dead-share amount can be carved out of it. Deposits at or
+    /// below MINIMUM_LIQUIDITY at genesis are rejected rather than silently minting
+    /// 0 (or underflowing) LP to the first depositor.
+    DepositBelowMinimumLiquidity = 28,
 }
 
 impl From<StakeError> for ProgramError {
@@ -108,6 +114,7 @@ pub fn error_hint(code: u32) -> &'static str {
         22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
         23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
         24 => "Insurance loss outstanding — junior tranche deposits are paused until the flushed insurance is returned (total_flushed > total_returned)",
+        28 => "Deposit below minimum liquidity — the pool's first-ever deposit must exceed MINIMUM_LIQUIDITY so a permanent dead-share floor can be locked (N7 anti-inflation hardening); deposit a larger amount",
         _ => "Unknown error — check the error code and pool state",
     }
 }

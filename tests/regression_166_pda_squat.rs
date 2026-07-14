@@ -366,9 +366,10 @@ fn deposit_pda_squat_adoption() {
     // Vault: empty token account for collateral, authority = vault_auth.
     set_token_account(&mut svm, vault, &collateral_mint, &vault_auth, 0);
 
-    // User's collateral ATA: holds 1_000 tokens (enough to deposit 500).
+    // User's collateral ATA: holds enough to deposit above N7's MINIMUM_LIQUIDITY
+    // dead-share floor (1,000) on this genesis deposit — see state::MINIMUM_LIQUIDITY.
     let user_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, user_ata, &collateral_mint, &user.pubkey(), 1_000);
+    set_token_account(&mut svm, user_ata, &collateral_mint, &user.pubkey(), 2_000);
 
     // User's LP ATA: empty, owned by user, mint = lp_mint.
     let user_lp_ata = Pubkey::new_unique();
@@ -423,7 +424,10 @@ fn deposit_pda_squat_adoption() {
     );
 
     // ---- Run Deposit (exercises the squat-adoption branch) ----
-    let deposit_amount: u64 = 500;
+    // N7: this is the pool's genesis deposit (injected pool has total_lp_supply == 0),
+    // so it must exceed MINIMUM_LIQUIDITY (1,000) for the dead-share carve-out to
+    // leave a nonzero mint to the depositor — see state::MINIMUM_LIQUIDITY.
+    let deposit_amount: u64 = 1_500;
     let ix = deposit_ix(
         stake_id,
         &user.pubkey(),
@@ -472,7 +476,7 @@ fn deposit_pda_squat_adoption() {
     // Collateral transferred: user_ata lost deposit_amount, vault gained it.
     assert_eq!(
         token_amount(&svm, &user_ata),
-        1_000 - deposit_amount,
+        2_000 - deposit_amount,
         "POST-STATE: user_ata must have lost the deposited collateral"
     );
     assert_eq!(
@@ -481,11 +485,12 @@ fn deposit_pda_squat_adoption() {
         "POST-STATE: vault must have received the deposited collateral"
     );
 
-    // LP tokens minted 1:1 (first depositor into an empty pool gets 1 LP per collateral).
+    // LP tokens minted 1:1 minus N7's MINIMUM_LIQUIDITY dead-share carve-out (this is
+    // the pool's genesis deposit — see state::MINIMUM_LIQUIDITY / apply_minimum_liquidity_lock).
     assert_eq!(
         token_amount(&svm, &user_lp_ata),
-        deposit_amount,
-        "POST-STATE: user_lp_ata must have received LP tokens (1:1 for first depositor)"
+        deposit_amount - percolator_stake::state::MINIMUM_LIQUIDITY,
+        "POST-STATE: user_lp_ata must have received LP tokens (1:1 minus the N7 dead-share floor for the genesis deposit)"
     );
 }
 
@@ -543,8 +548,9 @@ fn deposit_pda_clean_path_unaffected() {
 
     set_token_account(&mut svm, vault, &collateral_mint, &vault_auth, 0);
 
+    // N7: enough to clear MINIMUM_LIQUIDITY (1,000) on this genesis deposit.
     let user_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, user_ata, &collateral_mint, &user.pubkey(), 1_000);
+    set_token_account(&mut svm, user_ata, &collateral_mint, &user.pubkey(), 2_000);
 
     let user_lp_ata = Pubkey::new_unique();
     set_token_account(&mut svm, user_lp_ata, &lp_mint, &user.pubkey(), 0);
@@ -571,7 +577,7 @@ fn deposit_pda_clean_path_unaffected() {
             user_lp_ata,
             vault_auth,
             deposit_pda,
-            500,
+            1_500,
         ),
     )
     .unwrap_or_else(|e| {
@@ -597,7 +603,7 @@ fn deposit_pda_clean_path_unaffected() {
     );
     assert_eq!(
         token_amount(&svm, &user_lp_ata),
-        500,
-        "POST-STATE (clean): LP tokens minted 1:1 for first depositor"
+        1_500 - percolator_stake::state::MINIMUM_LIQUIDITY,
+        "POST-STATE (clean): LP tokens minted 1:1 minus the N7 dead-share floor for first depositor"
     );
 }

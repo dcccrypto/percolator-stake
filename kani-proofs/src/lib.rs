@@ -41,18 +41,28 @@
 // Arithmetic is IDENTICAL — just narrower types for CBMC tractability.
 // ═══════════════════════════════════════════════════════════════
 
-/// LP tokens for deposit. First depositor: 1:1. Subsequent: pro-rata (floor).
+/// N7 (CONSOLIDATED-PLAN §2.2): u32 mirror of `math::VIRTUAL_SHARES` /
+/// `math::VIRTUAL_ASSETS` — MUST stay numerically identical (value `1`) to the
+/// production constants in `percolator-stake/src/math.rs`, not just
+/// scale-mirrored, since the offset participates in the scale-invariance
+/// argument (module doc above) the same way for both widths.
+const VIRTUAL_SHARES: u64 = 1;
+const VIRTUAL_ASSETS: u64 = 1;
+
+/// LP tokens for deposit. First depositor: 1:1. Subsequent: pro-rata (floor),
+/// with the N7 virtual-offset applied to both sides of the ratio — mirrors
+/// `math::calc_lp_for_deposit` exactly (percolator-stake/src/math.rs).
 /// C9 fix: returns None when orphaned value exists (supply=0, value>0) or
 /// when pool is valueless but LP exists (supply>0, value=0).
 pub fn calc_lp_for_deposit(supply: u32, pool_value: u32, deposit: u32) -> Option<u32> {
     if supply == 0 && pool_value == 0 {
-        Some(deposit) // True first depositor — 1:1
+        Some(deposit) // True first depositor — 1:1 (offset cancels: VIRTUAL_SHARES == VIRTUAL_ASSETS)
     } else if supply == 0 || pool_value == 0 {
         None // Orphaned value or valueless LP — block deposits
     } else {
         let lp = (deposit as u64)
-            .checked_mul(supply as u64)?
-            .checked_div(pool_value as u64)?;
+            .checked_mul((supply as u64).checked_add(VIRTUAL_SHARES)?)?
+            .checked_div((pool_value as u64).checked_add(VIRTUAL_ASSETS)?)?;
         // Mirror production overflow guard (production checks > u64::MAX)
         if lp > u32::MAX as u64 {
             None
@@ -62,14 +72,15 @@ pub fn calc_lp_for_deposit(supply: u32, pool_value: u32, deposit: u32) -> Option
     }
 }
 
-/// Collateral for LP burn. floor(lp * pool_value / supply).
+/// Collateral for LP burn. floor(lp * (pool_value + VIRTUAL_ASSETS) / (supply +
+/// VIRTUAL_SHARES)) — N7 offset, mirrors `math::calc_collateral_for_withdraw`.
 pub fn calc_collateral_for_withdraw(supply: u32, pool_value: u32, lp: u32) -> Option<u32> {
     if supply == 0 {
         return None;
     }
     let col = (lp as u64)
-        .checked_mul(pool_value as u64)?
-        .checked_div(supply as u64)?;
+        .checked_mul((pool_value as u64).checked_add(VIRTUAL_ASSETS)?)?
+        .checked_div((supply as u64).checked_add(VIRTUAL_SHARES)?)?;
     // Mirror production overflow guard (production checks > u64::MAX)
     if col > u32::MAX as u64 {
         None
@@ -529,13 +540,22 @@ mod proofs {
         if let Some(lp) = calc_lp_for_deposit(supply, pv, deposit) {
             // Guard fired correctly: result is representable as u32 (no truncation occurred)
             assert!(lp <= u32::MAX);
-            // Reverse: the u64 product was within bounds (lp * pv <= deposit * supply)
+            // Reverse: the u64 product was within bounds. N7: the floor-division
+            // fairness invariant is now over the OFFSET quantities —
+            // lp * (pv + VIRTUAL_ASSETS) <= deposit * (supply + VIRTUAL_SHARES) —
+            // not the pre-N7 `lp*pv <= deposit*supply` (which the offset formula
+            // does not generally satisfy: shifting the effective denominator by
+            // +1 changes which side of the inequality dominates for small pv).
             if pv > 0 {
                 kani::cover!(
-                    (lp as u64) * (pv as u64) <= (deposit as u64) * (supply as u64),
+                    (lp as u64) * ((pv as u64) + VIRTUAL_ASSETS)
+                        <= (deposit as u64) * ((supply as u64) + VIRTUAL_SHARES),
                     "COVER: overflow-guard rounding invariant path is reachable"
                 );
-                assert!((lp as u64) * (pv as u64) <= (deposit as u64) * (supply as u64));
+                assert!(
+                    (lp as u64) * ((pv as u64) + VIRTUAL_ASSETS)
+                        <= (deposit as u64) * ((supply as u64) + VIRTUAL_SHARES)
+                );
             }
         }
     }
@@ -543,16 +563,31 @@ mod proofs {
     /// Targeted test: overflow guard fires for inputs that cause u64→u32 overflow.
     /// Uses values large enough to trigger the guard but small enough for CBMC
     /// to handle without SAT explosion (u32::MAX causes 32×32→64 bit-blast).
+    ///
+    /// N7: thresholds recomputed for the VIRTUAL_SHARES/VIRTUAL_ASSETS=1 offset —
+    /// the offset changes the effective denominator (supply+1 / pool_value+1), so
+    /// inputs that overflowed the PRE-N7 exact formula do not necessarily overflow
+    /// the offset formula (e.g. a pool_value of 1 becomes an effective denominator
+    /// of 2, HALVING the quotient). Every threshold below is picked to still
+    /// overflow under the offset formula specifically.
     #[kani::proof]
     fn proof_overflow_guard_fires_concrete() {
-        // deposit(70000) * supply(70000) / pool_value(1) = 4.9B > u32::MAX → None
-        assert!(calc_lp_for_deposit(70_000, 1, 70_000).is_none());
-        // deposit(100000) * supply(2) / pool_value(1) = 200000 → Some (fits in u32)
-        assert_eq!(calc_lp_for_deposit(2, 1, 100_000), Some(200_000));
-        // deposit(1) * supply(1) / pool_value(1) = 1 → Some(1)
+        // deposit(100000) * (supply(100000)+1) / (pool_value(1)+1)
+        //   = 100000*100001/2 = 5,000,050,000 > u32::MAX → None
+        // (Pre-N7 this input was already-overflowing at 70_000/70_000/1; the N7
+        // offset roughly HALVES the effective ratio here since pool_value=1 is
+        // dominated by the +1 offset, so the threshold had to move up.)
+        assert!(calc_lp_for_deposit(100_000, 1, 100_000).is_none());
+        // deposit(100000) * (supply(2)+1) / (pool_value(1)+1) = 100000*3/2 = 150000
+        // -> Some (fits in u32; N7 offset changes this from the pre-N7 value of
+        // 200,000 -- (2/1 ratio) to 150,000 -- (3/2 ratio)).
+        assert_eq!(calc_lp_for_deposit(2, 1, 100_000), Some(150_000));
+        // deposit(1) * (supply(1)+1) / (pool_value(1)+1) = 1*2/2 = 1 -> Some(1)
+        // (supply == pool_value -> offset cancels exactly, unaffected by N7).
         assert_eq!(calc_lp_for_deposit(1, 1, 1), Some(1));
-        // Withdraw: lp(70000) * pool_value(70000) / supply(1) = 4.9B > u32::MAX → None
-        assert!(calc_collateral_for_withdraw(1, 70_000, 70_000).is_none());
+        // Withdraw: lp(100000) * (pool_value(100000)+1) / (supply(1)+1)
+        //   = 100000*100001/2 = 5,000,050,000 > u32::MAX -> None
+        assert!(calc_collateral_for_withdraw(1, 100_000, 100_000).is_none());
     }
 
     /// No-panic proof for calc_collateral_for_withdraw.
@@ -594,8 +629,16 @@ mod proofs {
     // SECTION 3: Fairness / Monotonicity (4 proofs)
     // ════════════════════════════════════════════════════════════
 
-    /// LP rounding always favors pool: lp * pool_value <= deposit * supply.
-    /// This is the core pool-safety invariant that prevents value extraction.
+    /// LP rounding always favors pool: lp * (pool_value + VIRTUAL_ASSETS) <=
+    /// deposit * (supply + VIRTUAL_SHARES). This is the core pool-safety
+    /// invariant that prevents value extraction.
+    ///
+    /// N7: the invariant is stated over the OFFSET quantities, not the raw
+    /// (supply, pool_value) — mirrors the fix in proof_lp_deposit_overflow_guard
+    /// above (MUTATION CHECK: this harness FAILED with the pre-N7 invariant
+    /// `lp*pv <= dep*s` once the virtual offset was added to calc_lp_for_deposit;
+    /// re-deriving it over the offset quantities restores a SOUND, non-vacuous
+    /// proof of the underlying pool-favoring property under the new formula).
     #[kani::proof]
     fn proof_lp_rounding_favors_pool() {
         let s: u32 = kani::any();
@@ -606,13 +649,18 @@ mod proofs {
         kani::assume(dep > 0 && dep < 100);
 
         if let Some(lp) = calc_lp_for_deposit(s, pv, dep) {
-            // floor rounding: lp = floor(dep * s / pv)
-            // Invariant: lp * pv <= dep * s (pool never overissues)
+            // floor rounding: lp = floor(dep * (s+VIRTUAL_SHARES) / (pv+VIRTUAL_ASSETS))
+            // Invariant: lp * (pv+VIRTUAL_ASSETS) <= dep * (s+VIRTUAL_SHARES)
+            // (pool never overissues, even under the N7 offset).
             kani::cover!(
-                (lp as u64) * (pv as u64) <= (dep as u64) * (s as u64),
+                (lp as u64) * ((pv as u64) + VIRTUAL_ASSETS)
+                    <= (dep as u64) * ((s as u64) + VIRTUAL_SHARES),
                 "COVER: LP rounding pool-favoring assertion path is reachable"
             );
-            assert!((lp as u64) * (pv as u64) <= (dep as u64) * (s as u64));
+            assert!(
+                (lp as u64) * ((pv as u64) + VIRTUAL_ASSETS)
+                    <= (dep as u64) * ((s as u64) + VIRTUAL_SHARES)
+            );
         }
     }
 
@@ -1293,11 +1341,39 @@ mod proofs {
 
         match (total_claim_before, total_claim_after) {
             (Some(before), Some(after)) => {
+                // N7 MUTATION CHECK: this harness FAILED an exact `before - after ==
+                // flush` assertion once the virtual offset was added to
+                // calc_collateral_for_withdraw. Root cause: full-withdraw-of-supply
+                // is no longer an identity function of pool_value — it's
+                // floor(supply*(pv+VIRTUAL_ASSETS)/(supply+VIRTUAL_SHARES)), whose
+                // slope w.r.t. pv is supply/(supply+VIRTUAL_SHARES) < 1 (the offset
+                // deliberately "skims" a fraction attributable to the unowned
+                // virtual share). A concrete counterexample CBMC found:
+                // supply=4, pv_before=10, flush=3, pv_after=7 -> before=8, after=6,
+                // before-after=2 != flush=3 (slope-of-8/(4+1)=0.8 rounds the
+                // observed delta below the raw flush amount). The CORRECT
+                // post-N7 invariant is an INEQUALITY, not equality: flushing can
+                // never let a withdrawer claim MORE outstanding value than was
+                // actually flushed (before - after <= flush) — the offset only
+                // ever *reduces* what full-supply-withdraw reports, so the pool
+                // is never worse off than pre-N7, only potentially better
+                // (some value is conservatively retained rather than exactly
+                // conserved). before >= after always holds structurally (pv_before
+                // > pv_after and calc_collateral_for_withdraw is monotone in pv —
+                // proof_larger_burn_more_collateral / proof_determinism_across_states
+                // cover monotonicity), so `before - after` cannot underflow.
                 kani::cover!(
-                    before - after == flush,
-                    "COVER: flush-conservation-lp-value exact-accounting path is reachable"
+                    before - after <= flush,
+                    "COVER: flush-conservation-lp-value pool-favoring path is reachable"
                 );
-                assert_eq!(before - after, flush);
+                assert!(
+                    before >= after,
+                    "full-withdraw claim must be monotone non-increasing as pool_value drops"
+                );
+                assert!(
+                    before - after <= flush,
+                    "N7: flushing must never let a full withdrawal claim MORE than the flushed amount"
+                );
             }
             _ => {}
         }

@@ -49,6 +49,16 @@ use solana_program::{
 
 // Wrapper instruction tags (from percolator-prog/src/v16_program.rs ix::Instruction).
 const TAG_TOP_UP_INSURANCE: u8 = 9;
+/// UpdateAuthority (tag 32) — rotates the single market-level `cfg.marketauth`
+/// key ONLY. Confirmed against the live deployed wrapper
+/// (percolator-prog@14440e0c, src/v16_program.rs:3783 decode / :4123 encode /
+/// handle_update_authority:9658) — wire is `tag(1) + new_pubkey(32)` = 33
+/// bytes, NO kind byte, 3-account shape `[current(signer), new(signer),
+/// market(w)]`. This is orthogonal to `TAG_UPDATE_ASSET_AUTHORITY` below (tag
+/// 65, per-asset authorities e.g. insurance_authority/operator/admin) — both
+/// tags are live and unrelated fields on the currently-deployed wrapper; tag
+/// 65 did NOT supersede tag 32 for marketauth (see issue #6 lineage research).
+const TAG_UPDATE_AUTHORITY: u8 = 32;
 /// V17 auth overhaul (collision row 43): tag 32 `UpdateAuthority` rotated only
 /// `cfg.marketauth`. Per-asset authorities (including insurance_authority for
 /// asset 0) now go through tag 65 `UpdateAssetAuthority`.
@@ -143,6 +153,56 @@ pub fn cpi_top_up_insurance<'a>(
             token_program.clone(),
         ],
         &[signer_seeds],
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UpdateAuthority (Tag 32) — rotate market-level marketauth to the pool PDA
+// ═══════════════════════════════════════════════════════════════
+// Accounts (v16_program.rs handle_update_authority, account(_,0)/(_,1)/(_,2)):
+//   [current_authority(signer), new_authority(signer), market(w)]
+// Data: tag(1) + new_authority(32) = 33 bytes
+//
+// Ported byte-for-byte from the deployed percolator-vault@eb3ebe8 InitPool CPI
+// (src/cpi.rs `cpi_update_authority`, src/processor.rs:340) — issue #6
+// lineage reconciliation. Called from InitPool to prove the initializer is
+// the CURRENT wrapper marketauth by transferring it to this pool PDA
+// atomically with pool creation: if `admin` is not the current marketauth,
+// the wrapper CPI fails closed and the whole InitPool tx reverts. This
+// irreversibly moves wrapper-level admin from the human creator to the pool
+// PDA, matching the deployed vault's behavior that the launch wizard's
+// account-authority sequencing depends on (marketauth == creator wallet
+// until this call, pool PDA thereafter).
+//
+// NOTE: distinct from `cpi_bind_insurance_authority` / `TAG_UPDATE_ASSET_AUTHORITY`
+// (tag 65) above, which rotates only the per-asset insurance_authority/operator/
+// admin fields, not the market-wide marketauth this function rotates.
+
+pub fn cpi_update_authority<'a>(
+    percolator_program: &AccountInfo<'a>,
+    current_admin: &AccountInfo<'a>, // current marketauth; signs the outer tx
+    new_authority: &AccountInfo<'a>, // pool PDA; co-signs via invoke_signed
+    slab: &AccountInfo<'a>,          // market, writable
+    new_authority_seeds: &[&[u8]],   // pool PDA seeds
+) -> ProgramResult {
+    let mut data = Vec::with_capacity(33);
+    data.push(TAG_UPDATE_AUTHORITY);
+    data.extend_from_slice(new_authority.key.as_ref());
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*current_admin.key, true),
+            AccountMeta::new_readonly(*new_authority.key, true),
+            AccountMeta::new(*slab.key, false),
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[current_admin.clone(), new_authority.clone(), slab.clone()],
+        &[new_authority_seeds],
     )
 }
 

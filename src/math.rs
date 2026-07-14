@@ -3,6 +3,31 @@
 //! No Solana/Pubkey dependencies. Just arithmetic.
 //! Kani can verify these functions exhaustively.
 
+/// N7 hardening (CONSOLIDATED-PLAN §2.2): virtual shares/assets added to both
+/// sides of the pro-rata LP pricing ratio, ERC4626-"decimals offset"-style.
+/// Without this, a pool with a small real supply/value is priced using ONLY
+/// the tracked counters — an attacker who becomes sole/first LP holder, then
+/// donates raw collateral directly to the vault token account (bypassing
+/// `Deposit`) and cranks the permissionless `AccrueFees` (mode-1 pools only,
+/// since only mode-1 folds `total_fees_earned` into `total_pool_value()`),
+/// can book that donation as "fees" and inflate the tracked share price
+/// arbitrarily cheaply (the donation stays 100% attacker-owned the whole
+/// time — a later victim `Deposit` then rounds `calc_lp_for_deposit` down to
+/// 0 and reverts with `ZeroSharesMinted`, DoSing every deposit below the
+/// inflated price). Adding a fixed virtual offset to BOTH the numerator and
+/// denominator of the pro-rata ratio makes every donation-then-accrue round
+/// cost the attacker a small, permanent, unrecoverable dilution against the
+/// virtual (unowned) share — the classic single-asset-vault countermeasure.
+/// Kept at the minimal canonical value of 1 (not scaled to token decimals):
+/// larger offsets would materially reprice small-magnitude test/production
+/// pools (see math.rs unit tests), and the primary defense against the
+/// donation attack described above is the MINIMUM_LIQUIDITY dead-share lock
+/// applied by the caller (`processor.rs::process_deposit`) at genesis
+/// deposit — this offset is deliberate defense-in-depth on top of that, not
+/// the sole mitigation.
+const VIRTUAL_SHARES: u128 = 1;
+const VIRTUAL_ASSETS: u128 = 1;
+
 /// Calculate LP tokens for a deposit.
 ///
 /// # Arguments
@@ -16,14 +41,18 @@
 ///
 /// # Invariant
 /// First depositor (supply == 0): gets 1:1 LP tokens.
-/// Subsequent: `lp = amount * supply / pool_value` (pro-rata, rounded down).
+/// Subsequent: `lp = amount * (supply + VIRTUAL_SHARES) / (pool_value + VIRTUAL_ASSETS)`
+/// (pro-rata with N7 virtual-offset, rounded down).
 pub fn calc_lp_for_deposit(
     total_lp_supply: u64,
     total_pool_value: u64,
     deposit_amount: u64,
 ) -> Option<u64> {
     if total_lp_supply == 0 && total_pool_value == 0 {
-        // True first depositor — 1:1
+        // True first depositor — 1:1. (With the virtual offset applied uniformly,
+        // this equals (deposit * VIRTUAL_SHARES) / VIRTUAL_ASSETS = deposit exactly,
+        // since VIRTUAL_SHARES == VIRTUAL_ASSETS; kept as an explicit branch for
+        // clarity and to avoid a redundant division on the hot bootstrap path.)
         Some(deposit_amount)
     } else if total_lp_supply == 0 {
         // CRITICAL: LP supply is 0 but pool has orphaned value (e.g., returned insurance
@@ -36,10 +65,11 @@ pub fn calc_lp_for_deposit(
         // Allowing deposits would dilute that claim. Block deposits.
         None
     } else {
-        // Pro-rata via u128 to prevent overflow
+        // Pro-rata via u128 to prevent overflow. N7: +VIRTUAL_SHARES / +VIRTUAL_ASSETS
+        // on both sides of the ratio (see const doc above).
         let lp = (deposit_amount as u128)
-            .checked_mul(total_lp_supply as u128)?
-            .checked_div(total_pool_value as u128)?;
+            .checked_mul((total_lp_supply as u128).checked_add(VIRTUAL_SHARES)?)?
+            .checked_div((total_pool_value as u128).checked_add(VIRTUAL_ASSETS)?)?;
         if lp > u64::MAX as u128 {
             None
         } else {
@@ -60,8 +90,10 @@ pub fn calc_lp_for_deposit(
 /// * `None` - Division by zero or overflow
 ///
 /// # Invariant
-/// `collateral = lp_amount * pool_value / lp_supply` (rounded down).
-/// Full burn returns ≤ pool_value (never more).
+/// `collateral = lp_amount * (pool_value + VIRTUAL_ASSETS) / (lp_supply + VIRTUAL_SHARES)`
+/// (N7 virtual-offset, rounded down). Full burn returns ≤ pool_value (never more) —
+/// strictly less with the offset applied, since a fraction of the ratio is
+/// permanently attributed to the unowned virtual share.
 pub fn calc_collateral_for_withdraw(
     total_lp_supply: u64,
     total_pool_value: u64,
@@ -70,9 +102,12 @@ pub fn calc_collateral_for_withdraw(
     if total_lp_supply == 0 {
         return None;
     }
+    // N7: +VIRTUAL_ASSETS / +VIRTUAL_SHARES on both sides, symmetric with
+    // calc_lp_for_deposit above so minting and redeeming use the same offset ratio
+    // (asymmetric offsets would leak value in one direction).
     let collateral = (lp_amount as u128)
-        .checked_mul(total_pool_value as u128)?
-        .checked_div(total_lp_supply as u128)?;
+        .checked_mul((total_pool_value as u128).checked_add(VIRTUAL_ASSETS)?)?
+        .checked_div((total_lp_supply as u128).checked_add(VIRTUAL_SHARES)?)?;
     if collateral > u64::MAX as u128 {
         None
     } else {
@@ -450,11 +485,18 @@ mod tests {
     fn test_roundtrip_no_profit() {
         // Deposit 1000 into pool with 5000 supply / 10000 value
         let lp = calc_lp_for_deposit(5_000, 10_000, 1_000).unwrap();
-        assert_eq!(lp, 500); // 1000 * 5000 / 10000
+        assert_eq!(lp, 500); // 1000 * (5000+1) / (10000+1) = 500.05 -> 500 (offset negligible here)
 
-        // Withdraw those LP tokens from updated pool
+        // Withdraw those LP tokens from updated pool. N7: the VIRTUAL_SHARES/
+        // VIRTUAL_ASSETS=1 offset makes this round pool-favoring by exactly 1 unit
+        // versus the pre-N7 exact 2:1 roundtrip (500 * (11000+1)/(5500+1) = 999.99..
+        // -> floor 999, not 1000) — the offset's entire purpose is to make every
+        // withdrawal retain an epsilon in the pool rather than return it exactly,
+        // which is what defeats the donation/inflation attack. Not a profit either
+        // way (999 <= 1000 deposited), just slightly more conservative than before.
         let back = calc_collateral_for_withdraw(5_500, 11_000, 500).unwrap();
-        assert_eq!(back, 1_000); // exact roundtrip at 2:1 ratio
+        assert_eq!(back, 999);
+        assert!(back <= 1_000, "N7 offset must never let a withdrawal profit");
     }
 
     #[test]
@@ -698,9 +740,10 @@ mod tests {
 
     #[test]
     fn test_junior_withdraw_proportional() {
+        // N7: 500*(2000+1)/(1000+1) = 999.500... -> floor 999 (was exact 1000 pre-offset).
         assert_eq!(
             calc_junior_collateral_for_withdraw(1000, 2000, 500),
-            Some(1000)
+            Some(999)
         );
     }
 
@@ -714,9 +757,10 @@ mod tests {
 
     #[test]
     fn test_senior_withdraw_full_protection() {
+        // N7: 500*(1000+1)/(500+1) = 999.001... -> floor 999 (was exact 1000 pre-offset).
         assert_eq!(
             calc_senior_collateral_for_withdraw(500, 1000, 500),
-            Some(1000)
+            Some(999)
         );
     }
 
@@ -896,9 +940,95 @@ mod tests {
     #[test]
     fn test_fee_appreciation_increases_share_price() {
         let lp_before = calc_collateral_for_withdraw(1000, 1000, 100).unwrap();
-        assert_eq!(lp_before, 100);
+        assert_eq!(lp_before, 100); // supply == value -> offset cancels exactly
+        // N7: 100*(1200+1)/(1000+1) = 119.98... -> floor 119 (was exact 120 pre-offset).
         let lp_after = calc_collateral_for_withdraw(1000, 1200, 100).unwrap();
-        assert_eq!(lp_after, 120);
+        assert_eq!(lp_after, 119);
+        assert!(lp_after > lp_before, "fee appreciation must still raise share price");
+    }
+
+    // ── N7 (CONSOLIDATED-PLAN §2.2): virtual-offset mutation checks ─────────
+    //
+    // These assert the offset formula produces a DIFFERENT (strictly more
+    // conservative) result than the pre-N7 exact formula whenever supply != value
+    // — i.e. that VIRTUAL_SHARES/VIRTUAL_ASSETS are actually wired into the
+    // arithmetic, not silently zeroed out or dead code. If a future edit
+    // regresses the offset back to 0 (equivalent to removing it), these fail.
+
+    /// Reimplementation of the PRE-N7 exact (no-offset) formula, used only as a
+    /// mutation-check baseline in this test module — never call this in production.
+    fn pre_n7_calc_lp_for_deposit_baseline(
+        total_lp_supply: u64,
+        total_pool_value: u64,
+        deposit_amount: u64,
+    ) -> Option<u64> {
+        if total_lp_supply == 0 && total_pool_value == 0 {
+            Some(deposit_amount)
+        } else if total_lp_supply == 0 || total_pool_value == 0 {
+            None
+        } else {
+            let lp = (deposit_amount as u128)
+                .checked_mul(total_lp_supply as u128)?
+                .checked_div(total_pool_value as u128)?;
+            (lp <= u64::MAX as u128).then_some(lp as u64)
+        }
+    }
+
+    fn pre_n7_calc_collateral_for_withdraw_baseline(
+        total_lp_supply: u64,
+        total_pool_value: u64,
+        lp_amount: u64,
+    ) -> Option<u64> {
+        if total_lp_supply == 0 {
+            return None;
+        }
+        let col = (lp_amount as u128)
+            .checked_mul(total_pool_value as u128)?
+            .checked_div(total_lp_supply as u128)?;
+        (col <= u64::MAX as u128).then_some(col as u64)
+    }
+
+    #[test]
+    fn n7_mutation_check_deposit_offset_diverges_from_pre_n7_baseline() {
+        // supply != value -> the offset must change the result (pool-favoring,
+        // i.e. <= the pre-N7 baseline). If this ever becomes an EQUALITY, the
+        // offset has been silently removed/zeroed — that's the regression this
+        // test exists to catch.
+        let (supply, value, deposit) = (900_000u64, 400_000u64, 400_000u64);
+        let pre_n7 = pre_n7_calc_lp_for_deposit_baseline(supply, value, deposit).unwrap();
+        let current = calc_lp_for_deposit(supply, value, deposit).unwrap();
+        assert!(
+            current < pre_n7,
+            "N7 REGRESSION: calc_lp_for_deposit({supply},{value},{deposit}) = {current} must be \
+             STRICTLY LESS than the pre-N7 baseline {pre_n7} — equality means the virtual \
+             offset was removed"
+        );
+        assert!(current > 0, "sanity: this deposit must still mint something");
+    }
+
+    #[test]
+    fn n7_mutation_check_withdraw_offset_diverges_from_pre_n7_baseline() {
+        let (supply, value, lp) = (1_000u64, 2_000u64, 500u64);
+        let pre_n7 = pre_n7_calc_collateral_for_withdraw_baseline(supply, value, lp).unwrap();
+        let current = calc_collateral_for_withdraw(supply, value, lp).unwrap();
+        assert!(
+            current < pre_n7,
+            "N7 REGRESSION: calc_collateral_for_withdraw({supply},{value},{lp}) = {current} must \
+             be STRICTLY LESS than the pre-N7 baseline {pre_n7} — equality means the virtual \
+             offset was removed"
+        );
+    }
+
+    #[test]
+    fn n7_mutation_check_zero_offset_would_reproduce_exact_pre_n7_values_on_full_test_suite() {
+        // Direct proof that VIRTUAL_SHARES/VIRTUAL_ASSETS are the ONLY delta between
+        // the two formulas: with supply == value (offset cancels identically for any
+        // nonzero offset magnitude), current and pre-N7 baseline must match exactly —
+        // proving the divergence seen in the tests above comes from the offset, not
+        // from an unrelated formula change.
+        let current = calc_lp_for_deposit(500_000, 500_000, 250_000).unwrap();
+        let pre_n7 = pre_n7_calc_lp_for_deposit_baseline(500_000, 500_000, 250_000).unwrap();
+        assert_eq!(current, pre_n7, "supply==value must cancel the offset exactly");
     }
 }
 

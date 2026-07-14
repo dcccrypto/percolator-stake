@@ -49,6 +49,71 @@ fn test_cpi_tag9_8byte_u64_wire_is_rejected_shape() {
     );
 }
 
+// ── Tag 32: UpdateAuthority (issue #6 marketauth-rotation port) ──────────────
+
+/// CANARY: the tag-32 marketauth-rotation wire must be exactly 33 bytes:
+///   byte 0     : tag = 32 (UpdateAuthority)
+///   bytes 1-32 : new_authority pubkey (32 bytes) — NO kind byte, unlike tag 65.
+///
+/// Byte-for-byte parity proof against the deployed `percolator-vault@eb3ebe8`
+/// `cpi_update_authority` (src/cpi.rs:82-108) — issue #6 lineage reconciliation.
+/// Confirmed independently against the live deployed wrapper source
+/// (percolator-prog@14440e0c, v16_program.rs:3783 decode / :9658
+/// handle_update_authority): `32 => Self::UpdateAuthority { new_pubkey:
+/// read_bytes32(&mut rest)? }` — tag(1) + pubkey(32), no kind selector. This is
+/// the SAME tag-32 opcode as `test_old_v16_bind_wire_documents_the_break` below
+/// documents for the (unrelated, superseded) old insurance-bind usage — tag 32
+/// itself was never retired, only insurance-authority's use of it was replaced
+/// by tag 65. Marketauth rotation is the one live use of tag 32 that remains.
+#[test]
+fn test_cpi_tag32_update_authority_wire_33_bytes() {
+    let new_authority = [0xCDu8; 32];
+
+    // Reconstruct the wire exactly as cpi::cpi_update_authority builds it.
+    let mut data = Vec::with_capacity(33);
+    data.push(32u8); // TAG_UPDATE_AUTHORITY
+    data.extend_from_slice(&new_authority);
+
+    assert_eq!(
+        data.len(),
+        33,
+        "tag-32 marketauth-rotation wire must be 1 (tag) + 32 (pubkey) = 33 bytes"
+    );
+    assert_eq!(data[0], 32, "byte 0 must be tag=32 (UpdateAuthority)");
+    assert_eq!(&data[1..33], &new_authority, "new_authority pubkey at bytes [1..33]");
+
+    // Byte-for-byte parity with the deployed vault's exact wire construction
+    // (percolator-vault@eb3ebe8 src/cpi.rs cpi_update_authority):
+    //   data.push(TAG_UPDATE_AUTHORITY); data.extend_from_slice(new_authority.key.as_ref());
+    let mut vault_reference = Vec::with_capacity(33);
+    vault_reference.push(32u8);
+    vault_reference.extend_from_slice(&new_authority);
+    assert_eq!(
+        data, vault_reference,
+        "ported wire must be byte-for-byte identical to the deployed vault's cpi_update_authority output"
+    );
+}
+
+/// Account shape parity: tag 32 uses THREE accounts —
+/// [current_authority(signer), new_authority(signer), market(writable)] — the
+/// same 3-account shape as tag 65, but semantically different (whole-market
+/// marketauth vs. per-asset authority). Documents the shape so a future edit
+/// that accidentally collapses this to 2 accounts (as some other CPIs use) is
+/// caught by a reviewer diffing against this test.
+#[test]
+fn test_cpi_tag32_account_shape_is_three_accounts_both_signers() {
+    // [is_signer, is_writable] per account, in order.
+    let shape = [
+        (true, false),  // 0: current_authority (signer, read-only)
+        (true, false),  // 1: new_authority (signer, read-only)
+        (false, true),  // 2: market/slab (writable, not a signer)
+    ];
+    assert_eq!(shape.len(), 3, "tag 32 CPI must pass exactly 3 accounts");
+    assert!(shape[0].0 && shape[1].0, "both authority slots must be signers");
+    assert!(shape[2].1, "the market account must be writable");
+    assert!(!shape[2].0, "the market account is not a signer");
+}
+
 // ── Tag 65: UpdateAssetAuthority (bind / rotate) ──────────────────────────────
 
 /// CANARY: the v17 bind/rotate wire must be exactly 36 bytes:

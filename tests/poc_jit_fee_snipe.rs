@@ -94,10 +94,17 @@ fn jit_fee_snipe_is_profitable_with_current_pricing() {
         alice_back < 2_000_000,
         "Alice was diluted out of fees she earned (got {alice_back}, fair 2,000,000)"
     );
+    // N7 (CONSOLIDATED-PLAN §2.2): calc_collateral_for_withdraw now applies a
+    // VIRTUAL_SHARES/VIRTUAL_ASSETS=1 offset (see math.rs) that rounds every
+    // withdrawal pool-favoring by a small amount — 1 unit is permanently retained
+    // by the pool (attributed to nobody) per withdrawal that hits non-cancelling
+    // supply/value ratios, rather than being captured by Eve or Alice. Two
+    // withdrawals happen above; this scenario loses exactly 1 unit of the
+    // 1,000,000 total fees to that dust, not 2, because the ratios differ per call.
     assert_eq!(
         (eve_back - eve_dep) + (alice_back - 1_000_000),
-        1_000_000,
-        "Eve's gain + Alice's gain == total fees (Eve captured part of Alice's earnings)"
+        999_999,
+        "Eve's gain + Alice's gain == total fees minus N7 offset dust (Eve still captured part of Alice's earnings)"
     );
 }
 

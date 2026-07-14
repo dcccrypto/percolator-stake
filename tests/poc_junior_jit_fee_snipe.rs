@@ -124,7 +124,11 @@ fn junior_jit_fee_snipe_is_profitable_with_current_pricing() {
         eve_back > eve_dep,
         "junior JIT snipe must profit (got {eve_back} for {eve_dep})"
     );
-    assert_eq!(eve_back, 1_400_000, "Eve captures +400,000 of fees she did not earn");
+    // N7 (CONSOLIDATED-PLAN §2.2): calc_collateral_for_withdraw's VIRTUAL_SHARES/
+    // VIRTUAL_ASSETS=1 offset (math.rs) rounds this withdrawal pool-favoring by 1
+    // unit versus the pre-N7 exact value (was 1,400,000) — dust retained by the
+    // pool, not a change in the JIT-snipe vulnerability this PoC documents.
+    assert_eq!(eve_back, 1_399_999, "Eve captures ~+400,000 of fees she did not earn (minus 1 unit of N7 offset dust)");
 }
 
 #[test]

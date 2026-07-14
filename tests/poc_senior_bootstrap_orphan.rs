@@ -90,11 +90,22 @@ fn unconditional_bootstrap_was_a_c9_bypass() {
     )
     .expect("senior withdraw");
 
-    assert_eq!(coll, 500_001, "redeems the orphan plus the 1-token deposit");
+    // N7 (CONSOLIDATED-PLAN §2.2): calc_senior_collateral_for_withdraw now applies a
+    // VIRTUAL_SHARES/VIRTUAL_ASSETS=1 offset (math.rs). At this degenerate
+    // senior_total_lp==1 supply, that offset is NOT mere dust — it roughly halves
+    // the attacker's claim (1*(500001+1)/(1+1) = 250001, floor) versus the pre-N7
+    // exact value (500001), because the offset's +1 virtual share is a much larger
+    // fraction of a supply of 1 than of a realistic supply. The underlying
+    // regression this test documents (an unguarded bootstrap branch would let a
+    // 1-token deposit claim value it never contributed) is unchanged in KIND — N7
+    // is defense-in-depth on top of the C9 guard (which is what actually prevents
+    // this in production), not a substitute for it, and does not fully close this
+    // gap on its own at such a tiny supply.
+    assert_eq!(coll, 250_001, "redeems roughly half the orphan plus the 1-token deposit (N7 offset dilutes a supply-of-1 claim)");
     assert_eq!(
         coll - attacker_dep,
-        500_000,
-        "REGRESSION: a 1-token deposit drains the entire orphaned balance"
+        250_000,
+        "REGRESSION: a 1-token deposit still drains a large share of the orphaned balance despite the N7 offset"
     );
 }
 

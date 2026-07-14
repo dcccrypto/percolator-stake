@@ -58,13 +58,19 @@ fn senior_deposit_during_loss_snipes_recovery() {
     assert!(senior_marked_down(&pool));
 
     // Eve deposits 400k senior at the depressed price (UNGATED today).
+    // N7 (CONSOLIDATED-PLAN §2.2): calc_lp_for_deposit's VIRTUAL_SHARES/
+    // VIRTUAL_ASSETS=1 offset (math.rs) shaves this to 899,998 (was exact 900,000
+    // pre-N7: 400k*900k/400k) — dust, not a change in the recovery-snipe
+    // vulnerability this PoC documents (N7 is orthogonal defense-in-depth; the
+    // actual fix for THIS bug is the senior recovery-snipe gate, exercised by the
+    // other tests in this file).
     let eve_lp =
         calc_senior_lp_for_deposit(pool.senior_total_lp(), pool.senior_balance().unwrap(), 400_000)
             .unwrap();
-    assert_eq!(eve_lp, 900_000, "400k * 900k / 400k");
+    assert_eq!(eve_lp, 899_998, "400k * (900k+1) / (400k+1), N7 offset");
     pool.total_deposited += 400_000;
     pool.total_lp_supply += eve_lp;
-    assert_eq!(pool.senior_total_lp(), 1_800_000);
+    assert_eq!(pool.senior_total_lp(), 1_799_998);
 
     // Admin returns 600k. net_loss -> 0; senior_balance restored over the inflated supply.
     pool.total_returned = 600_000;
@@ -72,12 +78,13 @@ fn senior_deposit_during_loss_snipes_recovery() {
     assert_eq!(pool.total_pool_value().unwrap(), 1_400_000);
     assert_eq!(pool.senior_balance().unwrap(), 1_300_000);
 
-    // Eve withdraws her 900k senior LP.
+    // Eve withdraws her senior LP. N7 offset again shaves 1 unit off the exact
+    // pre-N7 value (900k*1.3M/1.8M = 650,000); still a clean transfer from Greg.
     let eve_out =
         calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), eve_lp)
             .unwrap();
-    assert_eq!(eve_out, 650_000, "900k * 1.3M / 1.8M");
-    assert_eq!(eve_out - 400_000, 250_000, "Eve nets +250k on a 400k deposit she never put at risk");
+    assert_eq!(eve_out, 649_999, "N7-offset value; pre-N7 was 900k * 1.3M / 1.8M = 650,000");
+    assert_eq!(eve_out - 400_000, 249_999, "Eve nets ~+250k on a 400k deposit she never put at risk");
     pool.total_withdrawn += eve_out;
     pool.total_lp_supply -= eve_lp;
 
@@ -85,8 +92,8 @@ fn senior_deposit_during_loss_snipes_recovery() {
     let greg_out =
         calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), 900_000)
             .unwrap();
-    assert_eq!(greg_out, 650_000, "deposited 900k, recovers only 650k");
-    assert_eq!(900_000 - greg_out, eve_out - 400_000, "Greg's -250k == Eve's +250k (clean transfer)");
+    assert_eq!(greg_out, 650_001, "deposited 900k, recovers only ~650k (N7-offset value)");
+    assert_eq!(900_000 - greg_out, eve_out - 400_000, "Greg's -~250k == Eve's +~250k (clean transfer)");
     // Without Eve, after the return senior_balance would be 900k over 900k LP -> Greg whole.
 }
 

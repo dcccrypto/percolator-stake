@@ -37,6 +37,7 @@ fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
 ///   - pre-funded: top up to rent-exemption if short, then `allocate` then `assign`. The
 ///     order matters — `allocate` requires the account to still be System-owned, and
 ///     `assign` hands ownership to this program, so `allocate` MUST precede `assign`.
+///
 /// `allocate` zero-fills the data, so an adopted account is byte-identical to a freshly
 /// created one. `need - have` is computed only under `have < need`, so it cannot underflow;
 /// surplus lamports (over-funding) are simply retained by the PDA. `payer` must be a
@@ -496,6 +497,27 @@ fn process_init_pool(
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
 
+    // Issue #6 lineage reconciliation: ensure the slab is owned by the wrapper program
+    // we are about to CPI into. `percolator_program` is already pinned to a hardcoded
+    // mainnet/devnet allowlist above, so this additionally confirms `slab` is a real
+    // market of THAT wrapper (not an arbitrary account) before we cross the CPI
+    // boundary — mirrors percolator-vault@eb3ebe8 src/processor.rs's equivalent guard.
+    if *slab.owner != *percolator_program.key {
+        msg!("InitPool: slab is not owned by percolator_program");
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // InitPool now performs a wrapper UpdateAuthority (tag 32) CPI that rotates
+    // marketauth to this pool PDA (see `cpi::cpi_update_authority` below), and that
+    // CPI marks the slab/market writable. Require the outer InitPool account
+    // metadata to provide the same writable privilege before crossing the CPI
+    // boundary — a top-level non-writable slab would otherwise fail deep inside the
+    // wrapper's `expect_writable(market_ai)` with a confusing error.
+    if !slab.is_writable {
+        msg!("InitPool: slab must be writable for marketauth admin-handoff CPI");
+        return Err(ProgramError::InvalidArgument);
+    }
+
     // Validate the rent sysvar account early (it is still passed to the LP-mint/vault
     // initialize CPIs below); create_or_adopt_pda reads rent via Rent::get() internally.
     let _ = Rent::from_account_info(rent_sysvar)?;
@@ -512,6 +534,18 @@ fn process_init_pool(
         STAKE_POOL_SIZE,
         pool_seeds,
     )?;
+
+    // Issue #6 lineage reconciliation: prove the initializer is the CURRENT wrapper
+    // marketauth by transferring wrapper admin authority to this pool PDA during
+    // initialization, atomically with pool creation. If `admin` is not the current
+    // wrapper marketauth, the wrapper CPI fails closed and the whole InitPool tx
+    // reverts (pool PDA creation above rolls back too — single-transaction atomicity).
+    // This irreversibly moves the wrapper's overall marketauth from the human creator
+    // to this pool PDA — ported byte-for-byte from the deployed percolator-vault's
+    // InitPool CPI (percolator-vault@eb3ebe8 src/processor.rs:340) so a redeploy of
+    // THIS program preserves the exact on-chain behavior the launch wizard's
+    // authority-sequencing depends on. See `cpi::cpi_update_authority` doc comment.
+    cpi::cpi_update_authority(percolator_program, admin, pool_pda, slab, pool_seeds)?;
 
     // Create LP mint (mint authority = vault_auth PDA, freeze authority = None).
     // FINDING-4: Passing Some(vault_auth.key) as freeze authority would allow the
@@ -825,6 +859,14 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         return Err(StakeError::ZeroSharesMinted.into());
     }
 
+    // N7: capture total_lp_supply BEFORE this deposit's own increment, so
+    // apply_minimum_liquidity_lock can tell whether this is the pool's true
+    // genesis deposit. `lp_to_mint` (full, pre-lock) is what pool.total_lp_supply
+    // is incremented by below; `mint_amount` (post-lock) is what actually gets
+    // SPL-minted to the depositor.
+    let total_lp_supply_before = pool.total_lp_supply;
+    let mint_amount = apply_minimum_liquidity_lock(total_lp_supply_before, lp_to_mint)?;
+
     // Transfer collateral: user ATA → stake vault
     invoke(
         &crate::spl_token::transfer(
@@ -843,7 +885,9 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         ],
     )?;
 
-    // Mint LP tokens to user
+    // Mint LP tokens to user. N7: mints `mint_amount` (== lp_to_mint minus the
+    // MINIMUM_LIQUIDITY dead-share floor on the genesis deposit only), not the
+    // full `lp_to_mint` — see apply_minimum_liquidity_lock.
     let (_, vault_auth_bump) = state::derive_vault_authority(program_id, pool_pda.key);
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
@@ -854,7 +898,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             user_lp_ata.key,
             vault_auth.key,
             &[],
-            lp_to_mint,
+            mint_amount,
         )?,
         &[
             lp_mint.clone(),
@@ -865,7 +909,10 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         &[vault_auth_seeds],
     )?;
 
-    // Update pool totals
+    // Update pool totals. total_lp_supply tracks the FULL lp_to_mint (including
+    // any MINIMUM_LIQUIDITY dead-share amount that was never actually minted to
+    // any account above) — the permanent gap between this counter and real SPL
+    // circulating supply IS the dead-share lock (see state::MINIMUM_LIQUIDITY doc).
     pool.total_deposited = pool
         .total_deposited
         .checked_add(amount)
@@ -2303,6 +2350,51 @@ fn process_rotate_insurance_authority(
 }
 
 // ============================================================================
+// N7: MINIMUM_LIQUIDITY dead-share lock (CONSOLIDATED-PLAN §2.2)
+// ============================================================================
+
+/// Applies the `state::MINIMUM_LIQUIDITY` dead-share lock at the pool's TRUE
+/// genesis deposit. Shared by `process_deposit` (senior/global bootstrap) and
+/// `process_deposit_junior` (junior bootstrap) — both mutate the SAME
+/// `pool.total_lp_supply` counter, so whichever instruction is called FIRST on a
+/// freshly-initialized pool is the genesis deposit, regardless of which entry
+/// point it comes through.
+///
+/// `total_lp_supply_before` MUST be read BEFORE the caller applies this
+/// deposit's own `total_lp_supply` increment. `lp_to_mint` is the FULL LP
+/// amount computed by the pro-rata/bootstrap math (at genesis this comes from
+/// the `total_lp_supply == 0 && total_pool_value == 0` branch of
+/// `calc_lp_for_deposit`, so `lp_to_mint == deposit_amount` exactly). The
+/// caller must still add the FULL `lp_to_mint` to `pool.total_lp_supply`
+/// unchanged — only the amount actually SPL-minted to the depositor's ATA is
+/// reduced here. The `MINIMUM_LIQUIDITY` difference is never minted to any
+/// account, so it becomes permanently unredeemable "dead" supply (the
+/// Uniswap-V2-style anti-inflation floor — see the constant's doc comment).
+///
+/// Returns `DepositBelowMinimumLiquidity` if the genesis deposit is too small
+/// to carve out the dead-share floor (rather than silently underflowing or
+/// minting 0 real LP while still transferring in collateral).
+fn apply_minimum_liquidity_lock(
+    total_lp_supply_before: u64,
+    lp_to_mint: u64,
+) -> Result<u64, ProgramError> {
+    if total_lp_supply_before != 0 {
+        // Not the pool's genesis deposit — mint the full computed amount, as before.
+        return Ok(lp_to_mint);
+    }
+    let mint_amount = lp_to_mint
+        .checked_sub(state::MINIMUM_LIQUIDITY)
+        .ok_or(StakeError::DepositBelowMinimumLiquidity)?;
+    // Reject an exact-equal genesis deposit too: it would carve the dead-share
+    // floor out fully and mint 0 real LP to the depositor while still
+    // transferring their collateral in — same S-4 class of bug as ZeroSharesMinted.
+    if mint_amount == 0 {
+        return Err(StakeError::DepositBelowMinimumLiquidity.into());
+    }
+    Ok(mint_amount)
+}
+
+// ============================================================================
 // PERC-272: LP Vault — Fee Accrual & Trading Pool Init
 // ============================================================================
 
@@ -2842,6 +2934,13 @@ fn process_deposit_junior(
         return Err(StakeError::ZeroSharesMinted.into());
     }
 
+    // N7: same MINIMUM_LIQUIDITY dead-share lock as process_deposit, keyed off the
+    // SAME pool.total_lp_supply counter — if a pool's very first-ever deposit
+    // happens to arrive via DepositJunior rather than Deposit, it must be treated
+    // as genesis too (see apply_minimum_liquidity_lock doc comment).
+    let total_lp_supply_before = pool.total_lp_supply;
+    let mint_amount = apply_minimum_liquidity_lock(total_lp_supply_before, lp_to_mint)?;
+
     invoke(
         &crate::spl_token::transfer(
             token_program.key,
@@ -2869,7 +2968,7 @@ fn process_deposit_junior(
             user_lp_ata.key,
             vault_auth.key,
             &[],
-            lp_to_mint,
+            mint_amount,
         )?,
         &[
             lp_mint.clone(),
@@ -3328,6 +3427,80 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    // ── N7 (CONSOLIDATED-PLAN §2.2): apply_minimum_liquidity_lock ───────────
+
+    #[test]
+    fn n7_genesis_deposit_above_minimum_liquidity_carves_out_dead_shares() {
+        let lp_to_mint = state::MINIMUM_LIQUIDITY + 1;
+        let mint_amount = apply_minimum_liquidity_lock(0, lp_to_mint).unwrap();
+        assert_eq!(mint_amount, 1, "genesis mint = lp_to_mint - MINIMUM_LIQUIDITY");
+    }
+
+    #[test]
+    fn n7_genesis_deposit_at_exactly_minimum_liquidity_rejected() {
+        // mint_amount would be exactly 0 — reject rather than mint 0 real LP
+        // while still transferring the depositor's collateral in.
+        let err = apply_minimum_liquidity_lock(0, state::MINIMUM_LIQUIDITY).unwrap_err();
+        assert_eq!(err, StakeError::DepositBelowMinimumLiquidity.into());
+    }
+
+    #[test]
+    fn n7_genesis_deposit_below_minimum_liquidity_rejected() {
+        let err = apply_minimum_liquidity_lock(0, state::MINIMUM_LIQUIDITY - 1).unwrap_err();
+        assert_eq!(err, StakeError::DepositBelowMinimumLiquidity.into());
+    }
+
+    #[test]
+    fn n7_genesis_deposit_of_zero_lp_rejected_not_underflow_panic() {
+        // Defense-in-depth: lp_to_mint=0 shouldn't reach this helper in production
+        // (S-4's ZeroSharesMinted check runs first), but the helper itself must not
+        // panic on checked_sub underflow if it ever did.
+        let err = apply_minimum_liquidity_lock(0, 0).unwrap_err();
+        assert_eq!(err, StakeError::DepositBelowMinimumLiquidity.into());
+    }
+
+    #[test]
+    fn n7_non_genesis_deposit_mints_full_amount_unchanged() {
+        // total_lp_supply_before != 0 -> not genesis -> pass through unchanged,
+        // even for amounts far below MINIMUM_LIQUIDITY (only the pool's FIRST
+        // deposit ever pays the dead-share floor).
+        assert_eq!(apply_minimum_liquidity_lock(1, 1).unwrap(), 1);
+        assert_eq!(apply_minimum_liquidity_lock(1_000_000, 5).unwrap(), 5);
+        assert_eq!(
+            apply_minimum_liquidity_lock(42, state::MINIMUM_LIQUIDITY).unwrap(),
+            state::MINIMUM_LIQUIDITY
+        );
+    }
+
+    /// MUTATION CHECK (requested by the coordinator's verification-pass addendum):
+    /// if the dead-share carve-out were removed (i.e. apply_minimum_liquidity_lock
+    /// degenerated to `Ok(lp_to_mint)` unconditionally, matching pre-N7 behavior),
+    /// this harness's own invariant — genesis mint_amount < lp_to_mint whenever
+    /// MINIMUM_LIQUIDITY > 0 — would need to fail. We assert the CURRENT (fixed)
+    /// behavior directly against that mutated baseline to make the regression
+    /// this test would catch explicit and auditable, without needing to actually
+    /// revert the source: the pre-N7 formula computed here inline is exactly
+    /// `Ok(lp_to_mint)`, and we assert our real function's output is STRICTLY LESS
+    /// than that baseline at genesis — i.e. the dead-share floor is actually being
+    /// deducted, not a no-op.
+    #[test]
+    fn n7_mutation_check_dead_share_floor_is_strictly_deducted_at_genesis() {
+        let lp_to_mint = state::MINIMUM_LIQUIDITY + 12_345;
+        let pre_n7_baseline_mint_amount = lp_to_mint; // what `Ok(lp_to_mint)` (the mutant) would return
+        let actual_mint_amount = apply_minimum_liquidity_lock(0, lp_to_mint).unwrap();
+        assert!(
+            actual_mint_amount < pre_n7_baseline_mint_amount,
+            "N7 REGRESSION: genesis mint_amount ({actual_mint_amount}) must be strictly less \
+             than the un-mitigated lp_to_mint ({pre_n7_baseline_mint_amount}) — if these are \
+             equal, the dead-share carve-out has been silently removed"
+        );
+        assert_eq!(
+            pre_n7_baseline_mint_amount - actual_mint_amount,
+            state::MINIMUM_LIQUIDITY,
+            "the deducted amount must be exactly MINIMUM_LIQUIDITY, not some other value"
+        );
+    }
 
     // ── #242 timelock_window_elapsed (pure helper) ──────────────────────────
     #[test]
