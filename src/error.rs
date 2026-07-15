@@ -55,10 +55,18 @@ pub enum StakeError {
     /// Two-step admin rotation: no pending admin proposal exists (or it was
     /// cancelled), so AcceptAdmin has nothing to accept.
     NoPendingAdmin = 23,
-    /// Junior tranche deposits are paused while an insurance loss is outstanding
-    /// (total_flushed > total_returned). A junior depositing during an open claim
-    /// would inherit a pre-existing loss it was never exposed to (and the mirror
-    /// case could snipe the recovery). Deposits resume once insurance is returned.
+    /// Reused across multiple gates that share the same underlying condition:
+    /// `total_flushed > total_returned` (flushed-but-unrecovered insurance).
+    /// - Junior tranche deposits are paused while an insurance loss is outstanding:
+    ///   a junior depositing during an open claim would inherit a pre-existing
+    ///   loss it was never exposed to (and the mirror case could snipe the
+    ///   recovery). Deposits resume once insurance is returned.
+    /// - H-1 (security review): `AdminResolveMarket` (tag 24) and `SetMarketResolved`
+    ///   (tag 18) both reject while this condition holds, because once the wrapper
+    ///   market is resolved (mode != 0), `RecoverFlushedInsurance`'s only CPI
+    ///   (wrapper tag 57 WithdrawInsuranceAsset) permanently rejects with
+    ///   EngineLockActive — any outstanding flush would otherwise be stranded.
+    ///   Call `RecoverFlushedInsurance` until fully caught up before resolving.
     InsuranceLossOutstanding = 24,
     /// #242 timelock: a `cooldown_slots` INCREASE must go through the two-phase
     /// timelock (ProposeCooldownIncrease → wait TIMELOCK_SLOTS → CommitCooldownIncrease),
@@ -113,7 +121,7 @@ pub fn error_hint(code: u32) -> &'static str {
         21 => "Wrong tranche — deposit already belongs to a different tranche",
         22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
         23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
-        24 => "Insurance loss outstanding — junior tranche deposits are paused until the flushed insurance is returned (total_flushed > total_returned)",
+        24 => "Insurance loss outstanding — total_flushed > total_returned. Junior tranche deposits are paused, and AdminResolveMarket/SetMarketResolved are blocked until RecoverFlushedInsurance fully returns the flushed insurance (resolving first would strand it — recovery requires LIVE mode)",
         28 => "Deposit below minimum liquidity — the pool's first-ever deposit must exceed MINIMUM_LIQUIDITY so a permanent dead-share floor can be locked (N7 anti-inflation hardening); deposit a larger amount",
         _ => "Unknown error — check the error code and pool state",
     }

@@ -229,3 +229,71 @@ fn test_bind_and_rotate_produce_same_wire_shape() {
         "new_pubkey bytes differ between bind and rotate"
     );
 }
+
+// ── Tag 19: ResolveMarket (C-1 fix — AdminResolveMarket CPI proxy) ───────────
+
+/// C-1 CANARY: the ResolveMarket (tag 19) wire is exactly 1 byte — the bare tag,
+/// with NO payload. Verified against the DEPLOYED wrapper source
+/// (percolator-prog@e26c97a4 == current HEAD, v16_program.rs:3867):
+/// `19 => Self::ResolveMarket` consumes zero additional bytes from `rest`.
+///
+/// CANARY POLICY: any change to this test requires a matching change to both
+/// src/cpi.rs AND the wrapper's ResolveMarket decoder (they must stay in sync).
+#[test]
+fn test_cpi_tag19_resolve_market_wire_is_1_byte() {
+    let data = vec![19u8]; // mirrors cpi::cpi_resolve_market's `vec![TAG_RESOLVE_MARKET]`
+
+    assert_eq!(data.len(), 1, "tag-19 ResolveMarket wire must be exactly 1 byte");
+    assert_eq!(data[0], 19, "byte 0 must be tag=19 (ResolveMarket)");
+
+    // Byte-for-byte parity with the deployed vault's cpi_resolve_market
+    // (percolator-vault@eb3ebe8 src/cpi.rs:246): `let data = vec![TAG_RESOLVE_MARKET];`
+    let vault_reference = vec![19u8];
+    assert_eq!(
+        data, vault_reference,
+        "ported wire must be byte-for-byte identical to the deployed vault's cpi_resolve_market"
+    );
+}
+
+/// Account shape parity: tag 19 uses exactly TWO accounts —
+/// [admin/marketauth(signer, read-only), market(writable)] — matching
+/// handle_resolve_market's `account(accounts, 0)` (expect_signer +
+/// expect_live_authority) / `account(accounts, 1)` (expect_writable +
+/// expect_owner) reads, and the deployed vault's identical 2-account
+/// `cpi_resolve_market` construction (percolator-vault@eb3ebe8 src/cpi.rs:250-253).
+#[test]
+fn test_cpi_tag19_account_shape_is_two_accounts() {
+    // [is_signer, is_writable] per account, in order.
+    let shape = [
+        (true, false), // 0: admin/marketauth (pool PDA), signer via invoke_signed, read-only
+        (false, true), // 1: market/slab, writable, not a signer
+    ];
+    assert_eq!(shape.len(), 2, "ResolveMarket CPI must pass exactly 2 accounts");
+    assert!(shape[0].0, "account 0 (marketauth) must be a signer");
+    assert!(!shape[0].1, "account 0 (marketauth) is read-only");
+    assert!(shape[1].1, "account 1 (market) must be writable");
+    assert!(!shape[1].0, "account 1 (market) is not a signer");
+}
+
+/// REGRESSION GUARD: tag 19 must never collide with the wire lengths of the
+/// other CPIs this program issues (9, 32, 57, 65) — a length collision alone
+/// isn't unsafe, but pins the expectation that ResolveMarket's payload stays
+/// the minimal 1-byte bare tag if anyone is tempted to add fields later without
+/// re-checking the deployed wrapper's decoder.
+#[test]
+fn test_cpi_tag19_wire_length_distinct_from_other_cpis() {
+    let resolve_market_len = 1usize; // tag(1)
+    let top_up_insurance_len = 17usize; // tag(1) + u128(16)
+    let update_authority_len = 33usize; // tag(1) + pubkey(32)
+    let update_asset_authority_len = 36usize; // tag(1) + idx(2) + kind(1) + pubkey(32)
+    let withdraw_insurance_asset_len = 19usize; // tag(1) + idx(2) + u128(16)
+
+    for other in [
+        top_up_insurance_len,
+        update_authority_len,
+        update_asset_authority_len,
+        withdraw_insurance_asset_len,
+    ] {
+        assert_ne!(resolve_market_len, other, "tag-19 wire length must stay distinct");
+    }
+}

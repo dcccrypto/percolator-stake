@@ -1,11 +1,27 @@
 use solana_program::program_error::ProgramError;
 
-/// Instructions for the Percolator Insurance LP Staking program (v3 — no admin proxy).
+/// Instructions for the Percolator Insurance LP Staking program.
 ///
 /// The stake program handles deposits, withdrawals, LP math, insurance flush/return,
-/// fee accrual, HWM, and tranches. All wrapper admin operations (ResolveMarket,
-/// SetOracleAuthority, WithdrawInsurance, etc.) are called directly by the human
-/// admin wallet on the wrapper program.
+/// fee accrual, HWM, and tranches.
+///
+/// DOC CORRECTION (security review C-1, issue #6 lineage): earlier versions of this
+/// file described the human admin as calling ALL wrapper admin operations
+/// (ResolveMarket, SetOracleAuthority, WithdrawInsurance, etc.) directly on the
+/// wrapper, with "no admin proxy needed". That was true only before `InitPool`
+/// grew the `cpi_update_authority` (wrapper tag 32) call that rotates
+/// `cfg.marketauth` to this program's pool PDA (ported from the deployed
+/// `percolator-vault@eb3ebe8`). Once marketauth is a PDA, the human admin can NO
+/// LONGER call any marketauth-gated wrapper instruction directly — a PDA cannot
+/// sign a top-level transaction, so every such call must be proxied through a CPI
+/// this program issues via `invoke_signed`. `ResolveMarket` (wrapper tag 19,
+/// proxied here as `AdminResolveMarket`, tag 24) is the first — and, as of this
+/// fix, the ONLY currently-implemented — marketauth-gated proxy; without it every
+/// InitPool market would be permanently stuck in Live mode. Other wrapper admin
+/// operations gated on marketauth (not the per-asset `insurance_authority` /
+/// `insurance_operator` / `asset_admin` fields, which already have their own
+/// Bind/Rotate/Burn proxies below) remain UNREACHABLE through this program and
+/// must be proxied here before they can ever be exercised on an InitPool market.
 #[derive(Debug)]
 pub enum StakeInstruction {
     /// 0: Initialize a stake pool for a slab (market).
@@ -81,7 +97,12 @@ pub enum StakeInstruction {
     /// wrapper requires the new authority to sign and a PDA cannot sign directly).
     /// Must be called once after market creation, before the first flush. Fails
     /// (wrapper Unauthorized) if the admin is no longer the current authority
-    /// (i.e. already bound), making it naturally single-use.
+    /// (i.e. already bound), making it naturally single-use — PROVIDED the
+    /// market is still Live (mode == 0). The wrapper's
+    /// `handle_update_asset_authority` checks `group.header.mode != 0` BEFORE
+    /// the authority check (v16_program.rs:10362-10364), so if the market has
+    /// since been resolved (e.g. via `AdminResolveMarket`, tag 24) a repeat or
+    /// late call fails with EngineLockActive instead, not Unauthorized.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (current insurance_authority; must equal pool.admin)
@@ -101,6 +122,12 @@ pub enum StakeInstruction {
     /// Migration: rotate to the admin wallet from the OLD program before
     /// decommissioning it, then re-bind from the NEW program before BurnAssetAdmin.
     /// Only works while the PDA is the current authority and before the final burn.
+    /// It ALSO only works while the market is still Live (mode == 0): the wrapper's
+    /// `handle_update_asset_authority` rejects with EngineLockActive (checked
+    /// before the authority match) once the market has been resolved — a
+    /// mode-related rejection is EngineLockActive, not Unauthorized, even though
+    /// both this and an authority mismatch surface as CPI failures from stake's
+    /// perspective. Migrate BEFORE resolving, not after.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
@@ -118,7 +145,12 @@ pub enum StakeInstruction {
     /// Stake also records the burn and disables its PDA-signed rotate escapes.
     ///
     /// IRREVERSIBLE. Only call this after BindInsuranceAuthority has completed.
-    /// Must NOT be called again if asset_admin is already zero (causes Unauthorized).
+    /// Must NOT be called again if asset_admin is already zero — this causes
+    /// Unauthorized ONLY while the market is still Live (mode == 0). The wrapper's
+    /// `handle_update_asset_authority` checks `group.header.mode != 0` before the
+    /// authority check, so calling this after the market has been resolved (e.g.
+    /// via `AdminResolveMarket`, tag 24) fails with EngineLockActive instead,
+    /// regardless of whether asset_admin was already burned.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (current asset_admin == pool.admin)
@@ -138,6 +170,10 @@ pub enum StakeInstruction {
     ///   2. RotateInsuranceOperator  (tag 22): operator  PDA → admin wallet
     ///   3. Re-bind from NEW program (BindInsuranceAuthority, tag 19)
     ///   4. BurnAssetAdmin (tag 21) when the new bind is final
+    ///
+    /// Same mode caveat as RotateInsuranceAuthority (tag 20): only works while the
+    /// market is Live (mode == 0). Post-resolution the wrapper CPI fails with
+    /// EngineLockActive, not Unauthorized — migrate before resolving.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
@@ -297,12 +333,64 @@ pub enum StakeInstruction {
     DepositJunior { amount: u64 },
 
     /// 18: Admin marks the pool as market-resolved (blocks new deposits).
-    /// Call this after resolving the market on the wrapper directly.
+    /// Call this after resolving the market via `AdminResolveMarket` (tag 24) —
+    /// NOT directly on the wrapper; see that instruction's doc for why the human
+    /// admin can no longer call the wrapper's ResolveMarket directly once InitPool
+    /// has rotated marketauth to the pool PDA.
+    ///
+    /// H-1 GATE (security review): rejects with
+    /// `StakeError::InsuranceLossOutstanding` if `pool.total_flushed >
+    /// pool.total_returned` — defense-in-depth mirroring the same gate on
+    /// `AdminResolveMarket`. `AdminResolveMarket` is the instruction that actually
+    /// flips the wrapper to a non-Live mode and is the primary enforcement point;
+    /// this local bookkeeping flag is gated identically so a market can never be
+    /// marked resolved here while insurance recovery is still outstanding,
+    /// regardless of call order.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
     SetMarketResolved,
+
+    /// 24: AdminResolveMarket — CPI proxy for the wrapper's ResolveMarket (tag 19).
+    ///
+    /// C-1 FIX (security review BLOCKER): `InitPool` rotates `cfg.marketauth` to
+    /// this pool's PDA (see `cpi::cpi_update_authority`, ported from the deployed
+    /// `percolator-vault@eb3ebe8`). After that rotation the human admin can no
+    /// longer call the wrapper's ResolveMarket directly — the wrapper's
+    /// `expect_live_authority(&cfg.marketauth, admin.key)` check requires the
+    /// SIGNER to equal `cfg.marketauth`, which is now this program's pool PDA, and
+    /// a PDA cannot sign a top-level transaction. Without this proxy, NO key could
+    /// ever resolve a stake-initialized market: every InitPool market would be
+    /// permanently stuck in Live mode (mode == 0), with the terminal insurance
+    /// withdrawal path unreachable forever. This instruction lets the pool admin
+    /// trigger the CPI, with the pool PDA signing via `invoke_signed` using its own
+    /// seeds (`[b"stake_pool", slab, bump]`) as the marketauth — see
+    /// `cpi::cpi_resolve_market` for the byte-for-byte wire proof against the
+    /// deployed wrapper.
+    ///
+    /// H-1 GATE (security review): rejects with
+    /// `StakeError::InsuranceLossOutstanding` if `pool.total_flushed >
+    /// pool.total_returned` (there is flushed-but-unrecovered insurance
+    /// outstanding). `RecoverFlushedInsurance` (tag 23) CPIs wrapper tag 57
+    /// `WithdrawInsuranceAsset`, which itself requires LIVE mode (mode == 0);
+    /// once THIS instruction's CPI flips the wrapper to mode != 0, tag 57
+    /// permanently rejects with EngineLockActive and any outstanding flush would
+    /// be stranded with no recovery path (this program does NOT implement the
+    /// wrapper's terminal-mode `WithdrawInsurance`, tag 41, as a fallback CPI).
+    /// Gating resolution on full recovery-first is the CHOSEN fix over adding a
+    /// second CPI wire: it is strictly less new attack surface (no new wrapper
+    /// wire to byte-match, no new account shape to validate) and makes the
+    /// stranding scenario structurally unreachable rather than merely
+    /// recoverable. The admin must call `RecoverFlushedInsurance` until
+    /// `total_flushed <= total_returned` before this instruction will succeed.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+    ///   2. `[writable]` Slab / market account (wrapper-owned)
+    ///   3. `[]` Percolator program
+    AdminResolveMarket,
 }
 
 impl StakeInstruction {
@@ -542,6 +630,12 @@ impl StakeInstruction {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 Ok(Self::SetMarketResolved)
+            }
+            24 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::AdminResolveMarket)
             }
             _ => Err(ProgramError::InvalidInstructionData),
         }
@@ -836,7 +930,7 @@ mod tests {
     /// #209 PoC: tag-only instructions must reject any trailing bytes too.
     #[test]
     fn poc_tag_only_instructions_should_reject_trailing_bytes() {
-        for tag in [6u8, 12, 18, 19, 20, 21, 22] {
+        for tag in [6u8, 12, 18, 19, 20, 21, 22, 24] {
             let result = StakeInstruction::unpack(&[tag, 99]);
             assert!(
                 matches!(result, Err(ProgramError::InvalidInstructionData)),
@@ -896,6 +990,27 @@ mod tests {
                 Err(ProgramError::InvalidInstructionData)
             ),
             "tag 23 with trailing bytes must reject"
+        );
+    }
+
+    /// C-1: tag 24 AdminResolveMarket round-trips with no payload.
+    #[test]
+    fn test_unpack_admin_resolve_market() {
+        match StakeInstruction::unpack(&[24u8]).unwrap() {
+            StakeInstruction::AdminResolveMarket => {}
+            _ => panic!("wrong variant"),
+        }
+        // trailing bytes rejected (no payload expected).
+        assert!(StakeInstruction::unpack(&[24u8, 0, 0]).is_err());
+    }
+
+    /// C-1: tag 24 must reject trailing bytes (tag-only instruction).
+    #[test]
+    fn test_unpack_admin_resolve_market_trailing_bytes_rejected() {
+        let result = StakeInstruction::unpack(&[24u8, 99]);
+        assert!(
+            matches!(result, Err(ProgramError::InvalidInstructionData)),
+            "tag 24 should reject trailing bytes"
         );
     }
 }

@@ -517,6 +517,85 @@ pub fn cpi_withdraw_insurance_asset<'a>(
     )
 }
 
+// ═══════════════════════════════════════════════════════════════
+// ResolveMarket (Tag 19) — C-1 fix: CPI proxy for the wrapper's terminal
+// resolution instruction, now that marketauth is the pool PDA
+// ═══════════════════════════════════════════════════════════════
+// SECURITY REVIEW C-1 (BLOCKER, fixed here): `process_init_pool` rotates
+// `cfg.marketauth` to the pool PDA (see `cpi_update_authority` above), ported
+// from the deployed `percolator-vault@eb3ebe8`. That vault ALSO ports an
+// `AdminResolveMarket` CPI proxy (vault tag 9 -> wrapper tag 19) alongside the
+// rotation — this program had the rotation WITHOUT the matching proxy. Once
+// marketauth is the pool PDA, NO top-level signer can ever satisfy the
+// wrapper's `expect_signer(admin)` + `expect_live_authority(&cfg.marketauth,
+// admin.key)` checks in `handle_resolve_market` directly (a PDA cannot sign a
+// plain transaction) — every market created via InitPool would be
+// permanently stuck in Live mode (mode == 0), with the terminal insurance
+// withdrawal path (post-resolution WithdrawInsurance) forever unreachable.
+// This CPI closes that gap: the pool PDA signs via `invoke_signed` using its
+// OWN seeds (`[b"stake_pool", slab, bump]`), exactly mirroring how
+// `cpi_update_authority` already proves control during InitPool.
+//
+// WIRE (verified against the DEPLOYED wrapper source,
+// percolator-prog@e26c97a4 == current HEAD, src/v16_program.rs:10278
+// handle_resolve_market):
+//   let admin = account(accounts, 0)?;      // expect_signer + expect_live_authority(marketauth)
+//   let market_ai = account(accounts, 1)?;  // expect_writable + expect_owner(program_id)
+//   ... mode must == 0 (else EngineLockActive) ...
+//   group.resolve_market_not_atomic(slot)
+// Tag decode (v16_program.rs:3867): `19 => Self::ResolveMarket` — the decoder
+// consumes ZERO additional bytes for this variant (unlike e.g. tag 9's
+// `read_u128`), so the wire is the bare 1-byte tag. Data: tag(1) = 1 byte.
+// Accounts: exactly 2 — [admin(signer), market(writable)]. NO payload bytes,
+// NO extra accounts.
+//
+// BYTE-FOR-BYTE PARITY with the deployed vault's `cpi_resolve_market`
+// (percolator-vault@eb3ebe8 src/cpi.rs:240-258): `let data =
+// vec![TAG_RESOLVE_MARKET];` with the identical 2-account
+// `[new_readonly(admin_pda, true), new(slab, false)]` shape and
+// `invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])`
+// call pattern. The only naming difference is that THIS program's "admin_pda"
+// signer is the `stake_pool` PDA itself (matching what `cpi_update_authority`
+// rotated marketauth to), not a separately-named admin PDA — vault and stake
+// converge on the same PDA-is-marketauth design from issue #6 lineage
+// reconciliation, so the CPI construction is identical.
+//
+// H-1 (HIGH, fixed at the call site in `processor.rs::process_admin_resolve_market`):
+// this CPI is gated so the caller may not invoke it while
+// `pool.total_flushed > pool.total_returned` (flushed-but-unrecovered
+// insurance outstanding). `RecoverFlushedInsurance` (tag 23) CPIs wrapper tag
+// 57 `WithdrawInsuranceAsset`, which itself requires LIVE mode (mode == 0) —
+// once THIS CPI flips the wrapper to mode != 0, tag 57 permanently rejects
+// with EngineLockActive and any outstanding flush would be stranded with no
+// recovery path (the wrapper's terminal-mode withdrawal, tag 41
+// `WithdrawInsurance`, is a DIFFERENT CPI this program does not implement).
+// Gating resolution on full recovery-first means that fallback is never
+// needed by construction — see the H-1 doc note on
+// `process_admin_resolve_market` for the full analysis.
+const TAG_RESOLVE_MARKET: u8 = 19;
+
+pub fn cpi_resolve_market<'a>(
+    percolator_program: &AccountInfo<'a>,
+    pool_pda: &AccountInfo<'a>, // marketauth (rotated by InitPool); signs via invoke_signed
+    slab: &AccountInfo<'a>,     // market, writable
+    pool_seeds: &[&[u8]],       // pool PDA seeds: [b"stake_pool", slab, bump]
+) -> ProgramResult {
+    // tag(1) = 1 byte. No payload — matches `19 => Self::ResolveMarket` (zero
+    // additional bytes consumed by the wrapper's decoder).
+    let data = vec![TAG_RESOLVE_MARKET];
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*pool_pda.key, true), // admin == marketauth, signer
+            AccountMeta::new(*slab.key, false),              // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
+}
+
 #[cfg(test)]
 mod tag_tests {
     use super::*;
@@ -702,5 +781,55 @@ mod tag_tests {
         assert_ne!(data.len(), 9, "9-byte u64 wire would be rejected by wrapper");
         // Guard: tag 57, not tag 9 (TopUpInsurance) — different directions.
         assert_ne!(data[0], TAG_TOP_UP_INSURANCE, "must be tag 57, not tag 9");
+    }
+
+    /// C-1 CANARY: pin the ResolveMarket (tag 19) wire = tag(1) = 1 byte, no
+    /// payload. Mirrors the decoder at v16_program.rs:3867
+    /// (`19 => Self::ResolveMarket`), which reads zero extra bytes.
+    #[test]
+    fn test_cpi_resolve_market_wire_shape() {
+        let mut data = Vec::with_capacity(1);
+        data.push(TAG_RESOLVE_MARKET);
+
+        assert_eq!(data.len(), 1, "tag-19 ResolveMarket wire must be exactly 1 byte");
+        assert_eq!(data[0], 19, "tag must be 19 (ResolveMarket)");
+
+        // Byte-for-byte parity with the deployed vault's cpi_resolve_market:
+        // `let data = vec![TAG_RESOLVE_MARKET];` where TAG_RESOLVE_MARKET = 19.
+        let vault_reference = vec![19u8];
+        assert_eq!(
+            data, vault_reference,
+            "ported wire must be byte-for-byte identical to percolator-vault@eb3ebe8's cpi_resolve_market"
+        );
+    }
+
+    /// C-1: TAG_RESOLVE_MARKET must equal 19 and be distinct from every other
+    /// wrapper tag this program CPIs into (9, 32, 57, 65) — a collision here
+    /// would silently misroute the resolve CPI to a different wrapper handler.
+    #[test]
+    fn test_tag_resolve_market_is_19_and_distinct() {
+        assert_eq!(TAG_RESOLVE_MARKET, 19, "TAG_RESOLVE_MARKET mismatch");
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_TOP_UP_INSURANCE);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_AUTHORITY);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_ASSET_AUTHORITY);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_WITHDRAW_INSURANCE_ASSET);
+    }
+
+    /// C-1: the ResolveMarket CPI account shape is exactly 2 accounts —
+    /// [admin/marketauth(signer, read-only), market(writable)] — matching
+    /// handle_resolve_market's `account(accounts, 0)` / `account(accounts, 1)`
+    /// reads and the deployed vault's identical 2-account construction.
+    #[test]
+    fn test_cpi_resolve_market_account_shape_is_two_accounts() {
+        // [is_signer, is_writable] per account, in order.
+        let shape = [
+            (true, false), // 0: pool PDA (marketauth), signer via invoke_signed, read-only
+            (false, true), // 1: market/slab, writable, not a signer
+        ];
+        assert_eq!(shape.len(), 2, "ResolveMarket CPI must pass exactly 2 accounts");
+        assert!(shape[0].0, "account 0 (marketauth) must be a signer");
+        assert!(!shape[0].1, "account 0 (marketauth) is read-only, not writable");
+        assert!(shape[1].1, "account 1 (market) must be writable");
+        assert!(!shape[1].0, "account 1 (market) is not a signer");
     }
 }

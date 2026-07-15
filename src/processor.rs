@@ -198,6 +198,29 @@ fn validate_account_owner(account: &AccountInfo, expected_owner: &Pubkey) -> Pro
 
 /// Validate stake pool account version for forward compatibility.
 /// Currently enforces current version only. In future, can add migration logic.
+///
+/// C-2 (security review, ACCEPTED — documented here, NOT code-fixed): this program
+/// upgrades `STAKE_POOL_SIZE` 352 -> 384 bytes (`StakePool::CURRENT_VERSION` 1 -> 2,
+/// see state.rs's `pending_admin` field doc) to add the two-step admin rotation
+/// field. Any pre-existing v1 (352-byte) pool account deployed under the OLD
+/// program build will read `version() == 1 != CURRENT_VERSION` after this program
+/// is deployed over it, and EVERY handler that calls `validate_pool_version` will
+/// reject with `StakeError::InvalidAccount` — i.e. this upgrade INTENTIONALLY
+/// FREEZES pre-existing 352-byte pools. There is no migration path in this build:
+/// the fresh-start cutover decision (see state.rs) is to abandon and reseed rather
+/// than write in-place layout-migration code for what is, at time of writing, zero
+/// live v1 pools on the deployed lineage.
+///
+/// OPERATIONAL GATE FOR THE DEPLOY RUNBOOK: if this program is EVER upgraded over
+/// an address that already holds live v1 StakePool accounts (352 bytes, e.g. a
+/// future re-deploy after pools have been created), those pools MUST be fully
+/// drained (all LP withdrawn, all insurance recovered) BEFORE the upgrade lands —
+/// once `version() != CURRENT_VERSION`, `Deposit`/`Withdraw`/`FlushToInsurance`/
+/// `ReturnInsurance`/`RecoverFlushedInsurance`/`SetMarketResolved`/etc. all hard-
+/// reject via this check, and funds already in the pool vault become unreachable
+/// through this program's instruction set. "Drain-before-upgrade" is a manual
+/// operational precondition this program does NOT enforce or verify on-chain —
+/// treat it as a deploy-runbook checklist item, not a code guarantee.
 fn validate_pool_version(pool: &StakePool) -> ProgramResult {
     let version = pool.version();
     if version != StakePool::CURRENT_VERSION {
@@ -404,6 +427,9 @@ pub fn process(
             process_deposit_junior(program_id, accounts, amount)
         }
         StakeInstruction::SetMarketResolved => process_set_market_resolved(program_id, accounts),
+        StakeInstruction::AdminResolveMarket => {
+            process_admin_resolve_market(program_id, accounts)
+        }
     }
 }
 
@@ -3417,9 +3443,106 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
         return Err(StakeError::MarketResolved.into());
     }
 
+    // H-1 (security review, defense-in-depth): reject if flushed insurance is
+    // still outstanding (total_flushed > total_returned). `AdminResolveMarket`
+    // (tag 24) is the instruction that actually flips the wrapper to a non-Live
+    // mode and carries the PRIMARY enforcement of this invariant (see its doc
+    // comment for the full rationale: post-resolution, wrapper tag 57
+    // WithdrawInsuranceAsset — the only CPI RecoverFlushedInsurance has —
+    // permanently rejects with EngineLockActive, stranding any outstanding
+    // flush). This local bookkeeping flag is gated identically so a pool can
+    // never be marked resolved here while recovery is outstanding, regardless
+    // of call order relative to AdminResolveMarket.
+    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    if outstanding != 0 {
+        msg!(
+            "SetMarketResolved: {} tokens flushed-but-unrecovered — call RecoverFlushedInsurance first",
+            outstanding
+        );
+        return Err(StakeError::InsuranceLossOutstanding.into());
+    }
+
     pool.set_market_resolved(true);
 
     msg!("SetMarketResolved: pool marked as resolved, deposits blocked");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 24: AdminResolveMarket — CPI proxy for wrapper tag 19 ResolveMarket
+// ═══════════════════════════════════════════════════════════════
+// C-1 fix (security review BLOCKER): InitPool rotates cfg.marketauth to this
+// pool's PDA (see cpi::cpi_update_authority / process_init_pool), so only a
+// CPI signed by that PDA can ever call the wrapper's ResolveMarket. Without
+// this proxy every stake-initialized market would be permanently stuck in
+// Live mode. See instruction.rs's AdminResolveMarket doc comment for the full
+// rationale and the H-1 gate this enforces, and cpi::cpi_resolve_market for
+// the byte-for-byte wire proof against the deployed wrapper.
+//
+// Accounts:
+//   0. `[signer]` Admin (must equal pool.admin)
+//   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+//   2. `[writable]` Slab / market account (wrapper-owned)
+//   3. `[]` Percolator program
+
+fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    // Read pool (immutable — no stake-side state is mutated by this
+    // instruction; SetMarketResolved is still the separate, explicit local
+    // bookkeeping step) and copy out what we need so the borrow is released
+    // before the CPI, which needs to clone pool_pda's AccountInfo.
+    let pool_bump = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool = pool_from_data(&pool_data[..])?;
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_pool_version(pool)?;
+        // Admin-gated: only the pool admin may trigger resolution.
+        if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        if pool.slab != slab.key.to_bytes() {
+            return Err(StakeError::InvalidPda.into());
+        }
+        if pool.percolator_program != percolator_program.key.to_bytes() {
+            return Err(StakeError::InvalidPercolatorProgram.into());
+        }
+        // H-1: block resolution while flushed insurance is unrecovered. See the
+        // doc comment above and on instruction.rs::AdminResolveMarket for the
+        // full rationale (post-resolution, wrapper tag 57 WithdrawInsuranceAsset
+        // permanently rejects with EngineLockActive, stranding any outstanding
+        // total_flushed - total_returned with no recovery path).
+        let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+        if outstanding != 0 {
+            msg!(
+                "AdminResolveMarket: {} tokens flushed-but-unrecovered — call RecoverFlushedInsurance first",
+                outstanding
+            );
+            return Err(StakeError::InsuranceLossOutstanding.into());
+        }
+        pool.bump
+    };
+
+    let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
+    cpi::cpi_resolve_market(percolator_program, pool_pda, slab, pool_seeds)?;
+
+    msg!("AdminResolveMarket: wrapper market resolved via pool PDA CPI");
     Ok(())
 }
 
@@ -3898,6 +4021,258 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
             result,
             Err(StakeError::InvalidAccount.into()),
             "SetMarketResolved should fail with InvalidAccount for a read-only pool account"
+        );
+    }
+
+    /// H-1: SetMarketResolved must reject when flushed insurance is still
+    /// outstanding (total_flushed > total_returned) — defense-in-depth mirroring
+    /// the primary gate on AdminResolveMarket.
+    #[test]
+    fn h1_set_market_resolved_blocks_when_flushed_not_returned() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.total_flushed = 500;
+        pool.total_returned = 200; // 300 outstanding
+        pool.set_discriminator();
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut admin_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
+                &system_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_key, false, true, &mut pool_lamports, &mut pool_data,
+                &program_id, false, 0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[18u8]);
+        assert_eq!(
+            result,
+            Err(StakeError::InsuranceLossOutstanding.into()),
+            "SetMarketResolved must reject while total_flushed > total_returned"
+        );
+    }
+
+    /// H-1: SetMarketResolved succeeds once total_returned has caught up with
+    /// total_flushed (nothing outstanding to recover).
+    #[test]
+    fn h1_set_market_resolved_allows_when_fully_returned() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.total_flushed = 500;
+        pool.total_returned = 500; // fully recovered
+        pool.set_discriminator();
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut admin_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
+                &system_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_key, false, true, &mut pool_lamports, &mut pool_data,
+                &program_id, false, 0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[18u8]);
+        assert!(result.is_ok(), "SetMarketResolved must succeed once fully recovered: {result:?}");
+
+        let pool_after = pool_from_data(&pool_data).unwrap();
+        assert!(pool_after.market_resolved(), "pool must be marked resolved");
+    }
+
+    /// C-1: AdminResolveMarket must reject a signer who is not pool.admin,
+    /// proving the new CPI proxy is admin-gated. This path returns before the
+    /// wrapper CPI is ever issued, so no real percolator program is needed.
+    #[test]
+    fn c1_admin_resolve_market_rejects_non_admin_signer() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let attacker_key = Pubkey::new_from_array([0xAAu8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let slab_key = Pubkey::new_from_array([3u8; 32]);
+        let percolator_program_id = Pubkey::new_from_array([4u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes(); // real admin — attacker will sign instead
+        pool.slab = slab_key.to_bytes();
+        pool.percolator_program = percolator_program_id.to_bytes();
+        pool.bump = 255;
+        pool.set_discriminator();
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut attacker_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut slab_lamports = 0u64;
+        let mut program_lamports = 0u64;
+        let mut attacker_data = vec![];
+        let mut slab_data = vec![];
+        let mut program_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &attacker_key, true, false, &mut attacker_lamports, &mut attacker_data,
+                &system_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_key, false, false, &mut pool_lamports, &mut pool_data,
+                &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &slab_key, false, true, &mut slab_lamports, &mut slab_data,
+                &percolator_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &percolator_program_id, false, false, &mut program_lamports, &mut program_data,
+                &system_program_id, true, 0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[24u8]);
+        assert_eq!(
+            result,
+            Err(StakeError::Unauthorized.into()),
+            "AdminResolveMarket must reject a signer that is not pool.admin"
+        );
+    }
+
+    /// H-1: AdminResolveMarket must reject while flushed insurance is
+    /// outstanding — this is the PRIMARY enforcement point (see doc comment on
+    /// process_admin_resolve_market). Reached before the wrapper CPI, so no real
+    /// percolator program is needed to observe the rejection.
+    #[test]
+    fn h1_admin_resolve_market_blocks_when_flushed_not_returned() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let slab_key = Pubkey::new_from_array([3u8; 32]);
+        let percolator_program_id = Pubkey::new_from_array([4u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.slab = slab_key.to_bytes();
+        pool.percolator_program = percolator_program_id.to_bytes();
+        pool.bump = 255;
+        pool.total_flushed = 1_000;
+        pool.total_returned = 400; // 600 outstanding
+        pool.set_discriminator();
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut slab_lamports = 0u64;
+        let mut program_lamports = 0u64;
+        let mut admin_data = vec![];
+        let mut slab_data = vec![];
+        let mut program_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
+                &system_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_key, false, false, &mut pool_lamports, &mut pool_data,
+                &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &slab_key, false, true, &mut slab_lamports, &mut slab_data,
+                &percolator_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &percolator_program_id, false, false, &mut program_lamports, &mut program_data,
+                &system_program_id, true, 0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[24u8]);
+        assert_eq!(
+            result,
+            Err(StakeError::InsuranceLossOutstanding.into()),
+            "AdminResolveMarket must reject while total_flushed > total_returned (H-1)"
+        );
+    }
+
+    /// C-1: AdminResolveMarket must reject a mismatched slab account (not
+    /// pool.slab) before ever reaching the CPI.
+    #[test]
+    fn c1_admin_resolve_market_rejects_wrong_slab() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let real_slab_key = Pubkey::new_from_array([3u8; 32]);
+        let wrong_slab_key = Pubkey::new_from_array([0xBBu8; 32]);
+        let percolator_program_id = Pubkey::new_from_array([4u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.slab = real_slab_key.to_bytes();
+        pool.percolator_program = percolator_program_id.to_bytes();
+        pool.bump = 255;
+        pool.set_discriminator();
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut slab_lamports = 0u64;
+        let mut program_lamports = 0u64;
+        let mut admin_data = vec![];
+        let mut slab_data = vec![];
+        let mut program_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
+                &system_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_key, false, false, &mut pool_lamports, &mut pool_data,
+                &program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &wrong_slab_key, false, true, &mut slab_lamports, &mut slab_data,
+                &percolator_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &percolator_program_id, false, false, &mut program_lamports, &mut program_data,
+                &system_program_id, true, 0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[24u8]);
+        assert_eq!(
+            result,
+            Err(StakeError::InvalidPda.into()),
+            "AdminResolveMarket must reject a slab account that doesn't match pool.slab"
         );
     }
 }

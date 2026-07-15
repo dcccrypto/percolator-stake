@@ -42,7 +42,7 @@ use std::str::FromStr;
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const MARKET_LEN_V17_CAP1: usize = 3003;
+const MARKET_LEN_V17_CAP1: usize = 3067; // dump_sizes MARKET_ACCOUNT_LEN as of percolator-prog HEAD (1d4594a5)
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 fn stake_so() -> PathBuf {

@@ -55,8 +55,10 @@ const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // state::market_account_len_for_capacity(1) (== constants::MARKET_ACCOUNT_LEN);
 // an undersized account makes market_slot_capacity() compute 0 slots < the
 // configured 1 → InitMarket returns InvalidAccountData. History: v16=3107,
-// earlier v17=2987; current v17 sparse layout (post source-domain convergence)=3003.
-const MARKET_LEN_V17_CAP1: usize = 3003;
+// earlier v17=2987, then 3003 (post source-domain convergence); current=3067
+// (post InitMatcherCtx port / protocol-fee tag renumbering, percolator-prog
+// HEAD 1d4594a5 — confirmed via `cargo run --example dump_sizes`).
+const MARKET_LEN_V17_CAP1: usize = 3067;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 const FLUSH_AMOUNT: u64 = 250_000;
 
