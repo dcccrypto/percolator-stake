@@ -221,6 +221,12 @@ fn validate_account_owner(account: &AccountInfo, expected_owner: &Pubkey) -> Pro
 /// through this program's instruction set. "Drain-before-upgrade" is a manual
 /// operational precondition this program does NOT enforce or verify on-chain —
 /// treat it as a deploy-runbook checklist item, not a code guarantee.
+///
+/// Same C-2 caveat applies to the v2 -> v3 bump (384 -> 392 bytes,
+/// `total_recovered_from_wrapper`, H-1 re-review fix): this build was deployed
+/// as a fresh-start reseed with zero live v2 pools, so no in-place migration
+/// was written. Any future upgrade over live v2 pools needs the same
+/// drain-before-upgrade discipline.
 fn validate_pool_version(pool: &StakePool) -> ProgramResult {
     let version = pool.version();
     if version != StakePool::CURRENT_VERSION {
@@ -3396,10 +3402,24 @@ fn process_recover_flushed_insurance(
         .checked_add(amount)
         .ok_or(StakeError::Overflow)?;
 
+    // H-1 re-review fix: this is the ONLY site that increments
+    // `total_recovered_from_wrapper` — it runs exclusively after the tag-57
+    // WithdrawInsuranceAsset CPI above has succeeded, so this counter tracks
+    // real wrapper-side recovery only. `process_return_insurance` (admin's own
+    // wallet -> pool.vault, no wrapper CPI) and the #161 last-junior-exit
+    // phantom write-off (realized_junior_loss, zero token movement) must NEVER
+    // touch this counter — see its doc comment on `StakePool` and the H-1 gates
+    // in `process_admin_resolve_market` / `process_set_market_resolved`.
+    pool.total_recovered_from_wrapper = pool
+        .total_recovered_from_wrapper
+        .checked_add(amount)
+        .ok_or(StakeError::Overflow)?;
+
     msg!(
-        "RecoverFlushedInsurance: {} tokens recovered to pool vault (total_returned: {})",
+        "RecoverFlushedInsurance: {} tokens recovered to pool vault (total_returned: {}, total_recovered_from_wrapper: {})",
         amount,
-        pool.total_returned
+        pool.total_returned,
+        pool.total_recovered_from_wrapper
     );
     Ok(())
 }
@@ -3443,20 +3463,32 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
         return Err(StakeError::MarketResolved.into());
     }
 
-    // H-1 (security review, defense-in-depth): reject if flushed insurance is
-    // still outstanding (total_flushed > total_returned). `AdminResolveMarket`
-    // (tag 24) is the instruction that actually flips the wrapper to a non-Live
-    // mode and carries the PRIMARY enforcement of this invariant (see its doc
-    // comment for the full rationale: post-resolution, wrapper tag 57
-    // WithdrawInsuranceAsset — the only CPI RecoverFlushedInsurance has —
-    // permanently rejects with EngineLockActive, stranding any outstanding
-    // flush). This local bookkeeping flag is gated identically so a pool can
-    // never be marked resolved here while recovery is outstanding, regardless
-    // of call order relative to AdminResolveMarket.
-    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
-    if outstanding != 0 {
+    // H-1 (security review, RE-REVIEW FIX): reject unless every flushed token has
+    // actually been recovered FROM THE WRAPPER (total_flushed <= total_recovered_
+    // from_wrapper). `AdminResolveMarket` (tag 24) is the instruction that actually
+    // flips the wrapper to a non-Live mode and carries the PRIMARY enforcement of
+    // this invariant (see its doc comment for the full rationale: post-resolution,
+    // wrapper tag 57 WithdrawInsuranceAsset — the only CPI RecoverFlushedInsurance
+    // has — permanently rejects with EngineLockActive, stranding any outstanding
+    // flush). This local bookkeeping flag is gated identically so a pool can never
+    // be marked resolved here while recovery is outstanding, regardless of call
+    // order relative to AdminResolveMarket.
+    //
+    // NOTE: this gate deliberately does NOT use `total_flushed - total_returned`.
+    // `total_returned` is also incremented by `process_return_insurance` (admin's
+    // own wallet tokens into pool.vault — no wrapper CPI) and the #161
+    // last-junior-exit phantom write-off (zero token movement). An admin could
+    // satisfy a `total_returned`-based gate via `ReturnInsurance` alone while
+    // leaving the actual flushed capital permanently stranded in the wrapper.
+    // `total_recovered_from_wrapper` is bumped ONLY inside
+    // `process_recover_flushed_insurance`, after its wrapper CPI succeeds, so it
+    // is the correct measure of "insurance actually pulled back from the wrapper".
+    if pool.total_flushed > pool.total_recovered_from_wrapper {
+        let outstanding = pool
+            .total_flushed
+            .saturating_sub(pool.total_recovered_from_wrapper);
         msg!(
-            "SetMarketResolved: {} tokens flushed-but-unrecovered — call RecoverFlushedInsurance first",
+            "SetMarketResolved: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
             outstanding
         );
         return Err(StakeError::InsuranceLossOutstanding.into());
@@ -3523,15 +3555,27 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
         if pool.percolator_program != percolator_program.key.to_bytes() {
             return Err(StakeError::InvalidPercolatorProgram.into());
         }
-        // H-1: block resolution while flushed insurance is unrecovered. See the
-        // doc comment above and on instruction.rs::AdminResolveMarket for the
-        // full rationale (post-resolution, wrapper tag 57 WithdrawInsuranceAsset
-        // permanently rejects with EngineLockActive, stranding any outstanding
-        // total_flushed - total_returned with no recovery path).
-        let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
-        if outstanding != 0 {
+        // H-1 (RE-REVIEW FIX): block resolution unless every flushed token has
+        // actually been recovered FROM THE WRAPPER. See the doc comment above and
+        // on instruction.rs::AdminResolveMarket for the full rationale
+        // (post-resolution, wrapper tag 57 WithdrawInsuranceAsset permanently
+        // rejects with EngineLockActive, stranding any outstanding flush with no
+        // recovery path).
+        //
+        // Gated on `total_flushed <= total_recovered_from_wrapper`, NOT
+        // `total_flushed - total_returned`: `total_returned` is also incremented
+        // by `process_return_insurance` (admin's own wallet -> pool.vault, no
+        // wrapper CPI) and the #161 last-junior-exit phantom write-off (zero
+        // token movement), either of which would let an admin satisfy a
+        // total_returned-based gate WITHOUT recovering the flushed capital from
+        // the wrapper. `total_recovered_from_wrapper` is bumped only inside
+        // `process_recover_flushed_insurance`, after its wrapper CPI succeeds.
+        if pool.total_flushed > pool.total_recovered_from_wrapper {
+            let outstanding = pool
+                .total_flushed
+                .saturating_sub(pool.total_recovered_from_wrapper);
             msg!(
-                "AdminResolveMarket: {} tokens flushed-but-unrecovered — call RecoverFlushedInsurance first",
+                "AdminResolveMarket: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
                 outstanding
             );
             return Err(StakeError::InsuranceLossOutstanding.into());
@@ -4024,9 +4068,9 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
         );
     }
 
-    /// H-1: SetMarketResolved must reject when flushed insurance is still
-    /// outstanding (total_flushed > total_returned) — defense-in-depth mirroring
-    /// the primary gate on AdminResolveMarket.
+    /// H-1: SetMarketResolved must reject when flushed insurance has not been
+    /// recovered from the wrapper (total_flushed > total_recovered_from_wrapper)
+    /// — defense-in-depth mirroring the primary gate on AdminResolveMarket.
     #[test]
     fn h1_set_market_resolved_blocks_when_flushed_not_returned() {
         let program_id = Pubkey::new_from_array([9u8; 32]);
@@ -4061,14 +4105,19 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
         assert_eq!(
             result,
             Err(StakeError::InsuranceLossOutstanding.into()),
-            "SetMarketResolved must reject while total_flushed > total_returned"
+            "SetMarketResolved must reject while total_flushed > total_recovered_from_wrapper"
         );
     }
 
-    /// H-1: SetMarketResolved succeeds once total_returned has caught up with
-    /// total_flushed (nothing outstanding to recover).
+    /// H-1 RE-REVIEW REGRESSION: SetMarketResolved must STILL reject when
+    /// `total_returned` alone has caught up with `total_flushed` via
+    /// `ReturnInsurance`-style bookkeeping (admin's own wallet -> pool.vault, no
+    /// wrapper CPI) but `total_recovered_from_wrapper` has NOT. This is exactly
+    /// the H-1 re-review finding: gating on `total_returned` let an admin
+    /// satisfy the check without ever recovering the flushed capital from the
+    /// wrapper, stranding it forever post-resolution.
     #[test]
-    fn h1_set_market_resolved_allows_when_fully_returned() {
+    fn h1_set_market_resolved_blocks_when_only_total_returned_caught_up() {
         let program_id = Pubkey::new_from_array([9u8; 32]);
         let admin_key = Pubkey::new_from_array([1u8; 32]);
         let pool_key = Pubkey::new_from_array([2u8; 32]);
@@ -4078,7 +4127,8 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
         pool.is_initialized = 1;
         pool.admin = admin_key.to_bytes();
         pool.total_flushed = 500;
-        pool.total_returned = 500; // fully recovered
+        pool.total_returned = 500; // fully "returned" via ReturnInsurance-style bookkeeping
+        pool.total_recovered_from_wrapper = 0; // but NOTHING actually recovered from the wrapper
         pool.set_discriminator();
 
         let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
@@ -4098,7 +4148,52 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
         ];
 
         let result = process(&program_id, &accounts, &[18u8]);
-        assert!(result.is_ok(), "SetMarketResolved must succeed once fully recovered: {result:?}");
+        assert_eq!(
+            result,
+            Err(StakeError::InsuranceLossOutstanding.into()),
+            "SetMarketResolved must reject on total_returned alone — total_recovered_from_wrapper is the correct gate"
+        );
+
+        let pool_after = pool_from_data(&pool_data).unwrap();
+        assert!(!pool_after.market_resolved(), "pool must NOT be marked resolved");
+    }
+
+    /// H-1: SetMarketResolved succeeds once total_recovered_from_wrapper has
+    /// caught up with total_flushed (nothing outstanding to recover from the
+    /// wrapper).
+    #[test]
+    fn h1_set_market_resolved_allows_when_fully_recovered_from_wrapper() {
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let system_program_id = solana_program::system_program::id();
+
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.total_flushed = 500;
+        pool.total_returned = 500;
+        pool.total_recovered_from_wrapper = 500; // fully recovered FROM THE WRAPPER
+        pool.set_discriminator();
+
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut admin_data = vec![];
+
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
+                &system_program_id, false, 0,
+            ),
+            AccountInfo::new(
+                &pool_key, false, true, &mut pool_lamports, &mut pool_data,
+                &program_id, false, 0,
+            ),
+        ];
+
+        let result = process(&program_id, &accounts, &[18u8]);
+        assert!(result.is_ok(), "SetMarketResolved must succeed once fully recovered from wrapper: {result:?}");
 
         let pool_after = pool_from_data(&pool_data).unwrap();
         assert!(pool_after.market_resolved(), "pool must be marked resolved");

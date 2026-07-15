@@ -129,6 +129,34 @@ pub struct StakePool {
 
     /// Reserved for future use
     pub _reserved: [u8; 64],
+
+    /// H-1 re-review fix: cumulative collateral actually recovered from the
+    /// WRAPPER via the tag-57 `WithdrawInsuranceAsset` CPI in
+    /// `process_recover_flushed_insurance` — the ONLY mechanism that pulls
+    /// flushed insurance back out of the wrapper. Incremented exclusively at
+    /// that one CPI success site.
+    ///
+    /// This is deliberately a SEPARATE counter from `total_returned`, which is
+    /// also bumped by two mechanisms that do NOT recover funds from the
+    /// wrapper: `process_return_insurance` (tag 10, the admin's own wallet
+    /// tokens transferred into `pool.vault` — no wrapper CPI) and the #161
+    /// last-junior-exit phantom write-off (`realized_junior_loss`, zero token
+    /// movement). Gating market-resolution on `total_returned` therefore let
+    /// an admin satisfy the H-1 gate via `ReturnInsurance` alone while leaving
+    /// flushed capital permanently stranded in the wrapper post-resolution
+    /// (tag 57 rejects with EngineLockActive once the market is no longer
+    /// mode 0). The resolve-gate in `process_admin_resolve_market` and
+    /// `process_set_market_resolved` must compare `total_flushed` against
+    /// THIS counter, not `total_returned`.
+    ///
+    /// Real struct field (offset 384), NOT carved from `_reserved`: every byte
+    /// of `_reserved`'s 64 bytes is already claimed by PERC-303 tranche state,
+    /// PERC-313 HWM state, and the #242 cooldown-timelock fields, leaving no
+    /// contiguous 8-byte gap for a u64. Adding it grows STAKE_POOL_SIZE
+    /// 384 -> 392 and is why CURRENT_VERSION bumps 2 -> 3. Fresh-start
+    /// cutover: pools are being re-seeded, so no on-chain migration path is
+    /// needed — SDK decoders must add this field for version-3 pools.
+    pub total_recovered_from_wrapper: u64,
 }
 
 /// Size of StakePool in bytes
@@ -430,7 +458,10 @@ impl StakePool {
 
     /// Current struct version. Increment when layout changes.
     /// v2 (size 352 -> 384): added `pending_admin` for two-step admin rotation.
-    pub const CURRENT_VERSION: u8 = 2;
+    /// v3 (size 384 -> 392): added `total_recovered_from_wrapper` (H-1 re-review
+    /// fix) — the resolve-gate counter that tracks ONLY wrapper-CPI-recovered
+    /// flushed insurance, distinct from `total_returned`.
+    pub const CURRENT_VERSION: u8 = 3;
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
     /// Call on init.
@@ -649,10 +680,11 @@ mod tests {
     fn test_stake_pool_size() {
         // Ensure struct is packed correctly (no surprise padding)
         assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
-        // v2 size: prior 352 + pending_admin[32] = 384.
+        // v3 size: prior 384 + total_recovered_from_wrapper[8] = 392.
         // 1+1+1+1+4 + 5*32 + 7*8 + 32(percolator_program) + 24(PERC-272 u64s)
-        //   + 1(pool_mode) + 7(mode_pad) + 32(pending_admin) + 64(_reserved) = 384
-        assert_eq!(STAKE_POOL_SIZE, 384);
+        //   + 1(pool_mode) + 7(mode_pad) + 32(pending_admin) + 64(_reserved)
+        //   + 8(total_recovered_from_wrapper) = 392
+        assert_eq!(STAKE_POOL_SIZE, 392);
     }
 
     #[test]

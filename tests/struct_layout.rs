@@ -6,13 +6,15 @@
 use percolator_stake::state::{StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
 
 #[test]
-fn test_stake_pool_size_is_384() {
-    // v2 layout: prior 352 + pending_admin[32] (two-step admin rotation) = 384.
+fn test_stake_pool_size_is_392() {
+    // v3 layout: prior 384 + total_recovered_from_wrapper[8] (H-1 re-review fix:
+    // resolve-gate counter tracking ONLY wrapper-CPI-recovered flushed insurance,
+    // distinct from total_returned) = 392.
     // If this changes, existing on-chain data becomes unreadable.
     // NEVER change this without a version bump + (if not fresh-start) a migration.
-    // v16 sync is a fresh-start cutover, so no v1 (352-byte) pools exist.
-    assert_eq!(STAKE_POOL_SIZE, 384);
-    assert_eq!(std::mem::size_of::<StakePool>(), 384);
+    // Pools are being re-seeded fresh for v3, so no migration path is needed.
+    assert_eq!(STAKE_POOL_SIZE, 392);
+    assert_eq!(std::mem::size_of::<StakePool>(), 392);
 }
 
 #[test]
@@ -154,4 +156,9 @@ fn test_stake_pool_field_offsets() {
     // v2: pending_admin[32] inserted at 288, pushing _reserved to 320.
     assert_eq!(&pool.pending_admin as *const _ as usize - base, 288);
     assert_eq!(&pool._reserved as *const _ as usize - base, 320);
+    // v3: total_recovered_from_wrapper[8] appended at 384 (after _reserved[64]).
+    assert_eq!(
+        &pool.total_recovered_from_wrapper as *const _ as usize - base,
+        384
+    );
 }

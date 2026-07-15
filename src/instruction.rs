@@ -338,14 +338,23 @@ pub enum StakeInstruction {
     /// admin can no longer call the wrapper's ResolveMarket directly once InitPool
     /// has rotated marketauth to the pool PDA.
     ///
-    /// H-1 GATE (security review): rejects with
-    /// `StakeError::InsuranceLossOutstanding` if `pool.total_flushed >
-    /// pool.total_returned` — defense-in-depth mirroring the same gate on
-    /// `AdminResolveMarket`. `AdminResolveMarket` is the instruction that actually
-    /// flips the wrapper to a non-Live mode and is the primary enforcement point;
-    /// this local bookkeeping flag is gated identically so a market can never be
-    /// marked resolved here while insurance recovery is still outstanding,
-    /// regardless of call order.
+    /// H-1 GATE (security review, RE-REVIEW FIX): rejects with
+    /// `StakeError::InsuranceLossOutstanding` unless `pool.total_flushed <=
+    /// pool.total_recovered_from_wrapper` — defense-in-depth mirroring the same
+    /// gate on `AdminResolveMarket`. `AdminResolveMarket` is the instruction that
+    /// actually flips the wrapper to a non-Live mode and is the primary
+    /// enforcement point; this local bookkeeping flag is gated identically so a
+    /// market can never be marked resolved here while insurance recovery is
+    /// still outstanding, regardless of call order.
+    ///
+    /// Gated on `total_recovered_from_wrapper`, NOT `total_returned`: the latter
+    /// is also incremented by `ReturnInsurance` (tag 10 — admin's own wallet
+    /// tokens transferred into pool.vault, no wrapper CPI) and the #161
+    /// last-junior-exit phantom write-off (zero token movement). Either of those
+    /// would let an admin satisfy a `total_returned`-based gate WITHOUT actually
+    /// recovering the flushed capital from the wrapper, permanently stranding it
+    /// post-resolution. `total_recovered_from_wrapper` is incremented ONLY by
+    /// `RecoverFlushedInsurance` (tag 23), after its wrapper CPI succeeds.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
@@ -369,21 +378,32 @@ pub enum StakeInstruction {
     /// `cpi::cpi_resolve_market` for the byte-for-byte wire proof against the
     /// deployed wrapper.
     ///
-    /// H-1 GATE (security review): rejects with
-    /// `StakeError::InsuranceLossOutstanding` if `pool.total_flushed >
-    /// pool.total_returned` (there is flushed-but-unrecovered insurance
-    /// outstanding). `RecoverFlushedInsurance` (tag 23) CPIs wrapper tag 57
-    /// `WithdrawInsuranceAsset`, which itself requires LIVE mode (mode == 0);
-    /// once THIS instruction's CPI flips the wrapper to mode != 0, tag 57
-    /// permanently rejects with EngineLockActive and any outstanding flush would
-    /// be stranded with no recovery path (this program does NOT implement the
-    /// wrapper's terminal-mode `WithdrawInsurance`, tag 41, as a fallback CPI).
-    /// Gating resolution on full recovery-first is the CHOSEN fix over adding a
-    /// second CPI wire: it is strictly less new attack surface (no new wrapper
-    /// wire to byte-match, no new account shape to validate) and makes the
-    /// stranding scenario structurally unreachable rather than merely
-    /// recoverable. The admin must call `RecoverFlushedInsurance` until
-    /// `total_flushed <= total_returned` before this instruction will succeed.
+    /// H-1 GATE (security review, RE-REVIEW FIX): rejects with
+    /// `StakeError::InsuranceLossOutstanding` unless `pool.total_flushed <=
+    /// pool.total_recovered_from_wrapper` (every flushed token has actually been
+    /// recovered FROM THE WRAPPER). `RecoverFlushedInsurance` (tag 23) CPIs
+    /// wrapper tag 57 `WithdrawInsuranceAsset`, which itself requires LIVE mode
+    /// (mode == 0); once THIS instruction's CPI flips the wrapper to mode != 0,
+    /// tag 57 permanently rejects with EngineLockActive and any outstanding
+    /// flush would be stranded with no recovery path (this program does NOT
+    /// implement the wrapper's terminal-mode `WithdrawInsurance`, tag 41, as a
+    /// fallback CPI). Gating resolution on full recovery-first is the CHOSEN fix
+    /// over adding a second CPI wire: it is strictly less new attack surface (no
+    /// new wrapper wire to byte-match, no new account shape to validate) and
+    /// makes the stranding scenario structurally unreachable rather than merely
+    /// recoverable.
+    ///
+    /// The gate is deliberately measured against `total_recovered_from_wrapper`,
+    /// a counter incremented ONLY inside `process_recover_flushed_insurance`
+    /// after its wrapper CPI succeeds — NOT `total_returned`, which is also
+    /// incremented by `ReturnInsurance` (tag 10 — admin's own wallet tokens
+    /// transferred into pool.vault, zero wrapper CPI) and the #161
+    /// last-junior-exit phantom write-off (zero token movement). A
+    /// `total_returned`-based gate let an admin satisfy H-1 via `ReturnInsurance`
+    /// alone while flushed capital stayed stranded in the wrapper — this is the
+    /// bug the re-review found and this counter fixes. The admin must call
+    /// `RecoverFlushedInsurance` until `total_flushed <=
+    /// total_recovered_from_wrapper` before this instruction will succeed.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin)
