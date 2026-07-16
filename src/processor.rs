@@ -482,7 +482,7 @@ fn process_init_pool(
             solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
         #[cfg(feature = "devnet")]
         const PERCOLATOR_DEVNET: Pubkey =
-            solana_program::pubkey!("FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD");
+            solana_program::pubkey!("DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj");
         let is_valid = *percolator_program.key == PERCOLATOR_MAINNET;
         #[cfg(feature = "devnet")]
         let is_valid = is_valid || *percolator_program.key == PERCOLATOR_DEVNET;
