@@ -966,12 +966,20 @@ fn test_154_deposit_cap_enforced_on_principal_not_fees() {
     let tpv_after = pool.total_pool_value().unwrap() + deposit;
     assert!(tpv_after > pool.deposit_cap, "old fee-inclusive basis would have rejected it");
 
-    // mode-0: principal_tvl == total_pool_value (no fee term).
+    // 2026-07-19: mode-0 insurance pools now accrue fees too, so principal_tvl()
+    // (which never has a fee term, for either mode) diverges from total_pool_value()
+    // once a mode-0 pool has earned fees — same fee-appreciation-vs-principal split
+    // #154 established for mode-1. The deposit cap must stay principal-basis here too.
     let mut m0 = new_pool();
     m0.pool_mode = 0;
     m0.total_deposited = 500_000;
-    m0.total_fees_earned = 99_999; // ignored for mode-0
-    assert_eq!(m0.principal_tvl(), m0.total_pool_value(), "mode-0: principal_tvl == tpv");
+    m0.total_fees_earned = 99_999; // now counted in tpv, still excluded from principal_tvl
+    assert_eq!(m0.principal_tvl(), Some(500_000), "mode-0: principal_tvl excludes fees");
+    assert_eq!(
+        m0.total_pool_value(),
+        Some(599_999),
+        "mode-0: tpv now includes accrued fees"
+    );
 }
 
 #[test]

@@ -554,19 +554,23 @@ fn test_accrue_fees_increases_pool_value() {
     );
 }
 
-/// Fees do NOT count toward pool value in insurance LP mode (pool_mode=0).
+/// 2026-07-19: mode-0 insurance pools now accrue fees too (the insurance leg
+/// of the wrapper's trade-fee split), so fees count toward pool value in
+/// BOTH modes. Previously this was mode-1-only (see git history for the old
+/// "test_fees_not_counted_in_insurance_mode" assertion) — mode 0 stakers had
+/// a downside leg (FlushToInsurance) with no upside leg at all.
 #[test]
-fn test_fees_not_counted_in_insurance_mode() {
+fn test_fees_counted_in_insurance_mode() {
     let mut pool = initialized_pool();
-    pool.pool_mode = 0; // insurance LP mode (legacy)
+    pool.pool_mode = 0; // insurance LP mode
     pool.total_deposited = 10_000_000;
     pool.total_lp_supply = 10_000_000;
     pool.total_fees_earned = 500_000;
 
     let value = pool.total_pool_value().unwrap();
     assert_eq!(
-        value, 10_000_000,
-        "Fees must NOT count toward pool value in insurance LP mode"
+        value, 10_500_000,
+        "Fees must count toward pool value in insurance LP mode too"
     );
 }
 

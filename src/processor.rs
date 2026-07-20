@@ -2582,9 +2582,19 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
         }
     }
 
-    // Only trading LP mode pools accrue fees
-    if pool.pool_mode != 1 {
-        msg!("AccrueFees: pool is not in trading LP mode");
+    // Modes 0 (insurance pool) and 1 (trading LP) both accrue fees.
+    //
+    // 2026-07-19 fee-collection design: mode-0 pools are the market's
+    // loss-absorbing backstop and are now compensated with the insurance leg
+    // of the trade-fee split, pushed in by the wrapper's
+    // WithdrawInsuranceReserveToStake (tag 87). Restricting accrual to mode 1
+    // left mode-0 stakers with a downside leg (FlushToInsurance) and NO upside
+    // leg at all. Every real client calls InitPool (mode 0), so gating on
+    // mode 1 made fee accrual unreachable in practice.
+    //
+    // Flush/return semantics and the junior/senior tranche math are UNCHANGED.
+    if pool.pool_mode > 1 {
+        msg!("AccrueFees: unknown pool mode");
         return Err(StakeError::InvalidPoolMode.into());
     }
 

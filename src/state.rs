@@ -594,11 +594,12 @@ impl StakePool {
         // insolvency guard while eliminating the false-underflow brick.
         //
         // PERC-272: accrued trading fees count toward a mode-1 trading pool's value.
-        let fees = if self.pool_mode == 1 {
-            self.total_fees_earned as i128
-        } else {
-            0
-        };
+        // PERC-272: accrued trading fees count toward a trading pool's value.
+        // 2026-07-19: mode-0 insurance pools also accrue fees (the insurance
+        // leg of the trade-fee split), so their fees count too. Both modes now
+        // include total_fees_earned; the field is 0 for any pool that has never
+        // accrued, so this is a no-op for existing mode-0 pools.
+        let fees = self.total_fees_earned as i128;
         // #161: subtract realized (forfeited) junior loss — dead value the exit booking
         // added to `total_returned` but that is NOT claimable by senior. Normally 0.
         let value = self.total_deposited as i128 - self.total_withdrawn as i128
