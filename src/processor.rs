@@ -800,14 +800,15 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     validate_lp_recipient_account(user_lp_ata, &pool.lp_mint, user.key)?;
 
     // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
-    // deposit (mode-1), so LP cannot be minted at the stale pre-accrual price and capture
-    // fees earned before the depositor joined. Reads the vault balance before the
-    // user->vault transfer below; pool.vault == vault.key was verified above.
+    // deposit (modes 0 and 1 as of the 2026-07-19 fee-collection design's THIRD EDIT), so
+    // LP cannot be minted at the stale pre-accrual price and capture fees earned before the
+    // depositor joined. Reads the vault balance before the user->vault transfer below;
+    // pool.vault == vault.key was verified above.
     //
-    // (Rebase note #160: KEEP main's pre_accrue_mode1 (PR #148 refactor) — #160's branch
-    // predated it and carried the old inline accrue block, which is dropped here. The
-    // senior recovery-snipe gate below is added AFTER it.)
-    pre_accrue_mode1(pool, vault)?;
+    // (Rebase note #160: KEEP main's pre_accrue_fee_modes (PR #148 refactor, renamed
+    // 2026-07-19) — #160's branch predated it and carried the old inline accrue block,
+    // which is dropped here. The senior recovery-snipe gate below is added AFTER it.)
+    pre_accrue_fee_modes(pool, vault)?;
 
     // Insurance recovery-snipe gate (SENIOR path) — completes #150 for the senior tranche
     // (see #159). When tranches are on and a flushed loss has spilled PAST junior into
@@ -1210,10 +1211,11 @@ fn process_withdraw(
     }
 
     // #136: crystallize pending trading-fee surplus into share price BEFORE pricing this
-    // withdrawal (mode-1), so the withdrawer realizes their fair share of earned fees (and
-    // the HWM floor sees true TVL) rather than redeeming at the stale pre-accrual price.
-    // Reads the vault balance before the vault->user transfer below; pool.vault verified above.
-    pre_accrue_mode1(pool, vault)?;
+    // withdrawal (modes 0 and 1 as of the 2026-07-19 fee-collection design's THIRD EDIT), so
+    // the withdrawer realizes their fair share of earned fees (and the HWM floor sees true
+    // TVL) rather than redeeming at the stale pre-accrual price. Reads the vault balance
+    // before the vault->user transfer below; pool.vault verified above.
+    pre_accrue_fee_modes(pool, vault)?;
 
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
@@ -1553,7 +1555,7 @@ fn process_flush_to_insurance(
     // error and prevents tokens of the wrong type from being routed to the insurance vault.
     // SPL token account layout: bytes [0..32] = mint.
     // N-5: verify SPL Token ownership before reading raw bytes — mirrors the guard in
-    // pre_accrue_mode1 (line ~1902) and process_return_insurance (line ~2618). Without
+    // pre_accrue_fee_modes (line ~1902) and process_return_insurance (line ~2618). Without
     // this, a crafted non-token account with forged bytes at [0..32] passes the mint check.
     if *wrapper_vault.owner != crate::spl_token::id() {
         msg!("Error: wrapper_vault is not owned by the SPL Token program");
@@ -2432,16 +2434,33 @@ fn apply_minimum_liquidity_lock(
 
 /// #136 pre-accrue guard — shared by EVERY path that prices against pool balances
 /// (`process_deposit`, `process_withdraw`, `process_deposit_junior`). Crystallizes any
-/// pending mode-1 trading-fee surplus into share price BEFORE pricing, so LP cannot be
+/// pending fee-accruing-mode surplus into share price BEFORE pricing, so LP cannot be
 /// minted/redeemed at the stale pre-accrual price and capture fees earned before joining.
 ///
 /// MUST be called AFTER the caller has verified `pool.vault == vault.key` and BEFORE the
 /// caller's user<->vault transfer, so the balance read reflects only the fee surplus and
-/// NOT the operation's own collateral. Mode-0 is a no-op; idempotent (a second call folds
-/// zero surplus). Centralized so the pricing paths cannot drift — this guard was previously
+/// NOT the operation's own collateral. Idempotent (a second call folds zero surplus).
+/// Centralized so the pricing paths cannot drift — this guard was previously
 /// inline-duplicated and the junior path was the one that was missed (see #146).
-fn pre_accrue_mode1(pool: &mut state::StakePool, vault: &AccountInfo) -> ProgramResult {
-    if pool.pool_mode == 1 {
+///
+/// 2026-07-19 (plan amendment, THIRD EDIT): widened from `pool_mode == 1` to
+/// `pool_mode <= 1` and renamed from `pre_accrue_mode1` — the old name became a
+/// lie the moment mode-0 pools started accruing fees (Task 11's first two
+/// edits: `total_pool_value()` now folds in `total_fees_earned` for mode 0
+/// too, and the permissionless `AccrueFees` instruction accepts
+/// `pool_mode <= 1`). Leaving THIS guard mode-1-only armed a front-running/
+/// dilution vector: with a pending, un-accrued vault surplus sitting in a
+/// mode-0 pool, a depositor could mint LP priced against the STALE
+/// `total_pool_value()` (this guard was a no-op for them), then
+/// permissionlessly self-call `AccrueFees` in the same transaction — the
+/// surplus then distributes pro-rata over the POST-deposit LP supply,
+/// handing the depositor a slice of fees that accrued before they staked
+/// and diluting every pre-existing LP holder. Widening the predicate closes
+/// it: deposit/withdraw pricing for mode 0 now crystallizes the surplus
+/// FIRST, exactly as it always has for mode 1. The body's logic below is
+/// UNCHANGED — only the predicate and this function's name differ.
+fn pre_accrue_fee_modes(pool: &mut state::StakePool, vault: &AccountInfo) -> ProgramResult {
+    if pool.pool_mode <= 1 {
         if *vault.owner != crate::spl_token::id() {
             return Err(ProgramError::IllegalOwner);
         }
@@ -2918,17 +2937,18 @@ fn process_deposit_junior(
     validate_lp_recipient_account(user_lp_ata, &pool.lp_mint, user.key)?;
 
     // #136 (junior): crystallize pending trading-fee surplus into share price BEFORE pricing
-    // this junior deposit (mode-1). process_deposit (senior/global) and process_withdraw
-    // already do this; the junior path was the one that was missed — without it a junior
+    // this junior deposit (modes 0 and 1 as of the 2026-07-19 fee-collection design's THIRD
+    // EDIT). process_deposit (senior/global) and process_withdraw already do this; the
+    // junior path was the one that was missed — without it a junior
     // depositor mints at the stale pre-fee price and a later permissionless AccrueFees hands
     // them a (multiplier-weighted) share of fees earned before they joined (see #146). Reads
     // the vault balance before the user->vault transfer below; pool.vault + token program
     // were verified above.
     //
-    // (Rebase note #150: this pre_accrue_mode1 call is from PR #148 — KEEP it. The
-    // InsuranceLossOutstanding gate below is added AFTER it, not in place of it, so #148's
-    // JIT fee-snipe guard stays intact.)
-    pre_accrue_mode1(pool, vault)?;
+    // (Rebase note #150: this pre_accrue_fee_modes call (renamed 2026-07-19) is from
+    // PR #148 — KEEP it. The InsuranceLossOutstanding gate below is added AFTER it, not in
+    // place of it, so #148's JIT fee-snipe guard stays intact.)
+    pre_accrue_fee_modes(pool, vault)?;
 
     // Pause junior deposits while an insurance loss is OUTSTANDING (flushed but not
     // yet returned). effective_junior_balance() applies the pool's CURRENT net_loss
