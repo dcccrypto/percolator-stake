@@ -44,6 +44,45 @@
 //!                              fix; required because marketauth is now the pool
 //!                              PDA. Gated on total_flushed <= total_returned (H-1).
 
+// ════════════════════════════════════════════════════════════════════════════
+// CANONICAL PROGRAM ID
+//
+// The percolator wrapper's tag-87 handler (`WithdrawInsuranceReserveToStake`)
+// used to recover "the stake program" from `*pool_ai.owner` — an account the
+// CALLER supplies — and then validate everything else self-consistently
+// against that attacker-chosen program. It now PINS the id instead, and this
+// `declare_id!` is the authoritative source that pin mirrors.
+//
+// Until this existed the wrapper explicitly refused to hardcode an id because
+// "percolator-stake has no `declare_id!`, and the candidate ids in this tree
+// disagree with each other". This resolves that: the id below is the DEPLOYED
+// devnet program, lineage-verified 2026-07-20 by rebuild-and-compare
+// (`--features devnet`, at the canonical repo path — the build is
+// path-dependent via the root crate's `-C metadata` hash, and building
+// elsewhere yields a function-reordered ELF that will NOT match):
+//
+//   on-chain `solana program dump` (ELF true length, 222624 bytes)
+//     sha256 0e9c25725615c3f11fa4db0cd53a3220f8d7d6f24fc4631bc9975c8970fd6e9c
+//   local build of percolator-stake@1e08d35 --features devnet
+//     sha256 0e9c25725615c3f11fa4db0cd53a3220f8d7d6f24fc4631bc9975c8970fd6e9c
+//                                                                      MATCH
+//
+// CLUSTER GATING (mirrors `processor.rs`'s `PERCOLATOR_MAINNET` /
+// `PERCOLATOR_DEVNET` allowlist, and its N-3 rationale): the devnet id is
+// gated behind the `devnet` feature so it CANNOT compile into a mainnet
+// binary. If the devnet deploy keypair is ever compromised, an attacker who
+// deploys a malicious binary at that address on mainnet must not thereby
+// inherit any authority a mainnet build grants.
+//
+// There is deliberately NO mainnet id: v17 percolator-stake has no mainnet
+// deployment. Do not invent one. A non-devnet build simply has no `ID`, and
+// the wrapper's tag 87 fails closed on that build (see
+// `PercolatorError::StakeProgramNotPinned`). When a mainnet deploy happens,
+// add the mainnet arm here and in the wrapper's `STAKE_PROGRAM_ID` together.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(feature = "devnet")]
+solana_program::declare_id!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
+
 pub mod cpi;
 pub mod error;
 pub mod instruction;

@@ -162,6 +162,48 @@ pub struct StakePool {
 /// Size of StakePool in bytes
 pub const STAKE_POOL_SIZE: usize = core::mem::size_of::<StakePool>();
 
+// ════════════════════════════════════════════════════════════════════════════
+// CROSS-PROGRAM LAYOUT CONTRACT (O5) — DO NOT WEAKEN
+//
+// The percolator wrapper does NOT link this crate. Its tag-87 handler
+// (`WithdrawInsuranceReserveToStake`) validates a `StakePool` account by
+// reading RAW BYTES at hardcoded offsets, mirrored in
+// `percolator-prog/src/v16_program.rs` as `constants::STAKE_POOL_OFF_*`.
+// Those offsets decide WHERE TAG-87 FUNDS LAND.
+//
+// A total-size assertion alone (`test_stake_pool_size`, 392) is NOT enough:
+// ANY same-size field reorder — swapping `vault` with `collateral_mint`, say —
+// keeps the size at 392, passes every test in BOTH repos, and silently
+// redirects the insurance-reserve payout to an attacker-chosen token account.
+//
+// These const assertions pin every offset the wrapper depends on, so a reorder
+// is a COMPILE ERROR in the program that owns the struct — the only place that
+// can notice. If one of these fires, you must update
+// `percolator-prog/src/v16_program.rs::constants::STAKE_POOL_OFF_*` in the
+// SAME change, and re-deploy both programs together.
+// ════════════════════════════════════════════════════════════════════════════
+const _: () = {
+    use core::mem::offset_of;
+    // STAKE_POOL_OFF_IS_INITIALIZED — pool must be live (byte == 1).
+    assert!(offset_of!(StakePool, is_initialized) == 0);
+    // STAKE_POOL_OFF_SLAB — the wrapper market this pool is bound to.
+    assert!(offset_of!(StakePool, slab) == 8);
+    // STAKE_POOL_OFF_VAULT — THE DESTINATION. The only legal tag-87 sink.
+    assert!(offset_of!(StakePool, vault) == 136);
+    // STAKE_POOL_OFF_PERCOLATOR_PROGRAM — the wrapper this pool CPIs.
+    assert!(offset_of!(StakePool, percolator_program) == 224);
+    // STAKE_POOL_OFF_MODE — 0 = insurance-LP, the only mode owed this leg.
+    assert!(offset_of!(StakePool, pool_mode) == 280);
+    // The wrapper reads the discriminator at 320 and the version at 328. Both
+    // are carved out of `_reserved` (see the PERC-303 layout map below):
+    // `_reserved[0..8]` = discriminator, `_reserved[8]` = version. Pin the base
+    // AND the derived offsets so recarving `_reserved` also trips this.
+    assert!(offset_of!(StakePool, _reserved) == 320);
+    assert!(offset_of!(StakePool, _reserved) + 8 == 328);
+    // Total size — the wrapper's `STAKE_POOL_LEN` minimum-length gate.
+    assert!(STAKE_POOL_SIZE == 392);
+};
+
 /// Per-depositor state — tracks cooldown and LP amount per user.
 /// PDA seeds: [b"stake_deposit", pool_pda, user_pubkey]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
