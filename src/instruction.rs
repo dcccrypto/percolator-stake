@@ -15,13 +15,59 @@ use solana_program::program_error::ProgramError;
 /// LONGER call any marketauth-gated wrapper instruction directly — a PDA cannot
 /// sign a top-level transaction, so every such call must be proxied through a CPI
 /// this program issues via `invoke_signed`. `ResolveMarket` (wrapper tag 19,
-/// proxied here as `AdminResolveMarket`, tag 24) is the first — and, as of this
-/// fix, the ONLY currently-implemented — marketauth-gated proxy; without it every
-/// InitPool market would be permanently stuck in Live mode. Other wrapper admin
-/// operations gated on marketauth (not the per-asset `insurance_authority` /
-/// `insurance_operator` / `asset_admin` fields, which already have their own
-/// Bind/Rotate/Burn proxies below) remain UNREACHABLE through this program and
-/// must be proxied here before they can ever be exercised on an InitPool market.
+/// proxied here as `AdminResolveMarket`, tag 24) was the first such proxy;
+/// without it every InitPool market would be permanently stuck in Live mode.
+///
+/// TASK 13 (2026-07-20): the proxy set is extended from one to five. Two
+/// DISTINCT signers are involved and they must never be conflated:
+///
+/// GROUP A — gated on `cfg.marketauth`, signed by the POOL PDA
+/// (`[b"stake_pool", slab, bump]`), exactly as `AdminResolveMarket` does:
+///
+/// ```text
+///   tag 25 AdminUpdateFeeSplit               -> wrapper tag 86
+///   tag 26 AdminUpdateMaintenanceFeePerSlot  -> wrapper tag 88
+/// ```
+///
+/// GROUP B — gated on the per-asset `insurance_authority`, signed by the
+/// VAULT_AUTH PDA (`[b"vault_auth", pool, bump]`) that
+/// `BindInsuranceAuthority` (tag 19) installs into asset 0's profile:
+///
+/// ```text
+///   tag 27 AdminUpdateBackingFeePolicy  -> wrapper tag 51
+///   tag 28 AdminUpdateTradeFeePolicy    -> wrapper tag 55
+/// ```
+///
+/// Group B RESTORES a capability rather than transferring one: before the bind,
+/// tags 51/55 are callable directly by whoever holds `insurance_authority` (the
+/// creator, by default). After the bind, the holder is a PDA and only these
+/// proxies can reach them. Tag 51 is the setter for `backing_trade_fee_bps` —
+/// without this proxy, a staked market's backing fee can never be set by
+/// anyone, which is the mechanical root of the "fee split is unachievable"
+/// finding.
+///
+/// NOT PROXYABLE — wrapper tag 69 `RestartAssetOracle`. It is gated on the
+/// per-asset `asset_admin`, and this program moves `asset_admin` to exactly one
+/// place: `[0u8; 32]`, via `BurnAssetAdmin` (tag 21). It is never rotated to
+/// `vault_auth` or to the pool PDA. The wrapper's gate is
+/// `expect_live_authority`, whose `live_authority_matches` helper requires
+/// `expected != [0u8; 32]` — so a burned `asset_admin` matches NO signer, PDA
+/// or otherwise. The two reachable states are therefore:
+///
+/// - pre-burn: `asset_admin == pool.admin`, a real keypair — the admin calls
+///   wrapper tag 69 DIRECTLY and needs no proxy;
+/// - post-burn: `asset_admin == [0;32]` — tag 69 is unreachable by every key in
+///   existence, and a proxy signing as `vault_auth` would fail `Unauthorized`
+///   just like anything else.
+///
+/// A tag-69 proxy would be dead code in both states, so none is shipped.
+/// Restoring tag 69 post-burn would require a wrapper change (out of scope) —
+/// see `tests/task13_cpi_proxies_e2e.rs::tag69_restart_asset_oracle_is_not_proxyable`,
+/// which pins this reasoning against the real wrapper bytecode.
+///
+/// Remaining marketauth-gated wrapper operations not listed above are still
+/// UNREACHABLE through this program and must be proxied here before they can
+/// ever be exercised on an InitPool market.
 #[derive(Debug)]
 pub enum StakeInstruction {
     /// 0: Initialize a stake pool for a slab (market).
@@ -411,6 +457,115 @@ pub enum StakeInstruction {
     ///   2. `[writable]` Slab / market account (wrapper-owned)
     ///   3. `[]` Percolator program
     AdminResolveMarket,
+
+    /// 25: AdminUpdateFeeSplit — CPI proxy for the wrapper's UpdateFeeSplit
+    /// (tag 86). GROUP A: gated on `cfg.marketauth`, so the POOL PDA signs.
+    ///
+    /// `InitPool` rotates `cfg.marketauth` to the pool PDA, so after staking no
+    /// key can call wrapper tag 86 directly and the market's fee split is
+    /// frozen at whatever it was at stake time. This proxy restores it.
+    ///
+    /// VALIDATION LIVES IN THE WRAPPER. `policy_v16::validate_fee_split`
+    /// enforces sum-to-total and the creator/LP/insurance floors inside
+    /// `handle_update_fee_split`. This program deliberately does NOT re-check
+    /// those bounds: a second copy would drift from the first the moment either
+    /// side is retuned. Bad shares fail at the wrapper with its own error.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket`.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+    ///   2. `[writable]` Slab / market account (wrapper-owned)
+    ///   3. `[]` Percolator program
+    AdminUpdateFeeSplit {
+        creator_share_bps: u16,
+        lp_share_bps: u16,
+        insurance_share_bps: u16,
+    },
+
+    /// 26: AdminUpdateMaintenanceFeePerSlot — CPI proxy for the wrapper's
+    /// UpdateMaintenanceFeePerSlot (tag 88). GROUP A: marketauth-gated, so the
+    /// POOL PDA signs.
+    ///
+    /// PAYLOAD IS `u128`, NOT `u64`. The wrapper decodes this argument with
+    /// `read_u128` (v16_program.rs tag-88 arm) and stores it in
+    /// `WrapperConfigV16::maintenance_fee_per_slot`, which is a `u128`. Sending
+    /// 8 bytes would leave `rest` non-empty on the wrapper side and be rejected
+    /// with `InvalidInstructionData`, and would also make all but the bottom
+    /// ~1.8e19 of the valid `MAX_PROTOCOL_FEE_ABS` (1e36) range unreachable.
+    ///
+    /// The wrapper enforces `maintenance_fee_per_slot <= MAX_PROTOCOL_FEE_ABS`;
+    /// this program does not duplicate that bound.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket`.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+    ///   2. `[writable]` Slab / market account (wrapper-owned)
+    ///   3. `[]` Percolator program
+    AdminUpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: u128 },
+
+    /// 27: AdminUpdateBackingFeePolicy — CPI proxy for the wrapper's
+    /// UpdateBackingFeePolicy (tag 51). GROUP B: gated on the per-asset
+    /// `insurance_authority`, so the VAULT_AUTH PDA signs — NOT the pool PDA.
+    ///
+    /// THIS IS THE TAG THAT SETS `backing_trade_fee_bps`. `BindInsuranceAuthority`
+    /// (tag 19) hands asset 0's `insurance_authority` to `vault_auth`; from that
+    /// moment nobody can set the backing fee on this market without this proxy,
+    /// which is precisely why the protocol fee split was unachievable on a
+    /// staked market.
+    ///
+    /// ORDERING: before the bind, `insurance_authority` is still the creator's
+    /// key and tag 51 is reachable directly; this proxy would then fail at the
+    /// wrapper's `expect_live_authority` because `vault_auth` is not yet the
+    /// authority. So the bind is a precondition, and this proxy restores a
+    /// capability rather than transferring one.
+    ///
+    /// `domain` selects the backing bucket; the wrapper maps `asset_index =
+    /// domain / 2` and gates on THAT asset's `insurance_authority`. This program
+    /// does not restrict `domain`: `BindInsuranceAuthority` binds asset 0 only,
+    /// so any domain >= 2 resolves to an asset whose `insurance_authority` is
+    /// not `vault_auth` and the wrapper fails closed on its own. Constraining it
+    /// here would duplicate wrapper logic and break if multi-asset binding is
+    /// added later.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket` and
+    /// `BindInsuranceAuthority` (which is likewise `pool.admin`-gated).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (used to derive + verify vault_auth; not a signer)
+    ///   2. `[]` Vault authority PDA (the insurance_authority; signs via invoke_signed)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    AdminUpdateBackingFeePolicy {
+        domain: u16,
+        fee_bps: u16,
+        insurance_share_bps: u16,
+    },
+
+    /// 28: AdminUpdateTradeFeePolicy — CPI proxy for the wrapper's
+    /// UpdateTradeFeePolicy (tag 55). GROUP B: gated on ASSET 0's
+    /// `insurance_authority` (the wrapper hardcodes asset 0 here), so the
+    /// VAULT_AUTH PDA signs — NOT the pool PDA.
+    ///
+    /// Same bind-ordering property as tag 27: reachable directly before
+    /// `BindInsuranceAuthority`, only through this proxy afterward.
+    ///
+    /// The wrapper enforces `trade_fee_base_bps <= max_trading_fee_bps` and
+    /// `<= MAX_DYNAMIC_TRADE_FEE_BPS`; this program does not duplicate those.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket`.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (used to derive + verify vault_auth; not a signer)
+    ///   2. `[]` Vault authority PDA (the insurance_authority; signs via invoke_signed)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    AdminUpdateTradeFeePolicy { trade_fee_base_bps: u64 },
 }
 
 impl StakeInstruction {
@@ -656,6 +811,87 @@ impl StakeInstruction {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 Ok(Self::AdminResolveMarket)
+            }
+            // 25: AdminUpdateFeeSplit — three u16 shares = 6 bytes.
+            25 => {
+                if rest.len() != 6 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let creator_share_bps = u16::from_le_bytes(
+                    rest[0..2]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let lp_share_bps = u16::from_le_bytes(
+                    rest[2..4]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let insurance_share_bps = u16::from_le_bytes(
+                    rest[4..6]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateFeeSplit {
+                    creator_share_bps,
+                    lp_share_bps,
+                    insurance_share_bps,
+                })
+            }
+            // 26: AdminUpdateMaintenanceFeePerSlot — u128 = 16 bytes, NOT 8.
+            // The wrapper decodes tag 88 with `read_u128`; a u64 payload would
+            // leave trailing bytes unconsumed and be rejected there.
+            26 => {
+                if rest.len() != 16 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let maintenance_fee_per_slot = u128::from_le_bytes(
+                    rest[0..16]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateMaintenanceFeePerSlot {
+                    maintenance_fee_per_slot,
+                })
+            }
+            // 27: AdminUpdateBackingFeePolicy — three u16 = 6 bytes.
+            27 => {
+                if rest.len() != 6 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let domain = u16::from_le_bytes(
+                    rest[0..2]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let fee_bps = u16::from_le_bytes(
+                    rest[2..4]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let insurance_share_bps = u16::from_le_bytes(
+                    rest[4..6]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateBackingFeePolicy {
+                    domain,
+                    fee_bps,
+                    insurance_share_bps,
+                })
+            }
+            // 28: AdminUpdateTradeFeePolicy — u64 = 8 bytes (wrapper tag 55
+            // decodes with `read_u64`, unlike tag 88's `read_u128`).
+            28 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let trade_fee_base_bps = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateTradeFeePolicy { trade_fee_base_bps })
             }
             _ => Err(ProgramError::InvalidInstructionData),
         }

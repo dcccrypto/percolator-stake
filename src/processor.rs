@@ -436,6 +436,38 @@ pub fn process(
         StakeInstruction::AdminResolveMarket => {
             process_admin_resolve_market(program_id, accounts)
         }
+        StakeInstruction::AdminUpdateFeeSplit {
+            creator_share_bps,
+            lp_share_bps,
+            insurance_share_bps,
+        } => process_admin_update_fee_split(
+            program_id,
+            accounts,
+            creator_share_bps,
+            lp_share_bps,
+            insurance_share_bps,
+        ),
+        StakeInstruction::AdminUpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot,
+        } => process_admin_update_maintenance_fee_per_slot(
+            program_id,
+            accounts,
+            maintenance_fee_per_slot,
+        ),
+        StakeInstruction::AdminUpdateBackingFeePolicy {
+            domain,
+            fee_bps,
+            insurance_share_bps,
+        } => process_admin_update_backing_fee_policy(
+            program_id,
+            accounts,
+            domain,
+            fee_bps,
+            insurance_share_bps,
+        ),
+        StakeInstruction::AdminUpdateTradeFeePolicy { trade_fee_base_bps } => {
+            process_admin_update_trade_fee_policy(program_id, accounts, trade_fee_base_bps)
+        }
     }
 }
 
@@ -3617,6 +3649,264 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
     cpi::cpi_resolve_market(percolator_program, pool_pda, slab, pool_seeds)?;
 
     msg!("AdminResolveMarket: wrapper market resolved via pool PDA CPI");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 25/26/27/28: TASK 13 CPI proxies for setters stranded by staking
+// ═══════════════════════════════════════════════════════════════
+// `InitPool` rotates `cfg.marketauth` to the pool PDA and
+// `BindInsuranceAuthority` rotates asset 0's `insurance_authority` to the
+// `vault_auth` PDA. Both are irreversible in practice, and a PDA cannot sign a
+// top-level transaction, so the wrapper setters gated on those two fields
+// become reachable ONLY through the proxies below.
+//
+// The two helpers here exist so the four proxies cannot drift from each other
+// or from `process_admin_resolve_market`, whose checks they reproduce exactly
+// (minus that instruction's resolve-specific H-1 insurance gate, which has no
+// meaning for a fee-policy setter — nothing is stranded by changing a fee).
+//
+// AUTHORITY MODEL — `pool.admin` for all four, matching `AdminResolveMarket`
+// and `BindInsuranceAuthority`. This is the conservative choice and it is worth
+// being explicit about what it does and does not mean: tags 51/55 set the fee
+// policy that determines LP and staker revenue, so "the pool admin decides" and
+// "the stakers decide" are genuinely different answers. This program has no
+// governance primitive of any kind — no vote, no quorum, no timelock — so
+// "stakers decide" is not implementable here without inventing one, which is
+// out of scope for a proxy task and would be a far larger change than the
+// proxies themselves. `pool.admin` also strictly matches the pre-stake status
+// quo: before `InitPool`/`BindInsuranceAuthority`, the market creator held
+// `marketauth` and `insurance_authority` and could set these same values
+// unilaterally. These proxies restore that capability to the same human; they
+// do not grant anyone new power over the market. See the report for the
+// residual concern (an admin can retune the LP/insurance split under staked
+// depositors, which a timelock would mitigate).
+
+/// Shared validation for the GROUP A (marketauth-gated) proxies: reproduces
+/// `process_admin_resolve_market`'s account and pool checks and returns the
+/// pool bump needed to sign as `cfg.marketauth`.
+fn validate_group_a_proxy(
+    program_id: &Pubkey,
+    admin: &AccountInfo,
+    pool_pda: &AccountInfo,
+    slab: &AccountInfo,
+    percolator_program: &AccountInfo,
+) -> Result<u8, ProgramError> {
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+
+    let pool_data = pool_pda.try_borrow_data()?;
+    let pool = pool_from_data(&pool_data[..])?;
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    // Admin-gated: only the pool admin may drive the pool's market authority.
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+    // Bind the CPI to the pool's OWN recorded market and wrapper program, so a
+    // caller cannot point a validly-signed proxy at a different market.
+    if pool.slab != slab.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool.percolator_program != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+    Ok(pool.bump)
+}
+
+/// Shared validation for the GROUP B (`insurance_authority`-gated) proxies.
+/// Same pool checks as Group A, but additionally derives and verifies the
+/// `vault_auth` PDA — the authority `BindInsuranceAuthority` installs — and
+/// returns ITS bump. Mirrors `process_bind_insurance_authority` /
+/// `process_recover_flushed_insurance`, the existing vault_auth-signing paths.
+fn validate_group_b_proxy(
+    program_id: &Pubkey,
+    admin: &AccountInfo,
+    pool_pda: &AccountInfo,
+    vault_auth: &AccountInfo,
+    slab: &AccountInfo,
+    percolator_program: &AccountInfo,
+) -> Result<u8, ProgramError> {
+    // Identical pool/admin/slab/program checks as Group A; the returned pool
+    // bump is not used here because this group signs as vault_auth instead.
+    let _pool_bump =
+        validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
+
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+    Ok(vault_auth_bump)
+}
+
+// ── 25: AdminUpdateFeeSplit -> wrapper tag 86 (marketauth, pool PDA signs) ──
+//
+// Accounts:
+//   0. `[signer]` Admin (must equal pool.admin)
+//   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+//   2. `[writable]` Slab / market account (wrapper-owned)
+//   3. `[]` Percolator program
+//
+// Share validation is the WRAPPER's (`policy_v16::validate_fee_split`), not
+// duplicated here — see the cpi.rs doc block.
+fn process_admin_update_fee_split(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    creator_share_bps: u16,
+    lp_share_bps: u16,
+    insurance_share_bps: u16,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    let pool_bump =
+        validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
+
+    let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
+    cpi::cpi_update_fee_split(
+        percolator_program,
+        pool_pda,
+        slab,
+        creator_share_bps,
+        lp_share_bps,
+        insurance_share_bps,
+        pool_seeds,
+    )?;
+
+    msg!("AdminUpdateFeeSplit: wrapper fee split updated via pool PDA CPI");
+    Ok(())
+}
+
+// ── 26: AdminUpdateMaintenanceFeePerSlot -> wrapper tag 88 (marketauth) ──
+//
+// Accounts: identical to tag 25 above.
+//
+// The payload is a u128 (see instruction.rs / cpi.rs); the wrapper enforces
+// `<= MAX_PROTOCOL_FEE_ABS`, not duplicated here.
+fn process_admin_update_maintenance_fee_per_slot(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    maintenance_fee_per_slot: u128,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    let pool_bump =
+        validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
+
+    let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
+    cpi::cpi_update_maintenance_fee_per_slot(
+        percolator_program,
+        pool_pda,
+        slab,
+        maintenance_fee_per_slot,
+        pool_seeds,
+    )?;
+
+    msg!("AdminUpdateMaintenanceFeePerSlot: wrapper maintenance fee updated via pool PDA CPI");
+    Ok(())
+}
+
+// ── 27: AdminUpdateBackingFeePolicy -> wrapper tag 51 (insurance_authority) ──
+//
+// THE FEE-SPLIT UNBLOCKER: wrapper tag 51 is the setter for
+// `backing_trade_fee_bps`. Once `BindInsuranceAuthority` moves asset 0's
+// `insurance_authority` to `vault_auth`, this CPI is the only way to reach it.
+//
+// Accounts:
+//   0. `[signer]` Admin (must equal pool.admin)
+//   1. `[]` Pool PDA (used to derive + verify vault_auth; NOT a signer here)
+//   2. `[]` Vault authority PDA (the insurance_authority; signs via invoke_signed)
+//   3. `[writable]` Slab / market account (wrapper-owned)
+//   4. `[]` Percolator program
+fn process_admin_update_backing_fee_policy(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    domain: u16,
+    fee_bps: u16,
+    insurance_share_bps: u16,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    let vault_auth_bump = validate_group_b_proxy(
+        program_id,
+        admin,
+        pool_pda,
+        vault_auth,
+        slab,
+        percolator_program,
+    )?;
+
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    cpi::cpi_update_backing_fee_policy(
+        percolator_program,
+        vault_auth,
+        slab,
+        domain,
+        fee_bps,
+        insurance_share_bps,
+        vault_auth_seeds,
+    )?;
+
+    msg!("AdminUpdateBackingFeePolicy: wrapper backing fee policy updated via vault_auth PDA CPI");
+    Ok(())
+}
+
+// ── 28: AdminUpdateTradeFeePolicy -> wrapper tag 55 (insurance_authority) ──
+//
+// Accounts: identical to tag 27 above.
+fn process_admin_update_trade_fee_policy(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    trade_fee_base_bps: u64,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    let vault_auth_bump = validate_group_b_proxy(
+        program_id,
+        admin,
+        pool_pda,
+        vault_auth,
+        slab,
+        percolator_program,
+    )?;
+
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    cpi::cpi_update_trade_fee_policy(
+        percolator_program,
+        vault_auth,
+        slab,
+        trade_fee_base_bps,
+        vault_auth_seeds,
+    )?;
+
+    msg!("AdminUpdateTradeFeePolicy: wrapper trade fee policy updated via vault_auth PDA CPI");
     Ok(())
 }
 

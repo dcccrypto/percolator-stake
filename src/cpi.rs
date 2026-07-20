@@ -596,6 +596,172 @@ pub fn cpi_resolve_market<'a>(
     invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
 }
 
+// ═══════════════════════════════════════════════════════════════
+// TASK 13 — CPI proxies for wrapper setters stranded by staking
+// ═══════════════════════════════════════════════════════════════
+// All four helpers below are byte-for-byte mirrors of `cpi_resolve_market`
+// above: a `[signer(readonly), market(writable)]` account pair and an
+// `invoke_signed` with the signing PDA's own seeds. That shape is not a guess —
+// every one of the four wrapper handlers opens with the identical
+//     let authority = account(accounts, 0)?;
+//     let market_ai = account(accounts, 1)?;
+//     expect_signer(authority)?;
+//     expect_writable(market_ai)?;
+//     expect_owner(market_ai, program_id)?;
+// prologue, then gates `authority.key` against a stored authority field with
+// `expect_live_authority`. Only WHICH field differs, and that is what splits
+// these into two groups with two different signers:
+//
+//   GROUP A (signer = POOL PDA, seeds [b"stake_pool", slab, bump]):
+//     tag 86 UpdateFeeSplit              -> gated on cfg.marketauth
+//     tag 88 UpdateMaintenanceFeePerSlot -> gated on cfg.marketauth
+//   GROUP B (signer = VAULT_AUTH PDA, seeds [b"vault_auth", pool, bump]):
+//     tag 51 UpdateBackingFeePolicy -> gated on per-asset insurance_authority
+//     tag 55 UpdateTradeFeePolicy   -> gated on asset 0's insurance_authority
+//
+// Passing a Group A signer to a Group B tag (or vice versa) does not silently
+// misbehave — the wrapper's `expect_live_authority` rejects with Unauthorized,
+// because the two PDAs are distinct keys. The split is enforced by the wrapper,
+// and mirrored here so the intent is legible at the call site.
+//
+// ARGUMENT VALIDATION IS DELIBERATELY ABSENT from all four. The wrapper owns it
+// (`validate_fee_split` for tag 86, `MAX_PROTOCOL_FEE_ABS` for 88,
+// `max_trading_fee_bps`/`MAX_DYNAMIC_TRADE_FEE_BPS` for 51/55). Duplicating any
+// of those bounds here would create two copies that drift apart on the first
+// retune.
+
+/// Wrapper tag 86 `UpdateFeeSplit`. Marketauth-gated — the POOL PDA signs.
+/// Wire: tag(1) + creator(2) + lp(2) + insurance(2) = 7 bytes, all u16 LE,
+/// matching `86 => Self::UpdateFeeSplit { read_u16, read_u16, read_u16 }`.
+const TAG_UPDATE_FEE_SPLIT: u8 = 86;
+
+pub fn cpi_update_fee_split<'a>(
+    percolator_program: &AccountInfo<'a>,
+    pool_pda: &AccountInfo<'a>, // marketauth (rotated by InitPool); signs via invoke_signed
+    slab: &AccountInfo<'a>,     // market, writable
+    creator_share_bps: u16,
+    lp_share_bps: u16,
+    insurance_share_bps: u16,
+    pool_seeds: &[&[u8]], // pool PDA seeds: [b"stake_pool", slab, bump]
+) -> ProgramResult {
+    let mut data = Vec::with_capacity(7);
+    data.push(TAG_UPDATE_FEE_SPLIT);
+    data.extend_from_slice(&creator_share_bps.to_le_bytes());
+    data.extend_from_slice(&lp_share_bps.to_le_bytes());
+    data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*pool_pda.key, true), // admin == marketauth, signer
+            AccountMeta::new(*slab.key, false),             // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
+}
+
+/// Wrapper tag 88 `UpdateMaintenanceFeePerSlot`. Marketauth-gated — the POOL
+/// PDA signs. Wire: tag(1) + maintenance_fee_per_slot(16, u128 LE) = 17 bytes.
+///
+/// THE PAYLOAD IS 16 BYTES, NOT 8. The wrapper's decoder arm is
+/// `88 => Self::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot:
+/// read_u128(&mut rest)? }`, and it rejects the instruction outright if `rest`
+/// is non-empty afterward. An 8-byte u64 payload therefore fails closed with
+/// `InvalidInstructionData` rather than writing a truncated value.
+const TAG_UPDATE_MAINTENANCE_FEE_PER_SLOT: u8 = 88;
+
+pub fn cpi_update_maintenance_fee_per_slot<'a>(
+    percolator_program: &AccountInfo<'a>,
+    pool_pda: &AccountInfo<'a>, // marketauth; signs via invoke_signed
+    slab: &AccountInfo<'a>,     // market, writable
+    maintenance_fee_per_slot: u128,
+    pool_seeds: &[&[u8]], // pool PDA seeds: [b"stake_pool", slab, bump]
+) -> ProgramResult {
+    let mut data = Vec::with_capacity(17);
+    data.push(TAG_UPDATE_MAINTENANCE_FEE_PER_SLOT);
+    data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes()); // 16 bytes
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*pool_pda.key, true), // admin == marketauth, signer
+            AccountMeta::new(*slab.key, false),             // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
+}
+
+/// Wrapper tag 51 `UpdateBackingFeePolicy`. Gated on the per-asset
+/// `insurance_authority` — the VAULT_AUTH PDA signs, NOT the pool PDA.
+/// Wire: tag(1) + domain(2) + fee_bps(2) + insurance_share_bps(2) = 7 bytes,
+/// all u16 LE, matching `51 => Self::UpdateBackingFeePolicy { read_u16 x3 }`.
+///
+/// This is the setter for `backing_trade_fee_bps`. On a market where
+/// `BindInsuranceAuthority` has run, this CPI is the ONLY way to reach it.
+const TAG_UPDATE_BACKING_FEE_POLICY: u8 = 51;
+
+pub fn cpi_update_backing_fee_policy<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>, // insurance_authority (bound by tag 19); signs via invoke_signed
+    slab: &AccountInfo<'a>,       // market, writable
+    domain: u16,
+    fee_bps: u16,
+    insurance_share_bps: u16,
+    vault_auth_seeds: &[&[u8]], // vault_auth PDA seeds: [b"vault_auth", pool, bump]
+) -> ProgramResult {
+    let mut data = Vec::with_capacity(7);
+    data.push(TAG_UPDATE_BACKING_FEE_POLICY);
+    data.extend_from_slice(&domain.to_le_bytes());
+    data.extend_from_slice(&fee_bps.to_le_bytes());
+    data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true), // insurance_authority, signer
+            AccountMeta::new(*slab.key, false),               // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(&ix, &[vault_auth.clone(), slab.clone()], &[vault_auth_seeds])
+}
+
+/// Wrapper tag 55 `UpdateTradeFeePolicy`. Gated on ASSET 0's
+/// `insurance_authority` (the wrapper hardcodes asset 0 for this tag) — the
+/// VAULT_AUTH PDA signs. Wire: tag(1) + trade_fee_base_bps(8, u64 LE) = 9
+/// bytes, matching `55 => Self::UpdateTradeFeePolicy { read_u64 }`.
+///
+/// Note the asymmetry with tag 88 above: this argument really is a `u64`.
+const TAG_UPDATE_TRADE_FEE_POLICY: u8 = 55;
+
+pub fn cpi_update_trade_fee_policy<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>, // asset-0 insurance_authority; signs via invoke_signed
+    slab: &AccountInfo<'a>,       // market, writable
+    trade_fee_base_bps: u64,
+    vault_auth_seeds: &[&[u8]], // vault_auth PDA seeds: [b"vault_auth", pool, bump]
+) -> ProgramResult {
+    let mut data = Vec::with_capacity(9);
+    data.push(TAG_UPDATE_TRADE_FEE_POLICY);
+    data.extend_from_slice(&trade_fee_base_bps.to_le_bytes()); // 8 bytes
+
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true), // insurance_authority, signer
+            AccountMeta::new(*slab.key, false),               // market, writable
+        ],
+        data,
+    };
+
+    invoke_signed(&ix, &[vault_auth.clone(), slab.clone()], &[vault_auth_seeds])
+}
+
 #[cfg(test)]
 mod tag_tests {
     use super::*;

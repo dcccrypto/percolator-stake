@@ -43,6 +43,23 @@
 //!  24  - AdminResolveMarket:  CPI proxy for wrapper ResolveMarket (tag 19) — C-1
 //!                              fix; required because marketauth is now the pool
 //!                              PDA. Gated on total_flushed <= total_returned (H-1).
+//!  25  - AdminUpdateFeeSplit: CPI proxy for wrapper UpdateFeeSplit (tag 86).
+//!                              GROUP A — marketauth-gated, POOL PDA signs.
+//!  26  - AdminUpdateMaintenanceFeePerSlot: CPI proxy for wrapper tag 88.
+//!                              GROUP A — marketauth-gated, POOL PDA signs.
+//!                              Payload is u128 (wrapper decodes read_u128).
+//!  27  - AdminUpdateBackingFeePolicy: CPI proxy for wrapper tag 51.
+//!                              GROUP B — insurance_authority-gated, VAULT_AUTH
+//!                              PDA signs. Sets backing_trade_fee_bps; without
+//!                              it a staked market's backing fee is unsettable.
+//!  28  - AdminUpdateTradeFeePolicy: CPI proxy for wrapper tag 55.
+//!                              GROUP B — insurance_authority-gated, VAULT_AUTH
+//!                              PDA signs.
+//!
+//! Wrapper tag 69 (RestartAssetOracle) is deliberately NOT proxied: it is gated
+//! on asset_admin, which this program only ever burns to [0;32] (tag 21), and
+//! the wrapper's expect_live_authority rejects a zero authority for every
+//! signer. See instruction.rs's module doc for the full argument.
 
 // ════════════════════════════════════════════════════════════════════════════
 // CANONICAL PROGRAM ID
