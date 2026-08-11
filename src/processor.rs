@@ -405,9 +405,7 @@ pub fn process(
         StakeInstruction::RotateInsuranceAuthority => {
             process_rotate_insurance_authority(program_id, accounts)
         }
-        StakeInstruction::BurnAssetAdmin => {
-            process_burn_asset_admin(program_id, accounts)
-        }
+        StakeInstruction::BurnAssetAdmin => process_burn_asset_admin(program_id, accounts),
         StakeInstruction::RotateInsuranceOperator => {
             process_rotate_insurance_operator(program_id, accounts)
         }
@@ -433,9 +431,7 @@ pub fn process(
             process_deposit_junior(program_id, accounts, amount)
         }
         StakeInstruction::SetMarketResolved => process_set_market_resolved(program_id, accounts),
-        StakeInstruction::AdminResolveMarket => {
-            process_admin_resolve_market(program_id, accounts)
-        }
+        StakeInstruction::AdminResolveMarket => process_admin_resolve_market(program_id, accounts),
         StakeInstruction::AdminUpdateFeeSplit {
             creator_share_bps,
             lp_share_bps,
@@ -913,7 +909,8 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         crate::math::calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
             .ok_or(StakeError::Overflow)?
     } else {
-        pool.calc_lp_for_deposit(amount).ok_or(StakeError::Overflow)?
+        pool.calc_lp_for_deposit(amount)
+            .ok_or(StakeError::Overflow)?
     };
     // S-4: reject a zero-share mint EXPLICITLY (dedicated variant, not the generic
     // ZeroAmount). A nonzero deposit that rounds to 0 LP at the current share price
@@ -2166,10 +2163,7 @@ fn process_bind_insurance_authority(
 ///   2. `[]` Vault authority PDA (placeholder new_authority slot — not checked for burn)
 ///   3. `[writable]` Slab / market account (wrapper-owned)
 ///   4. `[]` Percolator program
-fn process_burn_asset_admin(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-) -> ProgramResult {
+fn process_burn_asset_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let admin = next_account_info(accounts_iter)?;
     let pool_pda = next_account_info(accounts_iter)?;
@@ -3002,8 +2996,10 @@ fn process_deposit_junior(
     // above for why no auto-write-off (admin burned / resolved blocks deposits / time-box unfair).
     // M-3: use PHYSICAL net loss — exclude realized_junior_loss (bookkeeping-only settlement)
     // so paper-settled forfeitures from exited juniors don't prematurely reopen the gate.
-    let physical_net_loss = pool.total_flushed
-        .saturating_sub(pool.total_returned.saturating_sub(pool.realized_junior_loss()));
+    let physical_net_loss = pool.total_flushed.saturating_sub(
+        pool.total_returned
+            .saturating_sub(pool.realized_junior_loss()),
+    );
     if physical_net_loss > 0 {
         msg!(
             "DepositJunior paused: physical insurance loss outstanding (flushed {} > returned {} - realized_loss {})",
@@ -3230,7 +3226,7 @@ fn process_return_insurance(
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
     validate_account_writable(pool_pda)?; // N-4: return_insurance mutates pool.total_returned
-    validate_account_writable(vault)?;    // N-4: vault is the SPL transfer destination
+    validate_account_writable(vault)?; // N-4: vault is the SPL transfer destination
 
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
@@ -3363,11 +3359,11 @@ fn process_recover_flushed_insurance(
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
 
-    let _caller = next_account_info(accounts_iter)?;       // 0: permissionless caller
-    let pool_pda = next_account_info(accounts_iter)?;      // 1: pool PDA (writable)
-    let vault = next_account_info(accounts_iter)?;         // 2: pool vault (dest; writable)
-    let vault_auth = next_account_info(accounts_iter)?;    // 3: vault_auth PDA (signer for CPI)
-    let market = next_account_info(accounts_iter)?;        // 4: wrapper market (writable)
+    let _caller = next_account_info(accounts_iter)?; // 0: permissionless caller
+    let pool_pda = next_account_info(accounts_iter)?; // 1: pool PDA (writable)
+    let vault = next_account_info(accounts_iter)?; // 2: pool vault (dest; writable)
+    let vault_auth = next_account_info(accounts_iter)?; // 3: vault_auth PDA (signer for CPI)
+    let market = next_account_info(accounts_iter)?; // 4: wrapper market (writable)
     let wrapper_vault = next_account_info(accounts_iter)?; // 5: wrapper insurance vault (source)
     let wrapper_vault_auth = next_account_info(accounts_iter)?; // 6: wrapper vault auth
     let token_program = next_account_info(accounts_iter)?; // 7: token program
@@ -3742,8 +3738,7 @@ fn validate_group_b_proxy(
 ) -> Result<u8, ProgramError> {
     // Identical pool/admin/slab/program checks as Group A; the returned pool
     // bump is not used here because this group signs as vault_auth instead.
-    let _pool_bump =
-        validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
+    let _pool_bump = validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
 
     let (expected_vault_auth, vault_auth_bump) =
         state::derive_vault_authority(program_id, pool_pda.key);
@@ -3776,8 +3771,7 @@ fn process_admin_update_fee_split(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let pool_bump =
-        validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
+    let pool_bump = validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
 
     let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
     cpi::cpi_update_fee_split(
@@ -3811,8 +3805,7 @@ fn process_admin_update_maintenance_fee_per_slot(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let pool_bump =
-        validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
+    let pool_bump = validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
 
     let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
     cpi::cpi_update_maintenance_fee_per_slot(
@@ -3925,7 +3918,10 @@ mod tests {
     fn n7_genesis_deposit_above_minimum_liquidity_carves_out_dead_shares() {
         let lp_to_mint = state::MINIMUM_LIQUIDITY + 1;
         let mint_amount = apply_minimum_liquidity_lock(0, lp_to_mint).unwrap();
-        assert_eq!(mint_amount, 1, "genesis mint = lp_to_mint - MINIMUM_LIQUIDITY");
+        assert_eq!(
+            mint_amount, 1,
+            "genesis mint = lp_to_mint - MINIMUM_LIQUIDITY"
+        );
     }
 
     #[test]
@@ -4065,113 +4061,113 @@ mod tests {
     }
 
     #[test]
-fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
-    use solana_program::account_info::AccountInfo;
+    fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
+        use solana_program::account_info::AccountInfo;
 
-    let program_id = Pubkey::new_from_array([9u8; 32]);
-    let admin_key = Pubkey::new_from_array([1u8; 32]);
-    let pool_key = Pubkey::new_from_array([2u8; 32]);
-    let admin_ata_key = Pubkey::new_from_array([3u8; 32]);
-    let vault_key = Pubkey::new_from_array([4u8; 32]);
-    let collateral_mint = Pubkey::new_from_array([5u8; 32]);
-    let other_owner = Pubkey::new_from_array([6u8; 32]);
+        let program_id = Pubkey::new_from_array([9u8; 32]);
+        let admin_key = Pubkey::new_from_array([1u8; 32]);
+        let pool_key = Pubkey::new_from_array([2u8; 32]);
+        let admin_ata_key = Pubkey::new_from_array([3u8; 32]);
+        let vault_key = Pubkey::new_from_array([4u8; 32]);
+        let collateral_mint = Pubkey::new_from_array([5u8; 32]);
+        let other_owner = Pubkey::new_from_array([6u8; 32]);
 
-    let mut pool = StakePool::zeroed();
-    pool.is_initialized = 1;
-    pool.admin = admin_key.to_bytes();
-    pool.vault = vault_key.to_bytes();
-    pool.collateral_mint = collateral_mint.to_bytes();
-    pool.total_flushed = 100;
-    pool.total_returned = 0;
-    pool.set_discriminator();
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.admin = admin_key.to_bytes();
+        pool.vault = vault_key.to_bytes();
+        pool.collateral_mint = collateral_mint.to_bytes();
+        pool.total_flushed = 100;
+        pool.total_returned = 0;
+        pool.set_discriminator();
 
-    let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
+        let mut pool_data = bytemuck::bytes_of(&pool).to_vec();
 
-    let mut admin_ata_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
-    admin_ata_data[0..32].copy_from_slice(collateral_mint.as_ref());
-    admin_ata_data[32..64].copy_from_slice(other_owner.as_ref());
+        let mut admin_ata_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
+        admin_ata_data[0..32].copy_from_slice(collateral_mint.as_ref());
+        admin_ata_data[32..64].copy_from_slice(other_owner.as_ref());
 
-    let mut vault_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
+        let mut vault_data = vec![0u8; crate::spl_token::state::ACCOUNT_LEN];
 
-    let mut admin_lamports = 0u64;
-    let mut pool_lamports = 0u64;
-    let mut admin_ata_lamports = 0u64;
-    let mut vault_lamports = 0u64;
-    let mut token_program_lamports = 0u64;
+        let mut admin_lamports = 0u64;
+        let mut pool_lamports = 0u64;
+        let mut admin_ata_lamports = 0u64;
+        let mut vault_lamports = 0u64;
+        let mut token_program_lamports = 0u64;
 
-    let mut admin_data = vec![];
-    let mut token_program_data = vec![];
+        let mut admin_data = vec![];
+        let mut token_program_data = vec![];
 
-    let token_program_id = crate::spl_token::id();
-    let system_program_id = solana_program::system_program::id();
+        let token_program_id = crate::spl_token::id();
+        let system_program_id = solana_program::system_program::id();
 
-    let accounts = vec![
-        AccountInfo::new(
-            &admin_key,
-            true,
-            false,
-            &mut admin_lamports,
-            &mut admin_data,
-            &system_program_id,
-            false,
-            0,
-        ),
-        AccountInfo::new(
-            &pool_key,
-            false,
-            true,
-            &mut pool_lamports,
-            &mut pool_data,
+        let accounts = vec![
+            AccountInfo::new(
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &pool_key,
+                false,
+                true,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &admin_ata_key,
+                false,
+                true,
+                &mut admin_ata_lamports,
+                &mut admin_ata_data,
+                &token_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &vault_key,
+                false,
+                true,
+                &mut vault_lamports,
+                &mut vault_data,
+                &token_program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &token_program_id,
+                false,
+                false,
+                &mut token_program_lamports,
+                &mut token_program_data,
+                &system_program_id,
+                false,
+                0,
+            ),
+        ];
+
+        let result = process(
             &program_id,
-            false,
-            0,
-        ),
-        AccountInfo::new(
-            &admin_ata_key,
-            false,
-            true,
-            &mut admin_ata_lamports,
-            &mut admin_ata_data,
-            &token_program_id,
-            false,
-            0,
-        ),
-        AccountInfo::new(
-            &vault_key,
-            false,
-            true,
-            &mut vault_lamports,
-            &mut vault_data,
-            &token_program_id,
-            false,
-            0,
-        ),
-        AccountInfo::new(
-            &token_program_id,
-            false,
-            false,
-            &mut token_program_lamports,
-            &mut token_program_data,
-            &system_program_id,
-            false,
-            0,
-        ),
-    ];
+            &accounts,
+            &[
+                10u8, // ReturnInsurance
+                10, 0, 0, 0, 0, 0, 0, 0, // amount = 10u64 little-endian
+            ],
+        );
 
-    let result = process(
-        &program_id,
-        &accounts,
-        &[
-            10u8, // ReturnInsurance
-            10, 0, 0, 0, 0, 0, 0, 0, // amount = 10u64 little-endian
-        ],
-    );
-
-    assert!(
+        assert!(
         matches!(result, Err(e) if e == StakeError::Unauthorized.into()),
         "ReturnInsurance should reject admin_ata when the token account owner is not the admin signer"
     );
-}
+    }
 
     // #185 regression: disabling HWM must NOT clobber the stored floor, so that
     // a later re-enable preserves the operator's original floor. The disable
@@ -4297,10 +4293,19 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
     #[test]
     fn test_pool_helpers_reject_undersized_without_panic() {
-        assert!(STAKE_DEPOSIT_SIZE < STAKE_POOL_SIZE, "deposit-sized buffer is a valid undersize");
+        assert!(
+            STAKE_DEPOSIT_SIZE < STAKE_POOL_SIZE,
+            "deposit-sized buffer is a valid undersize"
+        );
         let mut deposit_sized = vec![0u8; STAKE_DEPOSIT_SIZE];
-        assert!(pool_from_data_mut(&mut deposit_sized).is_err(), "mut: undersized -> Err, not panic");
-        assert!(pool_from_data(&deposit_sized).is_err(), "ro: undersized -> Err, not panic");
+        assert!(
+            pool_from_data_mut(&mut deposit_sized).is_err(),
+            "mut: undersized -> Err, not panic"
+        );
+        assert!(
+            pool_from_data(&deposit_sized).is_err(),
+            "ro: undersized -> Err, not panic"
+        );
 
         let mut one_short = vec![0u8; STAKE_POOL_SIZE - 1];
         assert!(pool_from_data_mut(&mut one_short).is_err());
@@ -4316,10 +4321,16 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
         let mut buf = vec![0u8; STAKE_POOL_SIZE];
         let pool = pool_from_data_mut(&mut buf).expect("exact-size buffer must be Ok (mut)");
         assert_eq!(pool.is_initialized, 0);
-        assert!(pool_from_data(&buf).is_ok(), "exact-size buffer must be Ok (ro)");
+        assert!(
+            pool_from_data(&buf).is_ok(),
+            "exact-size buffer must be Ok (ro)"
+        );
         // Real Solana accounts may carry trailing bytes; only the first SIZE are read.
         let mut over = vec![0u8; STAKE_POOL_SIZE + 32];
-        assert!(pool_from_data_mut(&mut over).is_ok(), "oversized buffer must be Ok");
+        assert!(
+            pool_from_data_mut(&mut over).is_ok(),
+            "oversized buffer must be Ok"
+        );
     }
 
     #[test]
@@ -4416,12 +4427,24 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
         let accounts = vec![
             AccountInfo::new(
-                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
-                &system_program_id, false, 0,
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &pool_key, false, true, &mut pool_lamports, &mut pool_data,
-                &program_id, false, 0,
+                &pool_key,
+                false,
+                true,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
             ),
         ];
 
@@ -4462,12 +4485,24 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
         let accounts = vec![
             AccountInfo::new(
-                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
-                &system_program_id, false, 0,
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &pool_key, false, true, &mut pool_lamports, &mut pool_data,
-                &program_id, false, 0,
+                &pool_key,
+                false,
+                true,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
             ),
         ];
 
@@ -4479,7 +4514,10 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
         );
 
         let pool_after = pool_from_data(&pool_data).unwrap();
-        assert!(!pool_after.market_resolved(), "pool must NOT be marked resolved");
+        assert!(
+            !pool_after.market_resolved(),
+            "pool must NOT be marked resolved"
+        );
     }
 
     /// H-1: SetMarketResolved succeeds once total_recovered_from_wrapper has
@@ -4507,17 +4545,32 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
         let accounts = vec![
             AccountInfo::new(
-                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
-                &system_program_id, false, 0,
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &pool_key, false, true, &mut pool_lamports, &mut pool_data,
-                &program_id, false, 0,
+                &pool_key,
+                false,
+                true,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
             ),
         ];
 
         let result = process(&program_id, &accounts, &[18u8]);
-        assert!(result.is_ok(), "SetMarketResolved must succeed once fully recovered from wrapper: {result:?}");
+        assert!(
+            result.is_ok(),
+            "SetMarketResolved must succeed once fully recovered from wrapper: {result:?}"
+        );
 
         let pool_after = pool_from_data(&pool_data).unwrap();
         assert!(pool_after.market_resolved(), "pool must be marked resolved");
@@ -4555,20 +4608,44 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
         let accounts = vec![
             AccountInfo::new(
-                &attacker_key, true, false, &mut attacker_lamports, &mut attacker_data,
-                &system_program_id, false, 0,
+                &attacker_key,
+                true,
+                false,
+                &mut attacker_lamports,
+                &mut attacker_data,
+                &system_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &pool_key, false, false, &mut pool_lamports, &mut pool_data,
-                &program_id, false, 0,
+                &pool_key,
+                false,
+                false,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &slab_key, false, true, &mut slab_lamports, &mut slab_data,
-                &percolator_program_id, false, 0,
+                &slab_key,
+                false,
+                true,
+                &mut slab_lamports,
+                &mut slab_data,
+                &percolator_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &percolator_program_id, false, false, &mut program_lamports, &mut program_data,
-                &system_program_id, true, 0,
+                &percolator_program_id,
+                false,
+                false,
+                &mut program_lamports,
+                &mut program_data,
+                &system_program_id,
+                true,
+                0,
             ),
         ];
 
@@ -4614,20 +4691,44 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
         let accounts = vec![
             AccountInfo::new(
-                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
-                &system_program_id, false, 0,
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &pool_key, false, false, &mut pool_lamports, &mut pool_data,
-                &program_id, false, 0,
+                &pool_key,
+                false,
+                false,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &slab_key, false, true, &mut slab_lamports, &mut slab_data,
-                &percolator_program_id, false, 0,
+                &slab_key,
+                false,
+                true,
+                &mut slab_lamports,
+                &mut slab_data,
+                &percolator_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &percolator_program_id, false, false, &mut program_lamports, &mut program_data,
-                &system_program_id, true, 0,
+                &percolator_program_id,
+                false,
+                false,
+                &mut program_lamports,
+                &mut program_data,
+                &system_program_id,
+                true,
+                0,
             ),
         ];
 
@@ -4670,20 +4771,44 @@ fn return_insurance_rejects_admin_ata_not_owned_by_admin() {
 
         let accounts = vec![
             AccountInfo::new(
-                &admin_key, true, false, &mut admin_lamports, &mut admin_data,
-                &system_program_id, false, 0,
+                &admin_key,
+                true,
+                false,
+                &mut admin_lamports,
+                &mut admin_data,
+                &system_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &pool_key, false, false, &mut pool_lamports, &mut pool_data,
-                &program_id, false, 0,
+                &pool_key,
+                false,
+                false,
+                &mut pool_lamports,
+                &mut pool_data,
+                &program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &wrong_slab_key, false, true, &mut slab_lamports, &mut slab_data,
-                &percolator_program_id, false, 0,
+                &wrong_slab_key,
+                false,
+                true,
+                &mut slab_lamports,
+                &mut slab_data,
+                &percolator_program_id,
+                false,
+                0,
             ),
             AccountInfo::new(
-                &percolator_program_id, false, false, &mut program_lamports, &mut program_data,
-                &system_program_id, true, 0,
+                &percolator_program_id,
+                false,
+                false,
+                &mut program_lamports,
+                &mut program_data,
+                &system_program_id,
+                true,
+                0,
             ),
         ];
 
