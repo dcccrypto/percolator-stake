@@ -6,15 +6,41 @@
 use percolator_stake::state::{StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
 
 #[test]
-fn test_stake_pool_size_is_392() {
-    // v3 layout: prior 384 + total_recovered_from_wrapper[8] (H-1 re-review fix:
-    // resolve-gate counter tracking ONLY wrapper-CPI-recovered flushed insurance,
-    // distinct from total_returned) = 392.
+fn test_stake_pool_size_is_408() {
+    // v4 layout: v3's 392 + pending_cooldown_slots[8] + cooldown_proposed_at_slot[8]
+    // = 408. The two #242 timelock values were promoted out of `_reserved[10..26]`,
+    // where they aliased the PERC-313 HWM fields on the deployed v3 program.
     // If this changes, existing on-chain data becomes unreadable.
     // NEVER change this without a version bump + (if not fresh-start) a migration.
-    // Pools are being re-seeded fresh for v3, so no migration path is needed.
-    assert_eq!(STAKE_POOL_SIZE, 392);
-    assert_eq!(std::mem::size_of::<StakePool>(), 392);
+    // Pools are being re-seeded fresh for v4, so no migration path is needed.
+    assert_eq!(STAKE_POOL_SIZE, 408);
+    assert_eq!(std::mem::size_of::<StakePool>(), 408);
+}
+
+/// The new fields must be APPENDED after `total_recovered_from_wrapper` (offset 384),
+/// not inserted. Cross-program readers (percolator-surfpool's `stake_nft.rs` mirror)
+/// bounds-check with `len >= 392` and read every field at a fixed offset <= 384, so
+/// appending keeps them working unchanged; inserting would silently corrupt them.
+#[test]
+fn test_v3_prefix_offsets_are_unchanged() {
+    let pool: StakePool = bytemuck::Zeroable::zeroed();
+    let base = &pool as *const _ as usize;
+    let off = |p: *const u64| p as usize - base;
+    assert_eq!(
+        off(&pool.total_recovered_from_wrapper),
+        384,
+        "v3 field must stay at 384"
+    );
+    assert_eq!(
+        off(&pool.pending_cooldown_slots),
+        392,
+        "must be appended, not inserted"
+    );
+    assert_eq!(
+        off(&pool.cooldown_proposed_at_slot),
+        400,
+        "must be appended, not inserted"
+    );
 }
 
 #[test]
