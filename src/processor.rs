@@ -3253,13 +3253,14 @@ fn process_return_insurance(
         return Err(ProgramError::IllegalOwner);
     }
 
-    // M-1: physical outstanding = (flushed - returned) + realized_junior_loss.
-    // realized_junior_loss was added to total_returned as a bookkeeping settlement
-    // when the last junior exited; adding it back exposes the full physical recovery
-    // capacity that senior holders are entitled to.
-    let outstanding = pool.total_flushed
-        .saturating_sub(pool.total_returned)
-        .saturating_add(pool.realized_junior_loss());
+    // ReturnInsurance moves the ADMIN'S OWN wallet tokens into `pool.vault` — it is
+    // not a wrapper recovery, so it is capped by the unsettled accounting shortfall
+    // rather than by `wrapper_recoverable()`. It deliberately does NOT add
+    // `realized_junior_loss` back: that portion was settled at the last junior's exit
+    // (`total_returned += L`, no token movement), so re-adding it let `total_returned`
+    // climb past `total_flushed` without bound, inflating `total_pool_value()` and
+    // handing the forfeited junior capital to senior.
+    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
     if amount > outstanding {
         msg!(
             "ReturnInsurance: amount {} exceeds outstanding insurance {}",
@@ -3400,14 +3401,18 @@ fn process_recover_flushed_insurance(
         return Err(StakeError::ZeroAmount.into());
     }
 
-    // CAP: amount must not exceed outstanding = total_flushed - total_returned.
-    // Use saturating_sub so a stale / already-fully-returned pool yields 0 outstanding.
-    let outstanding = pool.total_flushed.saturating_sub(pool.total_returned);
+    // CAP: measured against `total_recovered_from_wrapper`, NOT `total_returned`.
+    // `total_returned` is also bumped by ReturnInsurance and by the #161 phantom
+    // settlement, neither of which moves tokens out of the wrapper — using it here
+    // both understated the capacity (bricking the H-1 resolve gate below) and, in
+    // the #262 variant, never converged. See `StakePool::wrapper_recoverable`.
+    let outstanding = pool.wrapper_recoverable();
     if outstanding == 0 {
         msg!(
-            "RecoverFlushedInsurance: nothing to recover (total_flushed={} total_returned={})",
+            "RecoverFlushedInsurance: nothing to recover (total_flushed={} realized_junior_loss={} total_recovered_from_wrapper={})",
             pool.total_flushed,
-            pool.total_returned
+            pool.realized_junior_loss(),
+            pool.total_recovered_from_wrapper
         );
         return Err(StakeError::InsufficientVaultBalance.into());
     }
@@ -3545,13 +3550,13 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
     // `total_recovered_from_wrapper` is bumped ONLY inside
     // `process_recover_flushed_insurance`, after its wrapper CPI succeeds, so it
     // is the correct measure of "insurance actually pulled back from the wrapper".
-    if pool.total_flushed > pool.total_recovered_from_wrapper {
-        let outstanding = pool
-            .total_flushed
-            .saturating_sub(pool.total_recovered_from_wrapper);
+    // Threshold is net of `realized_junior_loss`: that capital was forfeited by the
+    // exiting junior and is deliberately left in the wrapper, so requiring it back
+    // would make this gate unsatisfiable. See `StakePool::wrapper_recoverable`.
+    if !pool.wrapper_fully_recovered() {
         msg!(
             "SetMarketResolved: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
-            outstanding
+            pool.wrapper_recoverable()
         );
         return Err(StakeError::InsuranceLossOutstanding.into());
     }
@@ -3632,13 +3637,12 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
         // total_returned-based gate WITHOUT recovering the flushed capital from
         // the wrapper. `total_recovered_from_wrapper` is bumped only inside
         // `process_recover_flushed_insurance`, after its wrapper CPI succeeds.
-        if pool.total_flushed > pool.total_recovered_from_wrapper {
-            let outstanding = pool
-                .total_flushed
-                .saturating_sub(pool.total_recovered_from_wrapper);
+        // Net of `realized_junior_loss` for the same reason as the SetMarketResolved
+        // gate above — see `StakePool::wrapper_recoverable`.
+        if !pool.wrapper_fully_recovered() {
             msg!(
                 "AdminResolveMarket: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
-                outstanding
+                pool.wrapper_recoverable()
             );
             return Err(StakeError::InsuranceLossOutstanding.into());
         }
