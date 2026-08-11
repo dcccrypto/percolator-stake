@@ -1,10 +1,13 @@
 name: CI
 
+# NOTE: these were `master`, a branch that does not exist in this repository, so
+# CI had NEVER run on any push or pull request. Three defects reached the deployed
+# devnet program under that blind spot.
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,13 +20,58 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: percolator-stake
+
+      # The e2e suites run the REAL programs under LiteSVM, loading
+      # `percolator-stake/target/deploy/percolator_stake.so` and the sibling
+      # `percolator-prog/target/deploy/percolator_prog.so`. Both are gitignored
+      # build artifacts, so they must be built here or those suites do not
+      # exercise the on-chain code at all.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator-prog
+          path: percolator-prog
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
         with:
           toolchain: stable
-      - run: cargo test --features no-entrypoint
+
+      - name: Install Solana CLI (provides cargo-build-sbf)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Build stake BPF program
+        working-directory: percolator-stake
+        run: cargo build-sbf -- --features devnet
+
+      - name: Build wrapper BPF program
+        working-directory: percolator-prog
+        run: cargo build-sbf
+
+      # Guard: `common_svm_setup()` in the e2e suites returns None and the test
+      # passes VACUOUSLY when either .so is missing — 23 tests across 7 suites
+      # behave that way. Fail loudly here instead, so a green run always means
+      # those suites really executed.
+      - name: Assert both .so artifacts exist
+        run: |
+          stake_so=percolator-stake/target/deploy/percolator_stake.so
+          wrapper_so=percolator-prog/target/deploy/percolator_prog.so
+          missing=0
+          for f in "$stake_so" "$wrapper_so"; do
+            if [ ! -f "$f" ]; then echo "::error::missing $f — e2e suites would silently skip"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          ls -l "$stake_so" "$wrapper_so"
+
+      - name: Test
+        working-directory: percolator-stake
+        run: cargo test --features no-entrypoint --no-fail-fast
 
   build:
     name: Build
@@ -46,6 +94,9 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Library only. `--all-targets` currently reports pre-existing lints in the
+      # test suites (large Err variants, argument counts); tightening that is a
+      # separate cleanup, not a gate to add mid-flight.
       - run: cargo clippy --features no-entrypoint -- -D warnings
 
   fmt:
