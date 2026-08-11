@@ -72,9 +72,14 @@ jobs:
           # this workflow's business.
           rustflags: ""
 
-      - name: Install Solana CLI (provides cargo-build-sbf)
+      # Pinned, not "stable": cargo-build-sbf bundles its own platform-tools
+      # rustc, so the CLI version determines the emitted bytes. v3.1.15
+      # (platform-tools v1.52) is what reproduces the deployed wrapper exactly;
+      # "stable" drifted and produced a 1206296-byte binary instead of 1243192
+      # from identical source.
+      - name: Install Solana CLI v3.1.15 (provides cargo-build-sbf)
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.15/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
       - name: Build stake BPF program
@@ -106,6 +111,13 @@ jobs:
           done
           [ "$missing" -eq 0 ] || exit 1
           ls -l "$stake_so" "$wrapper_so"
+          # The deployed devnet wrapper DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj
+          # is sha256 f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802
+          # over its 1243192 content bytes. Logged, not asserted: a legitimate
+          # wrapper redeploy should not break this repo's CI. If these differ, the
+          # e2e suites are exercising a wrapper that is not the one on devnet.
+          echo "wrapper sha256: $(sha256sum "$wrapper_so" | cut -d' ' -f1)"
+          echo "deployed      : f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802"
 
       - name: Test
         working-directory: percolator-stake
