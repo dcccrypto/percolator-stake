@@ -35,6 +35,9 @@ jobs:
         with:
           repository: dcccrypto/percolator-prog
           path: percolator-prog
+          # Pinned: the deployed devnet wrapper was built from this branch
+          # (19d5d932). TODO move to main once it lands there.
+          ref: feat/protocol-fee-taker-only
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       # percolator-prog has a path dependency on the engine
@@ -44,6 +47,10 @@ jobs:
         with:
           repository: dcccrypto/percolator
           path: percolator
+          # Pinned for the same reason, and because dcccrypto/percolator@main
+          # does not currently compile under the wrapper's build settings
+          # ("error: variable does not need to be mutable", v16.rs:8871).
+          ref: feat/protocol-fee-taker-only
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
