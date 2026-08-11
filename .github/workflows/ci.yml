@@ -72,14 +72,17 @@ jobs:
           # this workflow's business.
           rustflags: ""
 
-      # Pinned, not "stable": cargo-build-sbf bundles its own platform-tools
-      # rustc, so the CLI version determines the emitted bytes. v3.1.15
-      # (platform-tools v1.52) is what reproduces the deployed wrapper exactly;
-      # "stable" drifted and produced a 1206296-byte binary instead of 1243192
-      # from identical source.
-      - name: Install Solana CLI v3.1.15 (provides cargo-build-sbf)
+      # NOTE on reproducibility: cargo-build-sbf bundles its own platform-tools
+      # rustc, so the CLI version determines the emitted bytes. "stable" here
+      # produces a 1206296-byte wrapper, while the DEPLOYED one is 1243192 (built
+      # with CLI 3.1.15 / platform-tools v1.52). Pinning would close that gap, but
+      # release.anza.xyz has no v3.1.15 installer (404; v3.1.14 is the nearest
+      # published one), so this stays on stable. What matters for these suites is
+      # already correct: same source ref (percolator-prog main) and same feature
+      # set (--features devnet). The sha is logged below so drift is visible.
+      - name: Install Solana CLI (provides cargo-build-sbf)
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.15/install)"
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
       - name: Build stake BPF program
@@ -113,9 +116,10 @@ jobs:
           ls -l "$stake_so" "$wrapper_so"
           # The deployed devnet wrapper DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj
           # is sha256 f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802
-          # over its 1243192 content bytes. Logged, not asserted: a legitimate
-          # wrapper redeploy should not break this repo's CI. If these differ, the
-          # e2e suites are exercising a wrapper that is not the one on devnet.
+          # over its 1243192 content bytes, from percolator-prog@main built with
+          # --features devnet under CLI 3.1.15. The CI build uses the same source
+          # and features but a newer platform-tools, so expect a DIFFERENT hash
+          # here — see the install step. Logged for visibility, not asserted.
           echo "wrapper sha256: $(sha256sum "$wrapper_so" | cut -d' ' -f1)"
           echo "deployed      : f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802"
 
