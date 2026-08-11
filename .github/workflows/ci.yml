@@ -35,9 +35,14 @@ jobs:
         with:
           repository: dcccrypto/percolator-prog
           path: percolator-prog
-          # Pinned: the deployed devnet wrapper was built from this branch
-          # (19d5d932). TODO move to main once it lands there.
-          ref: feat/protocol-fee-taker-only
+          # main IS the deployed devnet wrapper. Verified byte-for-byte:
+          # percolator-prog@19d5d932 built with `cargo build-sbf -- --features devnet`
+          # reproduces DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj exactly
+          # (sha256 f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802
+          # over the 1243192 content bytes; on-chain is that plus 7040 bytes of
+          # zero padding). NOT feat/protocol-fee-taker-only — that remote branch is
+          # stale, 3 commits BEHIND main, so pinning it tested an older wrapper.
+          ref: main
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       # percolator-prog has a path dependency on the engine
@@ -47,9 +52,10 @@ jobs:
         with:
           repository: dcccrypto/percolator
           path: percolator
-          # Pinned for the same reason, and because dcccrypto/percolator@main
-          # does not currently compile under the wrapper's build settings
-          # ("error: variable does not need to be mutable", v16.rs:8871).
+          # The engine is the opposite case: its main (d448e1c9) has DIVERGED from
+          # what is deployed (3 behind / 15 ahead), and f53be74a on this branch is
+          # the engine revision that reproduces the deployed wrapper byte-for-byte.
+          # Keep this pinned until the engine's main carries the deployed lineage.
           ref: feat/protocol-fee-taker-only
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
@@ -77,7 +83,14 @@ jobs:
 
       - name: Build wrapper BPF program
         working-directory: percolator-prog
-        run: cargo build-sbf
+        # --features devnet is what the DEPLOYED wrapper was built with: it
+        # compiles the devnet percolator-stake program id into
+        # constants::STAKE_PROGRAM_ID, which tag 87
+        # (WithdrawInsuranceReserveToStake) pins its stake-pool owner check and
+        # PDA derivations to — precisely the path these e2e suites exercise.
+        # Without it the binary is 1237568 bytes instead of the deployed
+        # 1243192, i.e. a different program than the one on devnet.
+        run: cargo build-sbf -- --features devnet
 
       # Guard: `common_svm_setup()` in the e2e suites returns None and the test
       # passes VACUOUSLY when either .so is missing — 23 tests across 7 suites
