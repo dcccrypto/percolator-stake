@@ -35,11 +35,36 @@ jobs:
         with:
           repository: dcccrypto/percolator-prog
           path: percolator-prog
+          # Pinned: the deployed devnet wrapper was built from this branch
+          # (19d5d932). TODO move to main once it lands there.
+          ref: feat/protocol-fee-taker-only
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
+      # percolator-prog has a path dependency on the engine
+      # (`percolator = { path = "../percolator" }`), so the wrapper cannot build
+      # without it checked out as a sibling.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator
+          path: percolator
+          # Pinned for the same reason, and because dcccrypto/percolator@main
+          # does not currently compile under the wrapper's build settings
+          # ("error: variable does not need to be mutable", v16.rs:8871).
+          ref: feat/protocol-fee-taker-only
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
         with:
           toolchain: stable
+          # This action defaults to rustflags: "-D warnings" and exports it as a
+          # GLOBAL env var, so it applies to every crate compiled here —
+          # including the sibling path dependencies. That made the engine fail to
+          # build on an `unused_mut` it has never been required to satisfy
+          # (percolator/src/v16.rs:9207), breaking the wrapper .so and this whole
+          # job. Deny-warnings for THIS crate is enforced by the Clippy job, which
+          # passes -D warnings explicitly; imposing it on other repos' code is not
+          # this workflow's business.
+          rustflags: ""
 
       - name: Install Solana CLI (provides cargo-build-sbf)
         run: |
