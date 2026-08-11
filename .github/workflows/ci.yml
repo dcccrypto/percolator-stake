@@ -37,6 +37,15 @@ jobs:
           path: percolator-prog
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
+      # percolator-prog has a path dependency on the engine
+      # (`percolator = { path = "../percolator" }`), so the wrapper cannot build
+      # without it checked out as a sibling.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator
+          path: percolator
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
         with:
           toolchain: stable
