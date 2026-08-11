@@ -207,7 +207,12 @@ fn build_live_market_v17(
     (market, mint)
 }
 
-fn preallocate_empty_spl_account(svm: &mut LiteSVM, key: Pubkey, token_program: Pubkey, size: usize) {
+fn preallocate_empty_spl_account(
+    svm: &mut LiteSVM,
+    key: Pubkey,
+    token_program: Pubkey,
+    size: usize,
+) {
     svm.set_account(
         key,
         Account {
@@ -243,7 +248,12 @@ struct InitPoolAccounts {
     token_program: Pubkey,
 }
 
-fn init_pool_ix(stake_id: Pubkey, a: &InitPoolAccounts, cooldown_slots: u64, deposit_cap: u64) -> Instruction {
+fn init_pool_ix(
+    stake_id: Pubkey,
+    a: &InitPoolAccounts,
+    cooldown_slots: u64,
+    deposit_cap: u64,
+) -> Instruction {
     Instruction {
         program_id: stake_id,
         accounts: vec![
@@ -361,13 +371,18 @@ fn deposit_ix(
 
 // ---- Stake AccrueFees (tag 12) -- copied verbatim from mode0_accrue_fees_e2e.rs. ----
 
-fn accrue_fees_ix(stake_id: Pubkey, caller: &Pubkey, pool_pda: Pubkey, vault: Pubkey) -> Instruction {
+fn accrue_fees_ix(
+    stake_id: Pubkey,
+    caller: &Pubkey,
+    pool_pda: Pubkey,
+    vault: Pubkey,
+) -> Instruction {
     Instruction {
         program_id: stake_id,
         accounts: vec![
             AccountMeta::new_readonly(*caller, true), // 0. caller [signer, permissionless]
-            AccountMeta::new(pool_pda, false),         // 1. pool PDA [writable]
-            AccountMeta::new_readonly(vault, false),   // 2. vault [readonly, balance only]
+            AccountMeta::new(pool_pda, false),        // 1. pool PDA [writable]
+            AccountMeta::new_readonly(vault, false),  // 2. vault [readonly, balance only]
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false), // 3. clock
         ],
         data: vec![12u8], // tag = AccrueFees
@@ -439,20 +454,52 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
 
     // ---- InitPool (real; pool_mode = 0, InitPool's hardcoded default -- the
     // path EVERY real client uses). ----
-    let (_market, accts) = setup(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
-    send(&mut svm, &payer, &[&admin], init_pool_ix(stake_id, &accts, 5, 0))
-        .unwrap_or_else(|e| panic!("InitPool must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
-    assert_eq!(read_pool(&svm, &accts.pool_pda).pool_mode, 0, "InitPool must produce a mode-0 pool");
+    let (_market, accts) = setup(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        init_pool_ix(stake_id, &accts, 5, 0),
+    )
+    .unwrap_or_else(|e| panic!("InitPool must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
+    assert_eq!(
+        read_pool(&svm, &accts.pool_pda).pool_mode,
+        0,
+        "InitPool must produce a mode-0 pool"
+    );
 
     // ---- Genesis deposit by an honest LP (real instruction). ----
     const GENESIS_DEPOSIT: u64 = 100_000;
-    assert!(GENESIS_DEPOSIT > MINIMUM_LIQUIDITY, "must clear the N7 dead-share floor");
+    assert!(
+        GENESIS_DEPOSIT > MINIMUM_LIQUIDITY,
+        "must clear the N7 dead-share floor"
+    );
 
     let genesis_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, genesis_ata, &accts.collateral_mint, &genesis_lp.pubkey(), GENESIS_DEPOSIT);
+    set_token_account(
+        &mut svm,
+        genesis_ata,
+        &accts.collateral_mint,
+        &genesis_lp.pubkey(),
+        GENESIS_DEPOSIT,
+    );
     let genesis_lp_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, genesis_lp_ata, &accts.lp_mint, &genesis_lp.pubkey(), 0);
-    let (genesis_deposit_pda, _) = derive_deposit_pda(&stake_id, &accts.pool_pda, &genesis_lp.pubkey());
+    set_token_account(
+        &mut svm,
+        genesis_lp_ata,
+        &accts.lp_mint,
+        &genesis_lp.pubkey(),
+        0,
+    );
+    let (genesis_deposit_pda, _) =
+        derive_deposit_pda(&stake_id, &accts.pool_pda, &genesis_lp.pubkey());
 
     let genesis_dep_ix = deposit_ix(
         stake_id,
@@ -466,8 +513,12 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
         genesis_deposit_pda,
         GENESIS_DEPOSIT,
     );
-    send(&mut svm, &payer, &[&genesis_lp], genesis_dep_ix)
-        .unwrap_or_else(|e| panic!("Genesis deposit must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
+    send(&mut svm, &payer, &[&genesis_lp], genesis_dep_ix).unwrap_or_else(|e| {
+        panic!(
+            "Genesis deposit must succeed.\nLogs:\n{}",
+            e.meta.logs.join("\n")
+        )
+    });
 
     let mint_amount_genesis = token_amount(&svm, &genesis_lp_ata);
     assert_eq!(
@@ -478,7 +529,10 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
 
     let pool_before_surplus = read_pool(&svm, &accts.pool_pda);
     let total_lp_supply_before = pool_before_surplus.total_lp_supply;
-    assert_eq!(total_lp_supply_before, GENESIS_DEPOSIT, "sanity: full genesis lp_to_mint incl. dead share");
+    assert_eq!(
+        total_lp_supply_before, GENESIS_DEPOSIT,
+        "sanity: full genesis lp_to_mint incl. dead share"
+    );
     assert_eq!(
         token_amount(&svm, &accts.vault),
         GENESIS_DEPOSIT,
@@ -521,10 +575,23 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
     // permissionless AccrueFees in the same transaction". ----
     const ATTACKER_DEPOSIT: u64 = GENESIS_DEPOSIT;
     let attacker_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, attacker_ata, &accts.collateral_mint, &attacker.pubkey(), ATTACKER_DEPOSIT);
+    set_token_account(
+        &mut svm,
+        attacker_ata,
+        &accts.collateral_mint,
+        &attacker.pubkey(),
+        ATTACKER_DEPOSIT,
+    );
     let attacker_lp_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, attacker_lp_ata, &accts.lp_mint, &attacker.pubkey(), 0);
-    let (attacker_deposit_pda, _) = derive_deposit_pda(&stake_id, &accts.pool_pda, &attacker.pubkey());
+    set_token_account(
+        &mut svm,
+        attacker_lp_ata,
+        &accts.lp_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    let (attacker_deposit_pda, _) =
+        derive_deposit_pda(&stake_id, &accts.pool_pda, &attacker.pubkey());
 
     let attacker_dep_ix = deposit_ix(
         stake_id,
@@ -538,16 +605,22 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
         attacker_deposit_pda,
         ATTACKER_DEPOSIT,
     );
-    let attacker_accrue_ix = accrue_fees_ix(stake_id, &attacker.pubkey(), accts.pool_pda, accts.vault);
+    let attacker_accrue_ix =
+        accrue_fees_ix(stake_id, &attacker.pubkey(), accts.pool_pda, accts.vault);
 
-    send_batch(&mut svm, &payer, &[&attacker], vec![attacker_dep_ix, attacker_accrue_ix])
-        .unwrap_or_else(|e| {
-            panic!(
-                "Attacker's deposit+AccrueFees batch must succeed (both are real, valid \
+    send_batch(
+        &mut svm,
+        &payer,
+        &[&attacker],
+        vec![attacker_dep_ix, attacker_accrue_ix],
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "Attacker's deposit+AccrueFees batch must succeed (both are real, valid \
                  instructions on a mode-0 pool post-Task-11).\nLogs:\n{}",
-                e.meta.logs.join("\n")
-            )
-        });
+            e.meta.logs.join("\n")
+        )
+    });
 
     // ---- Assertions on REAL post-transaction state (nothing hand-set). ----
     let actual_attacker_lp = token_amount(&svm, &attacker_lp_ata);
@@ -559,7 +632,10 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
     eprintln!(
         "expected_lp_post_accrual={} actual_attacker_lp={} claim_before_correct={} \
          actual_genesis_claim_after={}",
-        expected_lp_post_accrual, actual_attacker_lp, claim_before_correct, actual_genesis_claim_after
+        expected_lp_post_accrual,
+        actual_attacker_lp,
+        claim_before_correct,
+        actual_genesis_claim_after
     );
 
     assert_eq!(

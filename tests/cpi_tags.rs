@@ -80,7 +80,11 @@ fn test_cpi_tag32_update_authority_wire_33_bytes() {
         "tag-32 marketauth-rotation wire must be 1 (tag) + 32 (pubkey) = 33 bytes"
     );
     assert_eq!(data[0], 32, "byte 0 must be tag=32 (UpdateAuthority)");
-    assert_eq!(&data[1..33], &new_authority, "new_authority pubkey at bytes [1..33]");
+    assert_eq!(
+        &data[1..33],
+        &new_authority,
+        "new_authority pubkey at bytes [1..33]"
+    );
 
     // Byte-for-byte parity with the deployed vault's exact wire construction
     // (percolator-vault@eb3ebe8 src/cpi.rs cpi_update_authority):
@@ -104,12 +108,15 @@ fn test_cpi_tag32_update_authority_wire_33_bytes() {
 fn test_cpi_tag32_account_shape_is_three_accounts_both_signers() {
     // [is_signer, is_writable] per account, in order.
     let shape = [
-        (true, false),  // 0: current_authority (signer, read-only)
-        (true, false),  // 1: new_authority (signer, read-only)
-        (false, true),  // 2: market/slab (writable, not a signer)
+        (true, false), // 0: current_authority (signer, read-only)
+        (true, false), // 1: new_authority (signer, read-only)
+        (false, true), // 2: market/slab (writable, not a signer)
     ];
     assert_eq!(shape.len(), 3, "tag 32 CPI must pass exactly 3 accounts");
-    assert!(shape[0].0 && shape[1].0, "both authority slots must be signers");
+    assert!(
+        shape[0].0 && shape[1].0,
+        "both authority slots must be signers"
+    );
     assert!(shape[2].1, "the market account must be writable");
     assert!(!shape[2].0, "the market account is not a signer");
 }
@@ -149,7 +156,10 @@ fn test_cpi_tag65_update_asset_authority_wire_36_bytes() {
 
     // (1) Tag = 65
     assert_eq!(data[0], 65, "byte 0 must be tag=65 (UpdateAssetAuthority)");
-    assert_ne!(data[0], 32, "tag 32 is the OLD UpdateAuthority — must NOT ship");
+    assert_ne!(
+        data[0], 32,
+        "tag 32 is the OLD UpdateAuthority — must NOT ship"
+    );
 
     // (2) asset_index = 0 (u16 LE, bytes 1-2)
     assert_eq!(data[1], 0x00, "asset_index low byte must be 0x00");
@@ -159,7 +169,10 @@ fn test_cpi_tag65_update_asset_authority_wire_36_bytes() {
 
     // (3) kind = 1, NOT 2
     assert_eq!(data[3], 1, "byte 3 must be kind=1 (ASSET_AUTH_INSURANCE)");
-    assert_ne!(data[3], 2, "kind=2 is old AUTHORITY_INSURANCE — must NOT ship");
+    assert_ne!(
+        data[3], 2,
+        "kind=2 is old AUTHORITY_INSURANCE — must NOT ship"
+    );
 
     // pubkey round-trip
     assert_eq!(&data[4..36], &new_pubkey, "new_pubkey at bytes [4..36]");
@@ -176,7 +189,7 @@ fn test_old_v16_bind_wire_documents_the_break() {
     // The v16 wire
     let mut old_data: Vec<u8> = Vec::with_capacity(34);
     old_data.push(32u8); // old tag
-    old_data.push(2u8);  // old kind = AUTHORITY_INSURANCE (from v16 UpdateAuthority enum)
+    old_data.push(2u8); // old kind = AUTHORITY_INSURANCE (from v16 UpdateAuthority enum)
     old_data.extend_from_slice(&new_pubkey);
 
     // Document what was wrong:
@@ -185,10 +198,7 @@ fn test_old_v16_bind_wire_documents_the_break() {
     assert_eq!(old_data[1], 2, "old kind was 2 (AUTHORITY_INSURANCE)");
 
     // In v17, the correct wire has a different tag, kind, and 2 extra bytes
-    assert_ne!(
-        old_data[0], 65,
-        "old wire used tag 32; v17 requires tag 65"
-    );
+    assert_ne!(old_data[0], 65, "old wire used tag 32; v17 requires tag 65");
     assert_ne!(
         old_data.len(),
         36,
@@ -201,7 +211,7 @@ fn test_old_v16_bind_wire_documents_the_break() {
 /// vault_auth PDA, but the wire structure is byte-identical.
 #[test]
 fn test_bind_and_rotate_produce_same_wire_shape() {
-    let pda_pubkey = [0x11u8; 32];   // vault_auth PDA (bind target)
+    let pda_pubkey = [0x11u8; 32]; // vault_auth PDA (bind target)
     let rotate_target = [0x22u8; 32]; // rotation destination (rotate target)
 
     let mut bind_wire = Vec::with_capacity(36);
@@ -225,7 +235,8 @@ fn test_bind_and_rotate_produce_same_wire_shape() {
 
     // Only the pubkey differs
     assert_ne!(
-        &bind_wire[4..36], &rotate_wire[4..36],
+        &bind_wire[4..36],
+        &rotate_wire[4..36],
         "new_pubkey bytes differ between bind and rotate"
     );
 }
@@ -243,7 +254,11 @@ fn test_bind_and_rotate_produce_same_wire_shape() {
 fn test_cpi_tag19_resolve_market_wire_is_1_byte() {
     let data = vec![19u8]; // mirrors cpi::cpi_resolve_market's `vec![TAG_RESOLVE_MARKET]`
 
-    assert_eq!(data.len(), 1, "tag-19 ResolveMarket wire must be exactly 1 byte");
+    assert_eq!(
+        data.len(),
+        1,
+        "tag-19 ResolveMarket wire must be exactly 1 byte"
+    );
     assert_eq!(data[0], 19, "byte 0 must be tag=19 (ResolveMarket)");
 
     // Byte-for-byte parity with the deployed vault's cpi_resolve_market
@@ -268,7 +283,11 @@ fn test_cpi_tag19_account_shape_is_two_accounts() {
         (true, false), // 0: admin/marketauth (pool PDA), signer via invoke_signed, read-only
         (false, true), // 1: market/slab, writable, not a signer
     ];
-    assert_eq!(shape.len(), 2, "ResolveMarket CPI must pass exactly 2 accounts");
+    assert_eq!(
+        shape.len(),
+        2,
+        "ResolveMarket CPI must pass exactly 2 accounts"
+    );
     assert!(shape[0].0, "account 0 (marketauth) must be a signer");
     assert!(!shape[0].1, "account 0 (marketauth) is read-only");
     assert!(shape[1].1, "account 1 (market) must be writable");
@@ -294,6 +313,9 @@ fn test_cpi_tag19_wire_length_distinct_from_other_cpis() {
         update_asset_authority_len,
         withdraw_insurance_asset_len,
     ] {
-        assert_ne!(resolve_market_len, other, "tag-19 wire length must stay distinct");
+        assert_ne!(
+            resolve_market_len, other,
+            "tag-19 wire length must stay distinct"
+        );
     }
 }

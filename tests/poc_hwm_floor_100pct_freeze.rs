@@ -56,7 +56,11 @@ fn floor_100pct_blocks_every_positive_withdrawal_on_a_healthy_pool() {
     // Sanity: at 100% the floor equals the full mark.
     let hwm = pool.refresh_hwm(5, 1_000_000);
     assert_eq!(hwm, 1_000_000);
-    assert_eq!(hwm_floor(hwm, 10_000), Some(1_000_000), "floor == 100% of the mark");
+    assert_eq!(
+        hwm_floor(hwm, 10_000),
+        Some(1_000_000),
+        "floor == 100% of the mark"
+    );
 
     // No loss has occurred — the pool is fully solvent (TVL == 1,000,000) — yet EVERY
     // positive withdrawal is rejected, from a dust 1-unit exit up to a full redemption.
@@ -76,18 +80,27 @@ fn epoch_rollover_does_not_lift_the_freeze() {
     let mut pool = pool_with_floor(10_000);
 
     // Epoch 5: frozen.
-    assert!(!withdrawal_allowed(&mut pool, 5, 1), "frozen in the peak epoch");
+    assert!(
+        !withdrawal_allowed(&mut pool, 5, 1),
+        "frozen in the peak epoch"
+    );
 
     // Epoch 6 (rollover): refresh_hwm re-anchors mark to current TVL = 1,000,000.
     let hwm_new_epoch = pool.refresh_hwm(6, 1_000_000);
-    assert_eq!(hwm_new_epoch, 1_000_000, "mark re-anchors to current TVL on a new epoch");
+    assert_eq!(
+        hwm_new_epoch, 1_000_000,
+        "mark re-anchors to current TVL on a new epoch"
+    );
     assert!(
         !withdrawal_allowed(&mut pool, 6, 1),
         "STILL frozen one epoch later — the freeze is permanent until the admin lowers the floor"
     );
 
     // And many epochs later — same result.
-    assert!(!withdrawal_allowed(&mut pool, 9_999, 1), "still frozen thousands of epochs later");
+    assert!(
+        !withdrawal_allowed(&mut pool, 9_999, 1),
+        "still frozen thousands of epochs later"
+    );
 }
 
 #[test]
@@ -96,9 +109,18 @@ fn boundary_9999_allows_a_sliver_so_10000_is_the_discontinuity() {
     // the feature still functions as a *rate limiter*. Bumping the cap by a single bp to
     // 10000 removes the last unit of headroom and converts it into a *kill switch*.
     let mut pool99 = pool_with_floor(9_999);
-    assert!(withdrawal_allowed(&mut pool99, 5, 100), "9999 bps allows a 100-unit withdrawal");
-    assert!(!withdrawal_allowed(&mut pool99, 5, 101), "9999 bps blocks beyond the 0.01% headroom");
+    assert!(
+        withdrawal_allowed(&mut pool99, 5, 100),
+        "9999 bps allows a 100-unit withdrawal"
+    );
+    assert!(
+        !withdrawal_allowed(&mut pool99, 5, 101),
+        "9999 bps blocks beyond the 0.01% headroom"
+    );
 
     let mut pool100 = pool_with_floor(10_000);
-    assert!(!withdrawal_allowed(&mut pool100, 5, 1), "10000 bps blocks even a single unit");
+    assert!(
+        !withdrawal_allowed(&mut pool100, 5, 1),
+        "10000 bps blocks even a single unit"
+    );
 }

@@ -177,7 +177,12 @@ fn build_live_market_v17(
 /// instruction would produce before InitPool's `initialize_mint`/`initialize_account`
 /// CPIs run. InitPool does NOT create these accounts itself (only `pool_pda` gets
 /// `create_or_adopt_pda`), so the caller must pre-allocate them.
-fn preallocate_empty_spl_account(svm: &mut LiteSVM, key: Pubkey, token_program: Pubkey, size: usize) {
+fn preallocate_empty_spl_account(
+    svm: &mut LiteSVM,
+    key: Pubkey,
+    token_program: Pubkey,
+    size: usize,
+) {
     svm.set_account(
         key,
         Account {
@@ -211,7 +216,12 @@ struct InitPoolAccounts {
     token_program: Pubkey,
 }
 
-fn init_pool_ix(stake_id: Pubkey, a: &InitPoolAccounts, cooldown_slots: u64, deposit_cap: u64) -> Instruction {
+fn init_pool_ix(
+    stake_id: Pubkey,
+    a: &InitPoolAccounts,
+    cooldown_slots: u64,
+    deposit_cap: u64,
+) -> Instruction {
     Instruction {
         program_id: stake_id,
         accounts: vec![
@@ -242,7 +252,14 @@ fn read_32_at(svm: &LiteSVM, market: &Pubkey, off: usize) -> [u8; 32] {
 
 /// Common setup: live market (marketauth=admin) + pre-allocated (but not yet
 /// InitPool'd) lp_mint/vault/pool_pda accounts, ready for an InitPool call.
-fn setup(svm: &mut LiteSVM, wrapper_id: Pubkey, stake_id: Pubkey, token_program: Pubkey, admin: &Keypair, payer: &Keypair) -> (Pubkey, InitPoolAccounts) {
+fn setup(
+    svm: &mut LiteSVM,
+    wrapper_id: Pubkey,
+    stake_id: Pubkey,
+    token_program: Pubkey,
+    admin: &Keypair,
+    payer: &Keypair,
+) -> (Pubkey, InitPoolAccounts) {
     let (market, mint) = build_live_market_v17(svm, wrapper_id, token_program, admin, payer);
 
     let (pool_pda, _) = derive_pool_pda(&stake_id, &market);
@@ -298,7 +315,14 @@ fn initpool_rotates_marketauth_to_pool_pda() {
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
 
-    let (market, accts) = setup(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, accts) = setup(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
 
     // PRE-STATE: locate cfg.marketauth by searching for admin's pubkey in the raw
     // market bytes (InitMarket bootstraps marketauth to the init signer).
@@ -313,7 +337,13 @@ fn initpool_rotates_marketauth_to_pool_pda() {
     );
 
     // Run the real InitPool instruction.
-    send(&mut svm, &payer, &[&admin], init_pool_ix(stake_id, &accts, 5, 0)).unwrap_or_else(|e| {
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        init_pool_ix(stake_id, &accts, 5, 0),
+    )
+    .unwrap_or_else(|e| {
         panic!("InitPool must succeed when admin == current marketauth.\nError: {e:?}")
     });
 
@@ -332,7 +362,10 @@ fn initpool_rotates_marketauth_to_pool_pda() {
 
     // Pool PDA account was actually created and initialized.
     let pool_acct = svm.get_account(&accts.pool_pda).unwrap();
-    assert_eq!(pool_acct.owner, stake_id, "pool_pda must be owned by the stake program");
+    assert_eq!(
+        pool_acct.owner, stake_id,
+        "pool_pda must be owned by the stake program"
+    );
 
     // BEHAVIORAL proof the handoff is real: the OLD admin key can no longer call
     // wrapper UpdateAuthority (tag 32) directly — it would need to co-sign as
@@ -353,8 +386,9 @@ fn initpool_rotates_marketauth_to_pool_pda() {
         },
     };
     svm.expire_blockhash();
-    let err = send(&mut svm, &payer, &[&admin], re_rotate_attempt)
-        .expect_err("admin must NOT be able to re-rotate marketauth after InitPool moved it to the pool PDA");
+    let err = send(&mut svm, &payer, &[&admin], re_rotate_attempt).expect_err(
+        "admin must NOT be able to re-rotate marketauth after InitPool moved it to the pool PDA",
+    );
     match err {
         TransactionError::InstructionError(_, InstructionError::Custom(_)) => {
             // expect_live_authority(&cfg.marketauth, admin.key) fails: Unauthorized.
@@ -392,13 +426,23 @@ fn initpool_reverts_atomically_if_caller_is_not_marketauth() {
 
     // Market's marketauth is `admin`; attacker (not admin) attempts InitPool,
     // signing as the (wrong) admin account of a pool derived from the SAME slab.
-    let (market, mut accts) = setup(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, mut accts) = setup(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
     // Attacker pays and signs as "admin" of the pool — but is not the wrapper's
     // current marketauth, so the CPI must reject them.
     accts.admin = attacker.pubkey();
 
     let pool_pda_before = svm.get_account(&accts.pool_pda);
-    assert!(pool_pda_before.is_none(), "PRE-STATE: pool_pda must not exist yet");
+    assert!(
+        pool_pda_before.is_none(),
+        "PRE-STATE: pool_pda must not exist yet"
+    );
 
     let err = send(
         &mut svm,
@@ -453,7 +497,14 @@ fn initpool_requires_writable_slab() {
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
 
-    let (_market, accts) = setup(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (_market, accts) = setup(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
 
     // Build the InitPool ix by hand with slab marked READ-ONLY (index 1).
     let mut ix = init_pool_ix(stake_id, &accts, 5, 0);

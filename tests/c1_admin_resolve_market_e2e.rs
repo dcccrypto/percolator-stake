@@ -104,7 +104,11 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            token_program.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -421,12 +425,28 @@ fn common_svm_setup() -> Option<(LiteSVM, Pubkey, Pubkey, Pubkey, Keypair, Keypa
 /// wrapper decoder and `handle_resolve_market` expect.
 #[test]
 fn admin_resolve_market_succeeds_and_actually_flips_wrapper_mode() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
-    let (market, _mint, _wrapper_vault, pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
-    inject_pool(&mut svm, stake_id, wrapper_id, market, &admin.pubkey(), 0, 0, 0);
+    let (market, _mint, _wrapper_vault, pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
+    inject_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        &admin.pubkey(),
+        0,
+        0,
+        0,
+    );
 
     // First call: must succeed (nothing outstanding, admin signs, wire is correct).
     send(
@@ -452,7 +472,9 @@ fn admin_resolve_market_succeeds_and_actually_flips_wrapper_mode() {
         TransactionError::InstructionError(_, InstructionError::Custom(_)) => {
             // expected: the wrapper's mode guard (EngineLockActive) fires.
         }
-        other => panic!("expected a Custom program error from the wrapper's mode guard, got {other:?}"),
+        other => {
+            panic!("expected a Custom program error from the wrapper's mode guard, got {other:?}")
+        }
     }
 }
 
@@ -460,16 +482,32 @@ fn admin_resolve_market_succeeds_and_actually_flips_wrapper_mode() {
 /// proxy is admin-gated, not permissionless.
 #[test]
 fn admin_resolve_market_rejects_non_admin_signer() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
     let attacker = Keypair::new();
     svm.airdrop(&attacker.pubkey(), 20_000_000_000).unwrap();
 
-    let (market, _mint, _wrapper_vault, pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, _mint, _wrapper_vault, pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
     // pool.admin == admin.pubkey(), NOT attacker.
-    inject_pool(&mut svm, stake_id, wrapper_id, market, &admin.pubkey(), 0, 0, 0);
+    inject_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        &admin.pubkey(),
+        0,
+        0,
+        0,
+    );
 
     let err = send(
         &mut svm,
@@ -480,7 +518,10 @@ fn admin_resolve_market_rejects_non_admin_signer() {
     .expect_err("AdminResolveMarket must reject a non-admin signer");
     match err {
         TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
-            assert_eq!(code, 2, "expected StakeError::Unauthorized (2), got Custom({code})");
+            assert_eq!(
+                code, 2,
+                "expected StakeError::Unauthorized (2), got Custom({code})"
+            );
         }
         other => panic!("expected Custom(2) Unauthorized, got {other:?}"),
     }
@@ -492,13 +533,29 @@ fn admin_resolve_market_rejects_non_admin_signer() {
 /// remain resolvable-later (mode unchanged) after the rejection.
 #[test]
 fn admin_resolve_market_h1_blocked_by_outstanding_flushed_insurance() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
-    let (market, _mint, _wrapper_vault, pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, _mint, _wrapper_vault, pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
     // 600 tokens flushed, only 400 recovered from the wrapper -> 200 outstanding.
-    inject_pool(&mut svm, stake_id, wrapper_id, market, &admin.pubkey(), 600, 400, 400);
+    inject_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        &admin.pubkey(),
+        600,
+        400,
+        400,
+    );
 
     let err = send(
         &mut svm,
@@ -532,13 +589,29 @@ fn admin_resolve_market_h1_blocked_by_outstanding_flushed_insurance() {
 /// the fix.
 #[test]
 fn admin_resolve_market_h1_unblocked_after_recovery() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
-    let (market, _mint, _wrapper_vault, pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, _mint, _wrapper_vault, pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
     // Fully recovered from the wrapper: 600 flushed, 600 recovered -> 0 outstanding.
-    inject_pool(&mut svm, stake_id, wrapper_id, market, &admin.pubkey(), 600, 600, 600);
+    inject_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        &admin.pubkey(),
+        600,
+        600,
+        600,
+    );
 
     send(
         &mut svm,
@@ -560,16 +633,32 @@ fn admin_resolve_market_h1_unblocked_after_recovery() {
 /// instruction — proving the fix closes the exact hole the re-review found.
 #[test]
 fn admin_resolve_market_h1_blocked_when_only_total_returned_satisfied() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
-    let (market, _mint, _wrapper_vault, pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, _mint, _wrapper_vault, pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
     // total_returned == total_flushed (the OLD gate's condition is satisfied),
     // but total_recovered_from_wrapper == 0 — nothing was ever CPI'd out of
     // the wrapper. This is the exact state ReturnInsurance-only bookkeeping
     // (or the #161 phantom write-off) produces.
-    inject_pool(&mut svm, stake_id, wrapper_id, market, &admin.pubkey(), 600, 600, 0);
+    inject_pool(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        &admin.pubkey(),
+        600,
+        600,
+        0,
+    );
 
     let err = send(
         &mut svm,
@@ -802,24 +891,52 @@ fn read_pool_state(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
 /// resolution while flushed capital sits stranded in the wrapper.
 #[test]
 fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
-    let (market, mint, wrapper_vault, _rotated_pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, mint, wrapper_vault, _rotated_pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
 
-    let ctx = inject_pool_with_vault(&mut svm, stake_id, wrapper_id, market, mint, &admin.pubkey(), FLUSH_AMOUNT);
+    let ctx = inject_pool_with_vault(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        FLUSH_AMOUNT,
+    );
 
     // Bind + flush: real collateral moves stake_vault -> wrapper_vault, and
     // pool.total_flushed genuinely advances to FLUSH_AMOUNT.
-    send(&mut svm, &payer, &[&admin], bind_ix(&ctx, wrapper_id, market, &admin.pubkey()))
-        .expect("BindInsuranceAuthority");
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&ctx, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("BindInsuranceAuthority");
     svm.expire_blockhash();
     send(
         &mut svm,
         &payer,
         &[&admin],
-        flush_ix(&ctx, wrapper_id, token_program, market, wrapper_vault, &admin.pubkey(), FLUSH_AMOUNT),
+        flush_ix(
+            &ctx,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            FLUSH_AMOUNT,
+        ),
     )
     .expect("FlushToInsurance");
 
@@ -839,7 +956,14 @@ fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
         &mut svm,
         &payer,
         &[&admin],
-        return_insurance_ix(ctx.pool_pda, admin_ata, ctx.stake_vault, token_program, &admin.pubkey(), FLUSH_AMOUNT),
+        return_insurance_ix(
+            ctx.pool_pda,
+            admin_ata,
+            ctx.stake_vault,
+            token_program,
+            &admin.pubkey(),
+            FLUSH_AMOUNT,
+        ),
     )
     .expect("ReturnInsurance must succeed — it's a real self-funded transfer, not the bug");
 
@@ -888,23 +1012,52 @@ fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
 /// that real recovery has run does `AdminResolveMarket` succeed.
 #[test]
 fn admin_resolve_market_h1_unblocked_only_after_real_recover_flushed_insurance() {
-    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup() else {
+    let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
+    else {
         return;
     };
-    let (market, mint, wrapper_vault, _rotated_pool_pda) =
-        setup_resolved_ready_market(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
+    let (market, mint, wrapper_vault, _rotated_pool_pda) = setup_resolved_ready_market(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
 
-    let ctx = inject_pool_with_vault(&mut svm, stake_id, wrapper_id, market, mint, &admin.pubkey(), FLUSH_AMOUNT);
-    let wrapper_vault_auth = Pubkey::find_program_address(&[b"vault", market.as_ref()], &wrapper_id).0;
+    let ctx = inject_pool_with_vault(
+        &mut svm,
+        stake_id,
+        wrapper_id,
+        market,
+        mint,
+        &admin.pubkey(),
+        FLUSH_AMOUNT,
+    );
+    let wrapper_vault_auth =
+        Pubkey::find_program_address(&[b"vault", market.as_ref()], &wrapper_id).0;
 
-    send(&mut svm, &payer, &[&admin], bind_ix(&ctx, wrapper_id, market, &admin.pubkey()))
-        .expect("BindInsuranceAuthority");
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        bind_ix(&ctx, wrapper_id, market, &admin.pubkey()),
+    )
+    .expect("BindInsuranceAuthority");
     svm.expire_blockhash();
     send(
         &mut svm,
         &payer,
         &[&admin],
-        flush_ix(&ctx, wrapper_id, token_program, market, wrapper_vault, &admin.pubkey(), FLUSH_AMOUNT),
+        flush_ix(
+            &ctx,
+            wrapper_id,
+            token_program,
+            market,
+            wrapper_vault,
+            &admin.pubkey(),
+            FLUSH_AMOUNT,
+        ),
     )
     .expect("FlushToInsurance");
 
@@ -919,7 +1072,10 @@ fn admin_resolve_market_h1_unblocked_only_after_real_recover_flushed_insurance()
     .expect_err("AdminResolveMarket must be blocked before any recovery");
     match blocked {
         TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
-            assert_eq!(code, 24, "expected InsuranceLossOutstanding pre-recovery, got {code}");
+            assert_eq!(
+                code, 24,
+                "expected InsuranceLossOutstanding pre-recovery, got {code}"
+            );
         }
         other => panic!("expected Custom(24), got {other:?}"),
     }

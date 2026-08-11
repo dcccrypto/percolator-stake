@@ -62,8 +62,16 @@ fn orphan_state_is_well_formed() {
     let pool = orphan_pool();
     assert_eq!(pool.total_lp_supply, 0, "all LP exited");
     assert_eq!(pool.senior_total_lp(), 0, "no senior LP");
-    assert_eq!(pool.effective_junior_balance(), 0, "no junior; net_loss == 0");
-    assert_eq!(pool.total_pool_value().unwrap(), 500_000, "orphaned value present");
+    assert_eq!(
+        pool.effective_junior_balance(),
+        0,
+        "no junior; net_loss == 0"
+    );
+    assert_eq!(
+        pool.total_pool_value().unwrap(),
+        500_000,
+        "orphaned value present"
+    );
     assert_eq!(
         pool.senior_balance().unwrap(),
         500_000,
@@ -122,7 +130,11 @@ fn c9_guard_rejects_senior_deposit_into_orphan() {
     );
     // It is the STATE that is blocked, not a size threshold — any amount is rejected.
     assert_eq!(
-        calc_senior_lp_for_deposit(pool.senior_total_lp(), pool.senior_balance().unwrap(), 1_000_000),
+        calc_senior_lp_for_deposit(
+            pool.senior_total_lp(),
+            pool.senior_balance().unwrap(),
+            1_000_000
+        ),
         None,
         "FIX: a large deposit into an orphan is rejected too"
     );
@@ -137,8 +149,12 @@ fn first_senior_deposit_into_empty_pool_mints_1_to_1() {
     assert_eq!(pool.senior_total_lp(), 0);
     assert_eq!(pool.senior_balance().unwrap(), 0);
 
-    let lp = calc_senior_lp_for_deposit(pool.senior_total_lp(), pool.senior_balance().unwrap(), 750_000)
-        .expect("FIX: true first senior into an empty pool must succeed");
+    let lp = calc_senior_lp_for_deposit(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        750_000,
+    )
+    .expect("FIX: true first senior into an empty pool must succeed");
     assert_eq!(lp, 750_000, "true first senior mints 1:1");
 }
 
@@ -160,8 +176,12 @@ fn first_senior_after_junior_only_mints_1_to_1() {
         "junior-first leaves senior_balance == 0 (not an orphan)"
     );
 
-    let lp = calc_senior_lp_for_deposit(pool.senior_total_lp(), pool.senior_balance().unwrap(), 500_000)
-        .expect("FIX: first senior after junior-only must succeed");
+    let lp = calc_senior_lp_for_deposit(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        500_000,
+    )
+    .expect("FIX: first senior after junior-only must succeed");
     assert_eq!(lp, 500_000, "first senior mints 1:1");
 }
 
@@ -188,7 +208,11 @@ fn junior_only_with_partial_loss_first_senior_not_bricked() {
     pool.total_lp_supply = 800_000; // all junior
 
     assert_eq!(pool.senior_total_lp(), 0);
-    assert_eq!(pool.effective_junior_balance(), 600_000, "junior absorbs all net_loss");
+    assert_eq!(
+        pool.effective_junior_balance(),
+        600_000,
+        "junior absorbs all net_loss"
+    );
     assert_eq!(pool.total_pool_value().unwrap(), 600_000);
     assert_eq!(
         pool.senior_balance().unwrap(),
@@ -196,7 +220,14 @@ fn junior_only_with_partial_loss_first_senior_not_bricked() {
         "junior-only (gross_senior == 0) keeps senior_balance == 0 through loss + recovery"
     );
 
-    let lp = calc_senior_lp_for_deposit(pool.senior_total_lp(), pool.senior_balance().unwrap(), 400_000)
-        .expect("FIX: first senior into a junior-only-post-loss pool must succeed 1:1");
-    assert_eq!(lp, 400_000, "first senior mints 1:1 (not bricked by a phantom senior_balance)");
+    let lp = calc_senior_lp_for_deposit(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        400_000,
+    )
+    .expect("FIX: first senior into a junior-only-post-loss pool must succeed 1:1");
+    assert_eq!(
+        lp, 400_000,
+        "first senior mints 1:1 (not bricked by a phantom senior_balance)"
+    );
 }

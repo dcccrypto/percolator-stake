@@ -234,13 +234,13 @@ pub fn cpi_bind_insurance_authority<'a>(
     let mut data = Vec::with_capacity(36);
     data.push(TAG_UPDATE_ASSET_AUTHORITY);
     data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
-    data.push(ASSET_AUTH_INSURANCE);                         // kind = 1
-    data.extend_from_slice(vault_auth.key.as_ref());         // new_pubkey = PDA
+    data.push(ASSET_AUTH_INSURANCE); // kind = 1
+    data.extend_from_slice(vault_auth.key.as_ref()); // new_pubkey = PDA
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*admin.key, true),      // current authority, signer
+            AccountMeta::new_readonly(*admin.key, true), // current authority, signer
             AccountMeta::new_readonly(*vault_auth.key, true), // new authority (PDA), signer via invoke_signed
             AccountMeta::new(*market.key, false),             // market, writable
         ],
@@ -271,22 +271,22 @@ pub fn cpi_bind_insurance_authority<'a>(
 
 pub fn cpi_bind_insurance_operator<'a>(
     percolator_program: &AccountInfo<'a>,
-    admin: &AccountInfo<'a>,     // current insurance_operator (== admin at bootstrap); signer
+    admin: &AccountInfo<'a>, // current insurance_operator (== admin at bootstrap); signer
     vault_auth: &AccountInfo<'a>, // new operator = our PDA; co-signs via invoke_signed
-    market: &AccountInfo<'a>,    // the slab/market account (writable, wrapper-owned)
-    signer_seeds: &[&[u8]],      // vault_auth PDA seeds
+    market: &AccountInfo<'a>, // the slab/market account (writable, wrapper-owned)
+    signer_seeds: &[&[u8]],  // vault_auth PDA seeds
 ) -> ProgramResult {
     // tag(1) + asset_index(2, u16 LE = 0) + kind(1) + new_pubkey(32) = 36 bytes.
     let mut data = Vec::with_capacity(36);
     data.push(TAG_UPDATE_ASSET_AUTHORITY);
     data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
-    data.push(ASSET_AUTH_INSURANCE_OPERATOR);                // kind = 2
-    data.extend_from_slice(vault_auth.key.as_ref());         // new_pubkey = PDA
+    data.push(ASSET_AUTH_INSURANCE_OPERATOR); // kind = 2
+    data.extend_from_slice(vault_auth.key.as_ref()); // new_pubkey = PDA
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*admin.key, true),      // current operator (admin), signer
+            AccountMeta::new_readonly(*admin.key, true), // current operator (admin), signer
             AccountMeta::new_readonly(*vault_auth.key, true), // new operator (PDA), signer via invoke_signed
             AccountMeta::new(*market.key, false),             // market, writable
         ],
@@ -323,21 +323,21 @@ pub fn cpi_bind_insurance_operator<'a>(
 
 pub fn cpi_burn_asset_admin<'a>(
     percolator_program: &AccountInfo<'a>,
-    admin: &AccountInfo<'a>,     // current asset_admin; signer
+    admin: &AccountInfo<'a>,      // current asset_admin; signer
     vault_auth: &AccountInfo<'a>, // placeholder new_authority slot (not checked by wrapper for zero burn)
-    market: &AccountInfo<'a>,    // the slab/market account (writable, wrapper-owned)
+    market: &AccountInfo<'a>,     // the slab/market account (writable, wrapper-owned)
 ) -> ProgramResult {
     // tag(1) + asset_index(2, u16 LE = 0) + kind(1) + new_pubkey(32, all zeros) = 36 bytes.
     let mut data = Vec::with_capacity(36);
     data.push(TAG_UPDATE_ASSET_AUTHORITY);
     data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
-    data.push(ASSET_AUTH_ADMIN);                             // kind = 0
-    data.extend_from_slice(&[0u8; 32]);                      // new_pubkey = burn (all zeros)
+    data.push(ASSET_AUTH_ADMIN); // kind = 0
+    data.extend_from_slice(&[0u8; 32]); // new_pubkey = burn (all zeros)
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*admin.key, true),       // current asset_admin, signer
+            AccountMeta::new_readonly(*admin.key, true), // current asset_admin, signer
             AccountMeta::new_readonly(*vault_auth.key, false), // new_authority slot (any; not checked for zero-burn)
             AccountMeta::new(*market.key, false),              // market, writable
         ],
@@ -345,10 +345,7 @@ pub fn cpi_burn_asset_admin<'a>(
     };
 
     // Plain invoke (not signed) — admin signs as the outer tx signer; no PDA co-sign needed.
-    invoke(
-        &ix,
-        &[admin.clone(), vault_auth.clone(), market.clone()],
-    )
+    invoke(&ix, &[admin.clone(), vault_auth.clone(), market.clone()])
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -375,8 +372,8 @@ pub fn cpi_rotate_insurance_operator<'a>(
     let mut data = Vec::with_capacity(36);
     data.push(TAG_UPDATE_ASSET_AUTHORITY);
     data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
-    data.push(ASSET_AUTH_INSURANCE_OPERATOR);                // kind = 2
-    data.extend_from_slice(new_target.key.as_ref());         // new_pubkey = rotation target
+    data.push(ASSET_AUTH_INSURANCE_OPERATOR); // kind = 2
+    data.extend_from_slice(new_target.key.as_ref()); // new_pubkey = rotation target
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -428,8 +425,8 @@ pub fn cpi_rotate_insurance_authority<'a>(
     let mut data = Vec::with_capacity(36);
     data.push(TAG_UPDATE_ASSET_AUTHORITY);
     data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
-    data.push(ASSET_AUTH_INSURANCE);                         // kind = 1
-    data.extend_from_slice(new_target.key.as_ref());         // new_pubkey = rotation target
+    data.push(ASSET_AUTH_INSURANCE); // kind = 1
+    data.extend_from_slice(new_target.key.as_ref()); // new_pubkey = rotation target
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -475,9 +472,9 @@ const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 
 pub fn cpi_withdraw_insurance_asset<'a>(
     percolator_program: &AccountInfo<'a>,
-    vault_auth: &AccountInfo<'a>,   // insurance_operator = our PDA; signs via invoke_signed
-    market: &AccountInfo<'a>,       // wrapper market / slab (writable)
-    dest_token: &AccountInfo<'a>,   // destination token account (MUST be pool.vault; drain check by caller)
+    vault_auth: &AccountInfo<'a>, // insurance_operator = our PDA; signs via invoke_signed
+    market: &AccountInfo<'a>,     // wrapper market / slab (writable)
+    dest_token: &AccountInfo<'a>, // destination token account (MUST be pool.vault; drain check by caller)
     wrapper_vault: &AccountInfo<'a>, // wrapper insurance vault token account (source)
     wrapper_vault_auth: &AccountInfo<'a>, // wrapper vault authority PDA (read-only)
     token_program: &AccountInfo<'a>,
@@ -493,12 +490,12 @@ pub fn cpi_withdraw_insurance_asset<'a>(
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*vault_auth.key, true),      // operator (PDA), signer via invoke_signed
-            AccountMeta::new(*market.key, false),                   // market, writable
-            AccountMeta::new(*dest_token.key, false),               // dest_token (pool.vault), writable
-            AccountMeta::new(*wrapper_vault.key, false),            // vault_token (source), writable
+            AccountMeta::new_readonly(*vault_auth.key, true), // operator (PDA), signer via invoke_signed
+            AccountMeta::new(*market.key, false),             // market, writable
+            AccountMeta::new(*dest_token.key, false),         // dest_token (pool.vault), writable
+            AccountMeta::new(*wrapper_vault.key, false),      // vault_token (source), writable
             AccountMeta::new_readonly(*wrapper_vault_auth.key, false), // vault_authority, read-only
-            AccountMeta::new_readonly(*token_program.key, false),  // token_program, read-only
+            AccountMeta::new_readonly(*token_program.key, false), // token_program, read-only
         ],
         data,
     };
@@ -588,7 +585,7 @@ pub fn cpi_resolve_market<'a>(
         program_id: *percolator_program.key,
         accounts: vec![
             AccountMeta::new_readonly(*pool_pda.key, true), // admin == marketauth, signer
-            AccountMeta::new(*slab.key, false),              // market, writable
+            AccountMeta::new(*slab.key, false),             // market, writable
         ],
         data,
     };
@@ -728,7 +725,11 @@ pub fn cpi_update_backing_fee_policy<'a>(
         data,
     };
 
-    invoke_signed(&ix, &[vault_auth.clone(), slab.clone()], &[vault_auth_seeds])
+    invoke_signed(
+        &ix,
+        &[vault_auth.clone(), slab.clone()],
+        &[vault_auth_seeds],
+    )
 }
 
 /// Wrapper tag 55 `UpdateTradeFeePolicy`. Gated on ASSET 0's
@@ -759,7 +760,11 @@ pub fn cpi_update_trade_fee_policy<'a>(
         data,
     };
 
-    invoke_signed(&ix, &[vault_auth.clone(), slab.clone()], &[vault_auth_seeds])
+    invoke_signed(
+        &ix,
+        &[vault_auth.clone(), slab.clone()],
+        &[vault_auth_seeds],
+    )
 }
 
 #[cfg(test)]
@@ -791,17 +796,24 @@ mod tag_tests {
     fn test_cpi_bind_asset_authority_wire_shape_v17() {
         let pda = [9u8; 32];
         let mut data = Vec::with_capacity(36);
-        data.push(TAG_UPDATE_ASSET_AUTHORITY);            // byte 0: tag = 65
+        data.push(TAG_UPDATE_ASSET_AUTHORITY); // byte 0: tag = 65
         data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2: asset_index = 0
-        data.push(ASSET_AUTH_INSURANCE);                 // byte 3: kind = 1
-        data.extend_from_slice(&pda);                    // bytes 4-35: new_pubkey
+        data.push(ASSET_AUTH_INSURANCE); // byte 3: kind = 1
+        data.extend_from_slice(&pda); // bytes 4-35: new_pubkey
 
         // Total length: 36 bytes (was 34 bytes in v16)
-        assert_eq!(data.len(), 36, "v17 tag-65 wire must be 36 bytes (was 34 in v16)");
+        assert_eq!(
+            data.len(),
+            36,
+            "v17 tag-65 wire must be 36 bytes (was 34 in v16)"
+        );
 
         // (1) tag = 65, NOT 32
         assert_eq!(data[0], 65, "tag must be 65 (UpdateAssetAuthority), not 32");
-        assert_ne!(data[0], 32, "tag 32 is the OLD UpdateAuthority — MUST NOT ship");
+        assert_ne!(
+            data[0], 32,
+            "tag 32 is the OLD UpdateAuthority — MUST NOT ship"
+        );
 
         // (2) asset_index = 0 (little-endian u16)
         assert_eq!(data[1], 0x00, "asset_index low byte must be 0");
@@ -809,7 +821,10 @@ mod tag_tests {
 
         // (3) kind = 1 (ASSET_AUTH_INSURANCE), NOT 2 (old AUTHORITY_INSURANCE)
         assert_eq!(data[3], 1, "kind must be 1 (ASSET_AUTH_INSURANCE)");
-        assert_ne!(data[3], 2, "kind=2 is the OLD AUTHORITY_INSURANCE — MUST NOT ship");
+        assert_ne!(
+            data[3], 2,
+            "kind=2 is the OLD AUTHORITY_INSURANCE — MUST NOT ship"
+        );
 
         // pubkey bytes in position
         assert_eq!(&data[4..36], &pda, "new_pubkey at bytes [4..36]");
@@ -825,8 +840,8 @@ mod tag_tests {
         // Reconstruct the v16 wire
         let pda = [9u8; 32];
         let mut old_data = Vec::with_capacity(34);
-        old_data.push(32u8);  // old tag
-        old_data.push(2u8);   // old kind = AUTHORITY_INSURANCE
+        old_data.push(32u8); // old tag
+        old_data.push(2u8); // old kind = AUTHORITY_INSURANCE
         old_data.extend_from_slice(&pda);
 
         // These are the wrong values for v17
@@ -835,7 +850,10 @@ mod tag_tests {
         assert_eq!(old_data.len(), 34, "old wire was 34 bytes");
 
         // Assertions that must NOT hold in v17
-        assert_ne!(old_data[0], TAG_UPDATE_ASSET_AUTHORITY, "v17 tag must be 65");
+        assert_ne!(
+            old_data[0], TAG_UPDATE_ASSET_AUTHORITY,
+            "v17 tag must be 65"
+        );
         // kind byte in old wire is at position 1, in new wire it's at position 3
         assert_ne!(old_data.len(), 36, "v17 wire must be 36 bytes");
     }
@@ -871,10 +889,10 @@ mod tag_tests {
     fn test_cpi_bind_operator_wire_shape() {
         let pda = [7u8; 32];
         let mut data = Vec::with_capacity(36);
-        data.push(TAG_UPDATE_ASSET_AUTHORITY);             // byte 0: tag = 65
+        data.push(TAG_UPDATE_ASSET_AUTHORITY); // byte 0: tag = 65
         data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2
-        data.push(ASSET_AUTH_INSURANCE_OPERATOR);         // byte 3: kind = 2
-        data.extend_from_slice(&pda);                     // bytes 4-35
+        data.push(ASSET_AUTH_INSURANCE_OPERATOR); // byte 3: kind = 2
+        data.extend_from_slice(&pda); // bytes 4-35
 
         assert_eq!(data.len(), 36, "operator bind wire must be 36 bytes");
         assert_eq!(data[0], 65, "tag must be 65");
@@ -889,18 +907,25 @@ mod tag_tests {
     #[test]
     fn test_cpi_burn_asset_admin_wire_shape() {
         let mut data = Vec::with_capacity(36);
-        data.push(TAG_UPDATE_ASSET_AUTHORITY);             // byte 0: tag = 65
+        data.push(TAG_UPDATE_ASSET_AUTHORITY); // byte 0: tag = 65
         data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2
-        data.push(ASSET_AUTH_ADMIN);                      // byte 3: kind = 0
-        data.extend_from_slice(&[0u8; 32]);               // bytes 4-35: zero burn
+        data.push(ASSET_AUTH_ADMIN); // byte 3: kind = 0
+        data.extend_from_slice(&[0u8; 32]); // bytes 4-35: zero burn
 
         assert_eq!(data.len(), 36, "admin burn wire must be 36 bytes");
         assert_eq!(data[0], 65, "tag must be 65");
         assert_eq!(data[3], 0, "kind must be 0 (ASSET_AUTH_ADMIN)");
         assert_ne!(data[3], 1, "must not be kind=1 (ASSET_AUTH_INSURANCE)");
-        assert_ne!(data[3], 2, "must not be kind=2 (ASSET_AUTH_INSURANCE_OPERATOR)");
+        assert_ne!(
+            data[3], 2,
+            "must not be kind=2 (ASSET_AUTH_INSURANCE_OPERATOR)"
+        );
         // new_pubkey must be all zeros (the burn value)
-        assert_eq!(&data[4..36], &[0u8; 32], "new_pubkey must be all-zeros for admin burn");
+        assert_eq!(
+            &data[4..36],
+            &[0u8; 32],
+            "new_pubkey must be all-zeros for admin burn"
+        );
     }
 
     /// GUARD: all three kind constants in the secure-bind sequence are distinct
@@ -909,7 +934,10 @@ mod tag_tests {
     fn test_secure_bind_kind_constants_are_distinct() {
         assert_eq!(ASSET_AUTH_ADMIN, 0, "ASSET_AUTH_ADMIN must be 0");
         assert_eq!(ASSET_AUTH_INSURANCE, 1, "ASSET_AUTH_INSURANCE must be 1");
-        assert_eq!(ASSET_AUTH_INSURANCE_OPERATOR, 2, "ASSET_AUTH_INSURANCE_OPERATOR must be 2");
+        assert_eq!(
+            ASSET_AUTH_INSURANCE_OPERATOR, 2,
+            "ASSET_AUTH_INSURANCE_OPERATOR must be 2"
+        );
         // They must all differ (confusion between these is a security footgun)
         assert_ne!(ASSET_AUTH_ADMIN, ASSET_AUTH_INSURANCE);
         assert_ne!(ASSET_AUTH_ADMIN, ASSET_AUTH_INSURANCE_OPERATOR);
@@ -930,7 +958,7 @@ mod tag_tests {
     fn test_cpi_withdraw_insurance_asset_wire_shape() {
         let amount: u64 = 250_000;
         let mut data = Vec::with_capacity(19);
-        data.push(TAG_WITHDRAW_INSURANCE_ASSET);               // byte 0: tag = 57
+        data.push(TAG_WITHDRAW_INSURANCE_ASSET); // byte 0: tag = 57
         data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2: asset_index = 0
         data.extend_from_slice(&(amount as u128).to_le_bytes()); // bytes 3-18: amount u128 LE
 
@@ -944,7 +972,11 @@ mod tag_tests {
         assert_eq!(decoded, amount as u128, "amount round-trips as u128 LE");
 
         // Guard: must NOT be the 9-byte u64 wire (would be rejected by wrapper read_u128).
-        assert_ne!(data.len(), 9, "9-byte u64 wire would be rejected by wrapper");
+        assert_ne!(
+            data.len(),
+            9,
+            "9-byte u64 wire would be rejected by wrapper"
+        );
         // Guard: tag 57, not tag 9 (TopUpInsurance) — different directions.
         assert_ne!(data[0], TAG_TOP_UP_INSURANCE, "must be tag 57, not tag 9");
     }
@@ -957,7 +989,11 @@ mod tag_tests {
         let mut data = Vec::with_capacity(1);
         data.push(TAG_RESOLVE_MARKET);
 
-        assert_eq!(data.len(), 1, "tag-19 ResolveMarket wire must be exactly 1 byte");
+        assert_eq!(
+            data.len(),
+            1,
+            "tag-19 ResolveMarket wire must be exactly 1 byte"
+        );
         assert_eq!(data[0], 19, "tag must be 19 (ResolveMarket)");
 
         // Byte-for-byte parity with the deployed vault's cpi_resolve_market:
@@ -992,9 +1028,16 @@ mod tag_tests {
             (true, false), // 0: pool PDA (marketauth), signer via invoke_signed, read-only
             (false, true), // 1: market/slab, writable, not a signer
         ];
-        assert_eq!(shape.len(), 2, "ResolveMarket CPI must pass exactly 2 accounts");
+        assert_eq!(
+            shape.len(),
+            2,
+            "ResolveMarket CPI must pass exactly 2 accounts"
+        );
         assert!(shape[0].0, "account 0 (marketauth) must be a signer");
-        assert!(!shape[0].1, "account 0 (marketauth) is read-only, not writable");
+        assert!(
+            !shape[0].1,
+            "account 0 (marketauth) is read-only, not writable"
+        );
         assert!(shape[1].1, "account 1 (market) must be writable");
         assert!(!shape[1].0, "account 1 (market) is not a signer");
     }

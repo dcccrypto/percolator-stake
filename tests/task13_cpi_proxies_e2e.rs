@@ -802,7 +802,9 @@ fn tag88_maintenance_fee_direct_dies_after_initpool_and_proxy_writes_full_u128()
         &[&e.admin],
         direct_update_maintenance_fee_ix(e.wrapper_id, e.admin.pubkey(), market, BIG),
     )
-    .expect_err("AFTER StakeInitPool the direct tag-88 call must fail (marketauth is the pool PDA)");
+    .expect_err(
+        "AFTER StakeInitPool the direct tag-88 call must fail (marketauth is the pool PDA)",
+    );
     eprintln!("tag88 direct-call-after-InitPool rejected with: {err:?}");
     assert_eq!(
         read_u128_at(&e.svm, &market, OFF_MAINTENANCE_FEE_PER_SLOT),

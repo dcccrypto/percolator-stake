@@ -32,16 +32,26 @@ fn calc_lp_for_deposit(supply: u64, pool_value: u64, deposit: u64) -> Option<u64
         let lp = (deposit as u128)
             .checked_mul(supply as u128)?
             .checked_div(pool_value as u128)?;
-        if lp > u64::MAX as u128 { None } else { Some(lp as u64) }
+        if lp > u64::MAX as u128 {
+            None
+        } else {
+            Some(lp as u64)
+        }
     }
 }
 
 fn calc_collateral_for_withdraw(supply: u64, pool_value: u64, lp: u64) -> Option<u64> {
-    if supply == 0 { return None; }
+    if supply == 0 {
+        return None;
+    }
     let col = (lp as u128)
         .checked_mul(pool_value as u128)?
         .checked_div(supply as u128)?;
-    if col > u64::MAX as u128 { None } else { Some(col as u64) }
+    if col > u64::MAX as u128 {
+        None
+    } else {
+        Some(col as u64)
+    }
 }
 
 /// Mirror of math::distribute_fees
@@ -51,15 +61,21 @@ fn distribute_fees(
     junior_fee_mult_bps: u16,
     total_fee: u64,
 ) -> (u64, u64) {
-    if total_fee == 0 { return (0, 0); }
+    if total_fee == 0 {
+        return (0, 0);
+    }
     let total_balance = junior_balance as u128 + senior_balance as u128;
-    if total_balance == 0 { return (0, 0); }
+    if total_balance == 0 {
+        return (0, 0);
+    }
 
     let junior_weight = (junior_balance as u128) * (junior_fee_mult_bps as u128);
     let senior_weight = (senior_balance as u128) * 10_000u128;
     let total_weight = junior_weight + senior_weight;
 
-    if total_weight == 0 { return (0, 0); }
+    if total_weight == 0 {
+        return (0, 0);
+    }
 
     let junior_fee_u128 = if let Some(product) = (total_fee as u128).checked_mul(junior_weight) {
         product / total_weight
@@ -67,7 +83,8 @@ fn distribute_fees(
         let q = (total_fee as u128) / total_weight;
         let r = (total_fee as u128) % total_weight;
         let part1 = q * junior_weight;
-        let part2 = r.checked_mul(junior_weight)
+        let part2 = r
+            .checked_mul(junior_weight)
             .map(|p| p / total_weight)
             .unwrap_or(total_fee as u128);
         part1.saturating_add(part2)
@@ -708,11 +725,17 @@ fn test_loss_exceeds_total_is_capped() {
 #[test]
 fn test_cpi_insurance_policy_tag_is_not_30() {
     let data = build_set_insurance_withdraw_policy([0u8; 32], 0, 0, 0);
-    assert_eq!(data[0], 22, "CRIT: SetInsuranceWithdrawPolicy must be 22, not 30");
+    assert_eq!(
+        data[0], 22,
+        "CRIT: SetInsuranceWithdrawPolicy must be 22, not 30"
+    );
 }
 
 #[test]
 fn test_cpi_withdraw_limited_tag_is_not_31() {
     let data = build_withdraw_insurance_limited(1000);
-    assert_eq!(data[0], 23, "CRIT: WithdrawInsuranceLimited must be 23, not 31");
+    assert_eq!(
+        data[0], 23,
+        "CRIT: WithdrawInsuranceLimited must be 23, not 31"
+    );
 }

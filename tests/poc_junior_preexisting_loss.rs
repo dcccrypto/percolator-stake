@@ -55,7 +55,8 @@ fn first_junior_inherits_preexisting_loss() {
     // so effective_junior_balance() == 0 and she mints 1:1 — it looks like a fair entry.
     let eff_at_deposit = pool.effective_junior_balance();
     assert_eq!(eff_at_deposit, 0);
-    let jane_lp = calc_junior_lp_for_deposit(pool.junior_total_lp(), eff_at_deposit, 1_000_000).unwrap();
+    let jane_lp =
+        calc_junior_lp_for_deposit(pool.junior_total_lp(), eff_at_deposit, 1_000_000).unwrap();
     assert_eq!(jane_lp, 1_000_000);
     pool.set_junior_balance(1_000_000);
     pool.set_junior_total_lp(jane_lp);
@@ -71,9 +72,14 @@ fn first_junior_inherits_preexisting_loss() {
     );
 
     // Jane withdraws her 1,000,000 LP and recovers only 400,000 — an instant 600,000 loss.
-    let jane_back = calc_junior_collateral_for_withdraw(pool.junior_total_lp(), eff_after, jane_lp).unwrap();
+    let jane_back =
+        calc_junior_collateral_for_withdraw(pool.junior_total_lp(), eff_after, jane_lp).unwrap();
     assert_eq!(jane_back, 400_000);
-    assert_eq!(1_000_000 - jane_back, 600_000, "Jane lost the full pre-existing loss");
+    assert_eq!(
+        1_000_000 - jane_back,
+        600_000,
+        "Jane lost the full pre-existing loss"
+    );
 
     // Greg (now senior) recovers his FULL 3,000,000 — his loss evaporated onto Jane.
     let greg_back = calc_senior_collateral_for_withdraw(
@@ -82,7 +88,10 @@ fn first_junior_inherits_preexisting_loss() {
         3_000_000,
     )
     .unwrap();
-    assert_eq!(greg_back, 3_000_000, "incumbent made whole at the new junior's expense");
+    assert_eq!(
+        greg_back, 3_000_000,
+        "incumbent made whole at the new junior's expense"
+    );
 
     // Conservation holds globally (3,000,000 + 400,000 == 3,400,000 == vault), which is
     // exactly why no runtime check catches it — but 600,000 was transferred from the
@@ -110,13 +119,22 @@ fn junior_deposit_gate_fires_while_loss_outstanding_and_lifts_on_return() {
 
     // Outstanding loss → gate fires (handler rejects DepositJunior).
     pool.total_flushed = 600_000;
-    assert!(pool.total_flushed > pool.total_returned, "gate must fire while loss outstanding");
+    assert!(
+        pool.total_flushed > pool.total_returned,
+        "gate must fire while loss outstanding"
+    );
 
     // Partial return → still outstanding → gate still fires.
     pool.total_returned = 200_000;
-    assert!(pool.total_flushed > pool.total_returned, "gate must stay closed on partial return");
+    assert!(
+        pool.total_flushed > pool.total_returned,
+        "gate must stay closed on partial return"
+    );
 
     // Fully returned → gate lifts → junior deposits resume.
     pool.total_returned = 600_000;
-    assert!(!(pool.total_flushed > pool.total_returned), "gate must lift once fully returned");
+    assert!(
+        !(pool.total_flushed > pool.total_returned),
+        "gate must lift once fully returned"
+    );
 }

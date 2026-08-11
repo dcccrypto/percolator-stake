@@ -955,16 +955,30 @@ fn test_154_deposit_cap_enforced_on_principal_not_fees() {
     pool.total_lp_supply = 800_000;
     pool.total_fees_earned = 300_000; // tpv = 1_100_000 (> cap); principal = 800_000 (< cap)
 
-    assert_eq!(pool.principal_tvl(), Some(800_000), "principal excludes accrued fees");
-    assert_eq!(pool.total_pool_value(), Some(1_100_000), "tpv includes accrued fees");
+    assert_eq!(
+        pool.principal_tvl(),
+        Some(800_000),
+        "principal excludes accrued fees"
+    );
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(1_100_000),
+        "tpv includes accrued fees"
+    );
 
     // A 150K deposit keeps principal at 950K (<= 1M cap) → admitted under the fixed (principal) basis.
     let deposit = 150_000u64;
     let principal_after = pool.principal_tvl().unwrap() + deposit;
-    assert!(principal_after <= pool.deposit_cap, "#154: principal-basis cap admits the deposit");
+    assert!(
+        principal_after <= pool.deposit_cap,
+        "#154: principal-basis cap admits the deposit"
+    );
     // The old tpv-basis would have (wrongly) rejected it: 1.1M + 150K = 1.25M > cap.
     let tpv_after = pool.total_pool_value().unwrap() + deposit;
-    assert!(tpv_after > pool.deposit_cap, "old fee-inclusive basis would have rejected it");
+    assert!(
+        tpv_after > pool.deposit_cap,
+        "old fee-inclusive basis would have rejected it"
+    );
 
     // 2026-07-19: mode-0 insurance pools now accrue fees too, so principal_tvl()
     // (which never has a fee term, for either mode) diverges from total_pool_value()
@@ -974,7 +988,11 @@ fn test_154_deposit_cap_enforced_on_principal_not_fees() {
     m0.pool_mode = 0;
     m0.total_deposited = 500_000;
     m0.total_fees_earned = 99_999; // now counted in tpv, still excluded from principal_tvl
-    assert_eq!(m0.principal_tvl(), Some(500_000), "mode-0: principal_tvl excludes fees");
+    assert_eq!(
+        m0.principal_tvl(),
+        Some(500_000),
+        "mode-0: principal_tvl excludes fees"
+    );
     assert_eq!(
         m0.total_pool_value(),
         Some(599_999),
@@ -995,12 +1013,20 @@ fn test_161_last_junior_exit_does_not_windfall_recovery_to_senior() {
     pool.total_lp_supply = 200_000;
     pool.set_junior_balance(100_000);
     pool.set_junior_total_lp(100_000);
-    assert_eq!(pool.senior_balance().unwrap(), 100_000, "senior 100k pre-loss");
+    assert_eq!(
+        pool.senior_balance().unwrap(),
+        100_000,
+        "senior 100k pre-loss"
+    );
 
     // Flush 50k, junior-absorbed: senior protected, junior marked down to 50k.
     pool.total_flushed = 50_000;
     assert_eq!(pool.effective_junior_balance(), 50_000);
-    assert_eq!(pool.senior_balance().unwrap(), 100_000, "senior protected by junior first-loss");
+    assert_eq!(
+        pool.senior_balance().unwrap(),
+        100_000,
+        "senior protected by junior first-loss"
+    );
 
     // Last junior exits at eff_jb. Mirror process_withdraw's full-exit updates + the #161 booking.
     let junior_payout = pool.effective_junior_balance(); // 50k
@@ -1012,7 +1038,10 @@ fn test_161_last_junior_exit_does_not_windfall_recovery_to_senior() {
         .junior_balance()
         .saturating_sub(pool.effective_junior_balance())
         .min(net_loss);
-    assert_eq!(forfeited, 50_000, "junior forfeits the 50k loss it absorbed");
+    assert_eq!(
+        forfeited, 50_000,
+        "junior forfeits the 50k loss it absorbed"
+    );
     pool.total_returned += forfeited;
     pool.set_realized_junior_loss(pool.realized_junior_loss() + forfeited);
     pool.set_junior_total_lp(0);
@@ -1021,7 +1050,11 @@ fn test_161_last_junior_exit_does_not_windfall_recovery_to_senior() {
 
     // Senior is NOT windfalled — stays at its 100k principal.
     assert_eq!(pool.effective_junior_balance(), 0);
-    assert_eq!(pool.total_pool_value().unwrap(), 100_000, "tpv excludes the dead forfeited loss");
+    assert_eq!(
+        pool.total_pool_value().unwrap(),
+        100_000,
+        "tpv excludes the dead forfeited loss"
+    );
     assert_eq!(
         pool.senior_balance().unwrap(),
         100_000,
@@ -1131,7 +1164,11 @@ fn test_169_mode0_unaffected_and_rl_still_subtracted() {
         Some(700),
         "#161 RL still subtracted under the i128 rewrite"
     );
-    assert_eq!(pool.principal_tvl(), Some(700), "principal_tvl also subtracts RL");
+    assert_eq!(
+        pool.principal_tvl(),
+        Some(700),
+        "principal_tvl also subtracts RL"
+    );
 }
 
 #[test]
@@ -1142,6 +1179,10 @@ fn test_169_mode1_fees_included_in_value_but_not_principal() {
     pool.pool_mode = 1;
     pool.total_deposited = 1_000;
     pool.total_fees_earned = 250;
-    assert_eq!(pool.total_pool_value(), Some(1_250), "value includes fees in mode 1");
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(1_250),
+        "value includes fees in mode 1"
+    );
     assert_eq!(pool.principal_tvl(), Some(1_000), "cap basis excludes fees");
 }

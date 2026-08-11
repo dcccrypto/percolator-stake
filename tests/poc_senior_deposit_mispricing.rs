@@ -39,7 +39,9 @@ fn initialized_pool() -> StakePool {
 
 /// Old (buggy) senior deposit pricing: GLOBAL pool ratio.
 fn senior_deposit_global(pool: &mut StakePool, amount: u64) -> u64 {
-    let lp = pool.calc_lp_for_deposit(amount).expect("calc_lp_for_deposit");
+    let lp = pool
+        .calc_lp_for_deposit(amount)
+        .expect("calc_lp_for_deposit");
     pool.total_deposited += amount;
     pool.total_lp_supply += lp;
     lp
@@ -64,8 +66,12 @@ fn senior_deposit_fixed(pool: &mut StakePool, amount: u64) -> u64 {
 
 /// Senior withdraw — same as `process_withdraw`'s senior branch.
 fn senior_withdraw(pool: &mut StakePool, lp: u64) -> u64 {
-    let coll = calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), lp)
-        .expect("calc_senior_collateral_for_withdraw");
+    let coll = calc_senior_collateral_for_withdraw(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        lp,
+    )
+    .expect("calc_senior_collateral_for_withdraw");
     pool.total_withdrawn += coll;
     pool.total_lp_supply -= lp;
     coll
@@ -106,8 +112,12 @@ fn senior_subpool_pricing_prevents_extraction() {
     // Regression guard: the FIXED senior sub-pool pricing yields NO profit and
     // leaves the incumbent senior whole.
     let (mut pool, alice_lp) = setup();
-    let alice_before =
-        calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), alice_lp).unwrap();
+    let alice_before = calc_senior_collateral_for_withdraw(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        alice_lp,
+    )
+    .unwrap();
 
     let eve_dep = 1_000_000u64;
     let eve_lp = senior_deposit_fixed(&mut pool, eve_dep);
@@ -117,8 +127,12 @@ fn senior_subpool_pricing_prevents_extraction() {
         "FIX: sub-pool-priced senior deposit must not profit (got {eve_back} for {eve_dep})"
     );
 
-    let alice_after =
-        calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), alice_lp).unwrap();
+    let alice_after = calc_senior_collateral_for_withdraw(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        alice_lp,
+    )
+    .unwrap();
     assert!(
         alice_after >= alice_before,
         "FIX: incumbent senior must not be diluted ({alice_before} -> {alice_after})"

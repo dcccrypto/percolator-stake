@@ -65,8 +65,12 @@ fn accrue(pool: &mut StakePool, vault: u64) {
 
 /// CURRENT `process_deposit_junior`: price against `effective_junior_balance()` with NO pre-accrue.
 fn deposit_junior_current(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
-    let lp = calc_junior_lp_for_deposit(pool.junior_total_lp(), pool.effective_junior_balance(), amount)
-        .expect("calc_junior_lp_for_deposit");
+    let lp = calc_junior_lp_for_deposit(
+        pool.junior_total_lp(),
+        pool.effective_junior_balance(),
+        amount,
+    )
+    .expect("calc_junior_lp_for_deposit");
     pool.total_deposited += amount;
     pool.total_lp_supply += lp;
     pool.set_junior_total_lp(pool.junior_total_lp() + lp);
@@ -78,8 +82,12 @@ fn deposit_junior_current(pool: &mut StakePool, vault: &mut u64, amount: u64) ->
 /// FIXED `process_deposit_junior`: crystallize pending fees (pre-accrue) BEFORE pricing.
 fn deposit_junior_fixed(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
     accrue(pool, *vault); // <-- the fix: mirror the #136 pre-accrue from process_deposit
-    let lp = calc_junior_lp_for_deposit(pool.junior_total_lp(), pool.effective_junior_balance(), amount)
-        .expect("calc_junior_lp_for_deposit");
+    let lp = calc_junior_lp_for_deposit(
+        pool.junior_total_lp(),
+        pool.effective_junior_balance(),
+        amount,
+    )
+    .expect("calc_junior_lp_for_deposit");
     pool.total_deposited += amount;
     pool.total_lp_supply += lp;
     pool.set_junior_total_lp(pool.junior_total_lp() + lp);
@@ -89,9 +97,12 @@ fn deposit_junior_fixed(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u
 }
 
 fn withdraw_junior(pool: &mut StakePool, vault: &mut u64, lp: u64) -> u64 {
-    let coll =
-        calc_junior_collateral_for_withdraw(pool.junior_total_lp(), pool.effective_junior_balance(), lp)
-            .expect("calc_junior_collateral_for_withdraw");
+    let coll = calc_junior_collateral_for_withdraw(
+        pool.junior_total_lp(),
+        pool.effective_junior_balance(),
+        lp,
+    )
+    .expect("calc_junior_collateral_for_withdraw");
     pool.total_withdrawn += coll;
     pool.total_lp_supply -= lp;
     pool.set_junior_total_lp(pool.junior_total_lp() - lp);
@@ -128,7 +139,10 @@ fn junior_jit_fee_snipe_is_profitable_with_current_pricing() {
     // VIRTUAL_ASSETS=1 offset (math.rs) rounds this withdrawal pool-favoring by 1
     // unit versus the pre-N7 exact value (was 1,400,000) — dust retained by the
     // pool, not a change in the JIT-snipe vulnerability this PoC documents.
-    assert_eq!(eve_back, 1_399_999, "Eve captures ~+400,000 of fees she did not earn (minus 1 unit of N7 offset dust)");
+    assert_eq!(
+        eve_back, 1_399_999,
+        "Eve captures ~+400,000 of fees she did not earn (minus 1 unit of N7 offset dust)"
+    );
 }
 
 #[test]
