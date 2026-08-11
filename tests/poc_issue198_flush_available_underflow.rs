@@ -89,8 +89,14 @@ fn flush_available_underflows_in_a_reachable_state_with_tokens_present() {
     assert_eq!(physical_vault(&p), 20);
 
     // Underflow precondition: D - W < F  <=>  total_pool_value() < total_returned.
-    assert!(p.total_deposited - p.total_withdrawn < p.total_flushed, "D - W < F");
-    assert!(tpv < p.total_returned, "equivalently, total_pool_value < total_returned");
+    assert!(
+        p.total_deposited - p.total_withdrawn < p.total_flushed,
+        "D - W < F"
+    );
+    assert!(
+        tpv < p.total_returned,
+        "equivalently, total_pool_value < total_returned"
+    );
 
     // BUG: the old inline calc underflows at `(D-W) - F` = (70 - 100) -> None,
     // so the old process_flush_to_insurance returned StakeError::Overflow.
@@ -124,7 +130,11 @@ fn fix_does_not_overcount_flushable_balance_with_realized_junior_loss() {
 
     // The naive reorder would report 150 (= physical vault + realized_junior_loss),
     // letting the admin be admitted to flush 50 tokens that are NOT in the vault.
-    assert_eq!(reorder_available(&p), Some(150), "reorder over-counts by realized_junior_loss");
+    assert_eq!(
+        reorder_available(&p),
+        Some(150),
+        "reorder over-counts by realized_junior_loss"
+    );
 
     // The implemented fix reports exactly the real balance (100) -> no over-count.
     assert_eq!(fixed_available(&p), Some(100));
@@ -158,5 +168,9 @@ fn fix_still_blocks_flush_when_vault_truly_empty() {
     p.total_returned = 100;
     assert_eq!(p.total_pool_value().unwrap(), 0);
     assert_eq!(physical_vault(&p), 0);
-    assert_eq!(fixed_available(&p), Some(0), "fix reports 0 -> any flush still blocked");
+    assert_eq!(
+        fixed_available(&p),
+        Some(0),
+        "fix reports 0 -> any flush still blocked"
+    );
 }

@@ -170,8 +170,7 @@ impl Env {
         let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
         svm.add_program_from_file(stake_id, stake_so()).unwrap();
-        svm.add_program_from_file(wrapper_id, wrapper_so())
-            .unwrap();
+        svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
 
         let payer = Keypair::new();
         let admin = Keypair::new();
@@ -344,8 +343,7 @@ fn smoke_both_programs_load() {
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
     svm.add_program_from_file(stake_id, stake_path).unwrap();
-    svm.add_program_from_file(wrapper_id, wrapper_path)
-        .unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_path).unwrap();
     assert!(svm.get_account(&stake_id).unwrap().executable);
     assert!(svm.get_account(&wrapper_id).unwrap().executable);
 }
@@ -852,8 +850,7 @@ fn no_lockout_rotate_then_rebind_from_new_program() {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     svm.add_program_from_file(stake_id, stake_so()).unwrap();
     svm.add_program_from_file(stake_id_2, stake_so()).unwrap();
-    svm.add_program_from_file(wrapper_id, wrapper_so())
-        .unwrap();
+    svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
 
     let admin = Keypair::new();
     let payer = Keypair::new();

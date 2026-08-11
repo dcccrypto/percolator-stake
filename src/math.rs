@@ -328,11 +328,11 @@ pub fn distribute_fees(
         let q = (total_fee as u128) / total_weight;
         let r = (total_fee as u128) % total_weight;
         let part1 = q * junior_weight; // q ≤ 2^64, junior_weight ≤ 2^80 → fits u128
-        // part2 = floor(r * junior_weight / total_weight). r < total_weight ≤ ~2^81 and
-        // junior_weight ≤ ~2^80, so r * junior_weight (~2^161) overflows u128. The previous
-        // `unwrap_or(total_fee)` fallback on that overflow handed junior 100% of the fee
-        // (0% to the protected senior tranche) — see #120. Use an exact, overflow-safe
-        // 256-bit mul-div instead. The true result is < junior_weight ≤ ~2^80, so it fits.
+                                       // part2 = floor(r * junior_weight / total_weight). r < total_weight ≤ ~2^81 and
+                                       // junior_weight ≤ ~2^80, so r * junior_weight (~2^161) overflows u128. The previous
+                                       // `unwrap_or(total_fee)` fallback on that overflow handed junior 100% of the fee
+                                       // (0% to the protected senior tranche) — see #120. Use an exact, overflow-safe
+                                       // 256-bit mul-div instead. The true result is < junior_weight ≤ ~2^80, so it fits.
         let part2 = mul_div_floor(r, junior_weight, total_weight);
         part1.saturating_add(part2)
     };
@@ -377,7 +377,11 @@ fn mul_div_floor(a: u128, b: u128, d: u128) -> u128 {
     let mut i: u32 = 256;
     while i > 0 {
         i -= 1;
-        let bit = if i >= 128 { (hi >> (i - 128)) & 1 } else { (lo >> i) & 1 };
+        let bit = if i >= 128 {
+            (hi >> (i - 128)) & 1
+        } else {
+            (lo >> i) & 1
+        };
         let rem_top = rem >> 127; // bit shifted out of the 128-bit rem below
         rem = (rem << 1) | bit;
         // Compare the true remainder (rem_top:rem) against d; reduce if >=.
@@ -496,7 +500,10 @@ mod tests {
         // way (999 <= 1000 deposited), just slightly more conservative than before.
         let back = calc_collateral_for_withdraw(5_500, 11_000, 500).unwrap();
         assert_eq!(back, 999);
-        assert!(back <= 1_000, "N7 offset must never let a withdrawal profit");
+        assert!(
+            back <= 1_000,
+            "N7 offset must never let a withdrawal profit"
+        );
     }
 
     #[test]
@@ -733,9 +740,12 @@ mod tests {
         // Deposit then immediate withdraw on the senior sub-pool must not profit.
         // Senior sub-pool after a junior-absorbed loss: senior_total_lp=1000, senior_balance=1000.
         let lp = calc_senior_lp_for_deposit(1000, 1000, 1000).unwrap(); // 1000 LP
-        // After deposit, senior_total_lp=2000, senior_balance=2000.
+                                                                        // After deposit, senior_total_lp=2000, senior_balance=2000.
         let back = calc_senior_collateral_for_withdraw(2000, 2000, lp).unwrap();
-        assert!(back <= 1000, "senior round-trip must not profit (got {back})");
+        assert!(
+            back <= 1000,
+            "senior round-trip must not profit (got {back})"
+        );
     }
 
     #[test]
@@ -941,10 +951,13 @@ mod tests {
     fn test_fee_appreciation_increases_share_price() {
         let lp_before = calc_collateral_for_withdraw(1000, 1000, 100).unwrap();
         assert_eq!(lp_before, 100); // supply == value -> offset cancels exactly
-        // N7: 100*(1200+1)/(1000+1) = 119.98... -> floor 119 (was exact 120 pre-offset).
+                                    // N7: 100*(1200+1)/(1000+1) = 119.98... -> floor 119 (was exact 120 pre-offset).
         let lp_after = calc_collateral_for_withdraw(1000, 1200, 100).unwrap();
         assert_eq!(lp_after, 119);
-        assert!(lp_after > lp_before, "fee appreciation must still raise share price");
+        assert!(
+            lp_after > lp_before,
+            "fee appreciation must still raise share price"
+        );
     }
 
     // ── N7 (CONSOLIDATED-PLAN §2.2): virtual-offset mutation checks ─────────
@@ -1003,7 +1016,10 @@ mod tests {
              STRICTLY LESS than the pre-N7 baseline {pre_n7} — equality means the virtual \
              offset was removed"
         );
-        assert!(current > 0, "sanity: this deposit must still mint something");
+        assert!(
+            current > 0,
+            "sanity: this deposit must still mint something"
+        );
     }
 
     #[test]
@@ -1028,7 +1044,10 @@ mod tests {
         // from an unrelated formula change.
         let current = calc_lp_for_deposit(500_000, 500_000, 250_000).unwrap();
         let pre_n7 = pre_n7_calc_lp_for_deposit_baseline(500_000, 500_000, 250_000).unwrap();
-        assert_eq!(current, pre_n7, "supply==value must cancel the offset exactly");
+        assert_eq!(
+            current, pre_n7,
+            "supply==value must cancel the offset exactly"
+        );
     }
 }
 

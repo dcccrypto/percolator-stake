@@ -54,7 +54,11 @@ fn senior_deposit_during_loss_snipes_recovery() {
     pool.total_flushed = 600_000;
     assert_eq!(pool.effective_junior_balance(), 0);
     assert_eq!(pool.total_pool_value().unwrap(), 400_000);
-    assert_eq!(pool.senior_balance().unwrap(), 400_000, "senior depressed during the loss");
+    assert_eq!(
+        pool.senior_balance().unwrap(),
+        400_000,
+        "senior depressed during the loss"
+    );
     assert!(senior_marked_down(&pool));
 
     // Eve deposits 400k senior at the depressed price (UNGATED today).
@@ -64,9 +68,12 @@ fn senior_deposit_during_loss_snipes_recovery() {
     // vulnerability this PoC documents (N7 is orthogonal defense-in-depth; the
     // actual fix for THIS bug is the senior recovery-snipe gate, exercised by the
     // other tests in this file).
-    let eve_lp =
-        calc_senior_lp_for_deposit(pool.senior_total_lp(), pool.senior_balance().unwrap(), 400_000)
-            .unwrap();
+    let eve_lp = calc_senior_lp_for_deposit(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        400_000,
+    )
+    .unwrap();
     assert_eq!(eve_lp, 899_998, "400k * (900k+1) / (400k+1), N7 offset");
     pool.total_deposited += 400_000;
     pool.total_lp_supply += eve_lp;
@@ -80,20 +87,40 @@ fn senior_deposit_during_loss_snipes_recovery() {
 
     // Eve withdraws her senior LP. N7 offset again shaves 1 unit off the exact
     // pre-N7 value (900k*1.3M/1.8M = 650,000); still a clean transfer from Greg.
-    let eve_out =
-        calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), eve_lp)
-            .unwrap();
-    assert_eq!(eve_out, 649_999, "N7-offset value; pre-N7 was 900k * 1.3M / 1.8M = 650,000");
-    assert_eq!(eve_out - 400_000, 249_999, "Eve nets ~+250k on a 400k deposit she never put at risk");
+    let eve_out = calc_senior_collateral_for_withdraw(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        eve_lp,
+    )
+    .unwrap();
+    assert_eq!(
+        eve_out, 649_999,
+        "N7-offset value; pre-N7 was 900k * 1.3M / 1.8M = 650,000"
+    );
+    assert_eq!(
+        eve_out - 400_000,
+        249_999,
+        "Eve nets ~+250k on a 400k deposit she never put at risk"
+    );
     pool.total_withdrawn += eve_out;
     pool.total_lp_supply -= eve_lp;
 
     // Greg (incumbent senior) withdraws his 900k senior LP.
-    let greg_out =
-        calc_senior_collateral_for_withdraw(pool.senior_total_lp(), pool.senior_balance().unwrap(), 900_000)
-            .unwrap();
-    assert_eq!(greg_out, 650_001, "deposited 900k, recovers only ~650k (N7-offset value)");
-    assert_eq!(900_000 - greg_out, eve_out - 400_000, "Greg's -~250k == Eve's +~250k (clean transfer)");
+    let greg_out = calc_senior_collateral_for_withdraw(
+        pool.senior_total_lp(),
+        pool.senior_balance().unwrap(),
+        900_000,
+    )
+    .unwrap();
+    assert_eq!(
+        greg_out, 650_001,
+        "deposited 900k, recovers only ~650k (N7-offset value)"
+    );
+    assert_eq!(
+        900_000 - greg_out,
+        eve_out - 400_000,
+        "Greg's -~250k == Eve's +~250k (clean transfer)"
+    );
     // Without Eve, after the return senior_balance would be 900k over 900k LP -> Greg whole.
 }
 
@@ -109,7 +136,10 @@ fn gate_blocks_snipe_only_while_senior_marked_down() {
     p.set_junior_balance(100_000);
     p.set_junior_total_lp(100_000);
     p.total_flushed = 600_000; // > junior 100k
-    assert!(senior_marked_down(&p), "loss spilled past junior -> senior deposits paused");
+    assert!(
+        senior_marked_down(&p),
+        "loss spilled past junior -> senior deposits paused"
+    );
 
     // (b) Loss <= junior: senior fully protected (unchanged) -> senior deposits stay OPEN.
     let mut p2 = tranche_pool();
@@ -118,12 +148,22 @@ fn gate_blocks_snipe_only_while_senior_marked_down() {
     p2.set_junior_balance(100_000);
     p2.set_junior_total_lp(100_000);
     p2.total_flushed = 80_000; // < junior 100k: junior absorbs, senior NOT marked down
-    assert_eq!(p2.senior_balance().unwrap(), 900_000, "senior unchanged when loss <= junior");
-    assert!(!senior_marked_down(&p2), "no snipe possible -> senior deposits remain allowed");
+    assert_eq!(
+        p2.senior_balance().unwrap(),
+        900_000,
+        "senior unchanged when loss <= junior"
+    );
+    assert!(
+        !senior_marked_down(&p2),
+        "no snipe possible -> senior deposits remain allowed"
+    );
 
     // (c) After the insurance is returned, the gate lifts.
     p.total_returned = 600_000;
-    assert!(!senior_marked_down(&p), "gate lifts once the loss is recovered");
+    assert!(
+        !senior_marked_down(&p),
+        "gate lifts once the loss is recovered"
+    );
 }
 
 /// The crux that picks the PRECISE gate over both the simple-symmetric gate and a
@@ -144,12 +184,17 @@ fn precise_gate_no_false_fire_on_junior_partial_exit() {
     // Flush 300k — junior-ABSORBED (300k <= 400k): senior NOT marked down.
     pool.total_flushed = 300_000;
     assert_eq!(pool.effective_junior_balance(), 100_000);
-    assert_eq!(pool.senior_balance().unwrap(), 900_000, "senior untouched by a junior-absorbed loss");
+    assert_eq!(
+        pool.senior_balance().unwrap(),
+        900_000,
+        "senior untouched by a junior-absorbed loss"
+    );
     assert!(!senior_marked_down(&pool));
 
     // A junior burns 390k of 400k LP. Valued against effective_junior (100k):
     // withdrawal_amount = 390k * 100k / 400k = 97_500. Raw junior_balance drops by that.
-    let wd = calc_junior_collateral_for_withdraw(400_000, pool.effective_junior_balance(), 390_000).unwrap();
+    let wd = calc_junior_collateral_for_withdraw(400_000, pool.effective_junior_balance(), 390_000)
+        .unwrap();
     assert_eq!(wd, 97_500);
     pool.total_withdrawn += wd;
     pool.set_junior_balance(pool.junior_balance() - wd); // 400_000 - 97_500 = 302_500
@@ -158,6 +203,13 @@ fn precise_gate_no_false_fire_on_junior_partial_exit() {
 
     // net_loss (300k) is still <= junior_balance (302_500): gate stays OPEN, and senior is
     // STILL undepressed — so a senior deposit here is fair and must be allowed.
-    assert!(!senior_marked_down(&pool), "precise gate does NOT false-fire on junior partial exit");
-    assert_eq!(pool.senior_balance().unwrap(), 900_000, "senior still whole after junior's partial exit");
+    assert!(
+        !senior_marked_down(&pool),
+        "precise gate does NOT false-fire on junior partial exit"
+    );
+    assert_eq!(
+        pool.senior_balance().unwrap(),
+        900_000,
+        "senior still whole after junior's partial exit"
+    );
 }

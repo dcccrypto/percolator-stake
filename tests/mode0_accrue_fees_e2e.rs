@@ -173,7 +173,12 @@ fn build_live_market_v17(
     (market, mint)
 }
 
-fn preallocate_empty_spl_account(svm: &mut LiteSVM, key: Pubkey, token_program: Pubkey, size: usize) {
+fn preallocate_empty_spl_account(
+    svm: &mut LiteSVM,
+    key: Pubkey,
+    token_program: Pubkey,
+    size: usize,
+) {
     svm.set_account(
         key,
         Account {
@@ -210,7 +215,12 @@ struct InitPoolAccounts {
     token_program: Pubkey,
 }
 
-fn init_pool_ix(stake_id: Pubkey, a: &InitPoolAccounts, cooldown_slots: u64, deposit_cap: u64) -> Instruction {
+fn init_pool_ix(
+    stake_id: Pubkey,
+    a: &InitPoolAccounts,
+    cooldown_slots: u64,
+    deposit_cap: u64,
+) -> Instruction {
     Instruction {
         program_id: stake_id,
         accounts: vec![
@@ -335,13 +345,18 @@ fn deposit_ix(
 // ---- Stake AccrueFees (tag 12) — real instruction. Accounts per
 // instruction.rs:299-306 / processor.rs:2543-2551. ----
 
-fn accrue_fees_ix(stake_id: Pubkey, caller: &Pubkey, pool_pda: Pubkey, vault: Pubkey) -> Instruction {
+fn accrue_fees_ix(
+    stake_id: Pubkey,
+    caller: &Pubkey,
+    pool_pda: Pubkey,
+    vault: Pubkey,
+) -> Instruction {
     Instruction {
         program_id: stake_id,
         accounts: vec![
             AccountMeta::new_readonly(*caller, true), // 0. caller [signer, permissionless]
-            AccountMeta::new(pool_pda, false),         // 1. pool PDA [writable]
-            AccountMeta::new_readonly(vault, false),   // 2. vault [readonly, balance only]
+            AccountMeta::new(pool_pda, false),        // 1. pool PDA [writable]
+            AccountMeta::new_readonly(vault, false),  // 2. vault [readonly, balance only]
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false), // 3. clock
         ],
         data: vec![12u8], // tag = AccrueFees
@@ -391,23 +406,50 @@ fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
 
     // ---- InitPool (real instruction; pool_mode = 0 is InitPool's hardcoded
     // default -- see processor.rs:672. This is the path EVERY real client uses. ----
-    let (_market, accts) = setup(&mut svm, wrapper_id, stake_id, token_program, &admin, &payer);
-    send(&mut svm, &payer, &[&admin], init_pool_ix(stake_id, &accts, 5, 0))
-        .unwrap_or_else(|e| panic!("InitPool must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
+    let (_market, accts) = setup(
+        &mut svm,
+        wrapper_id,
+        stake_id,
+        token_program,
+        &admin,
+        &payer,
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[&admin],
+        init_pool_ix(stake_id, &accts, 5, 0),
+    )
+    .unwrap_or_else(|e| panic!("InitPool must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
 
     let pool_before_deposit = read_pool(&svm, &accts.pool_pda);
-    assert_eq!(pool_before_deposit.pool_mode, 0, "InitPool must produce a mode-0 pool");
-    assert_eq!(pool_before_deposit.total_fees_earned, 0, "genesis pool has no fees yet");
+    assert_eq!(
+        pool_before_deposit.pool_mode, 0,
+        "InitPool must produce a mode-0 pool"
+    );
+    assert_eq!(
+        pool_before_deposit.total_fees_earned, 0,
+        "genesis pool has no fees yet"
+    );
 
     // ---- Deposit (real instruction; genesis deposit, so LP = amount - MINIMUM_LIQUIDITY). ----
     let user_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, user_ata, &accts.collateral_mint, &user.pubkey(), 10_000);
+    set_token_account(
+        &mut svm,
+        user_ata,
+        &accts.collateral_mint,
+        &user.pubkey(),
+        10_000,
+    );
     let user_lp_ata = Pubkey::new_unique();
     set_token_account(&mut svm, user_lp_ata, &accts.lp_mint, &user.pubkey(), 0);
     let (deposit_pda, _) = derive_deposit_pda(&stake_id, &accts.pool_pda, &user.pubkey());
 
     let deposit_amount: u64 = 2_000;
-    assert!(deposit_amount > MINIMUM_LIQUIDITY, "must clear the N7 dead-share floor");
+    assert!(
+        deposit_amount > MINIMUM_LIQUIDITY,
+        "must clear the N7 dead-share floor"
+    );
     let dep_ix = deposit_ix(
         stake_id,
         &user.pubkey(),
@@ -424,7 +466,10 @@ fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
         .unwrap_or_else(|e| panic!("Deposit must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
 
     let pool_before_accrue = read_pool(&svm, &accts.pool_pda);
-    assert_eq!(pool_before_accrue.pool_mode, 0, "pool_mode is immutable after InitPool");
+    assert_eq!(
+        pool_before_accrue.pool_mode, 0,
+        "pool_mode is immutable after InitPool"
+    );
     assert_eq!(
         token_amount(&svm, &accts.vault),
         deposit_amount,
@@ -433,7 +478,10 @@ fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
     let pool_value_before = pool_before_accrue
         .total_pool_value()
         .expect("pool value must be computable pre-accrual");
-    assert_eq!(pool_value_before, deposit_amount, "pre-accrual: tpv == the real deposit, no fees yet");
+    assert_eq!(
+        pool_value_before, deposit_amount,
+        "pre-accrual: tpv == the real deposit, no fees yet"
+    );
 
     // ---- The ONE authorized forgery (task-11-brief.md step 3 / task instructions'
     // "Explicit permission" section): set the vault's token balance directly to
@@ -464,7 +512,10 @@ fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
 
     // ---- Assertions on the REAL post-instruction state. ----
     let pool_after = read_pool(&svm, &accts.pool_pda);
-    assert_eq!(pool_after.pool_mode, 0, "AccrueFees must not mutate pool_mode");
+    assert_eq!(
+        pool_after.pool_mode, 0,
+        "AccrueFees must not mutate pool_mode"
+    );
     assert_eq!(
         pool_after.total_fees_earned, surplus,
         "total_fees_earned must grow by EXACTLY the vault surplus"

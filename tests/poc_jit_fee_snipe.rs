@@ -41,7 +41,9 @@ fn accrue(pool: &mut StakePool, vault: u64) {
 
 /// Models the CURRENT `process_deposit`: price against total_pool_value() (no pre-accrue).
 fn deposit_current(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
-    let lp = pool.calc_lp_for_deposit(amount).expect("calc_lp_for_deposit");
+    let lp = pool
+        .calc_lp_for_deposit(amount)
+        .expect("calc_lp_for_deposit");
     pool.total_deposited += amount;
     pool.total_lp_supply += lp;
     *vault += amount;
@@ -51,7 +53,9 @@ fn deposit_current(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
 /// Models a FIXED `process_deposit`: crystallize pending fees BEFORE pricing.
 fn deposit_fixed(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
     accrue(pool, *vault); // <-- the fix: fold pending surplus into share price first
-    let lp = pool.calc_lp_for_deposit(amount).expect("calc_lp_for_deposit");
+    let lp = pool
+        .calc_lp_for_deposit(amount)
+        .expect("calc_lp_for_deposit");
     pool.total_deposited += amount;
     pool.total_lp_supply += lp;
     *vault += amount;
@@ -59,7 +63,9 @@ fn deposit_fixed(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
 }
 
 fn withdraw(pool: &mut StakePool, vault: &mut u64, lp: u64) -> u64 {
-    let coll = pool.calc_collateral_for_withdraw(lp).expect("calc_collateral_for_withdraw");
+    let coll = pool
+        .calc_collateral_for_withdraw(lp)
+        .expect("calc_collateral_for_withdraw");
     pool.total_withdrawn += coll;
     pool.total_lp_supply -= lp;
     *vault -= coll;

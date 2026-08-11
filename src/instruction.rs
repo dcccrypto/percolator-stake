@@ -1111,62 +1111,98 @@ mod tests {
     #[test]
     fn poc_byte_payload_instructions_should_reject_trailing_bytes() {
         let cases: &[(u8, Vec<u8>, &str)] = &[
-            (0, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&100u64.to_le_bytes());
-                payload.extend_from_slice(&5_000u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "InitPool"),
-            (1, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&42u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "Deposit"),
-            (2, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&42u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "Withdraw"),
-            (3, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&42u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "FlushToInsurance"),
-            (10, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&42u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "ReturnInsurance"),
-            (13, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&100u64.to_le_bytes());
-                payload.extend_from_slice(&5_000u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "InitTradingPool"),
-            (15, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&1_500u16.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "AdminSetTrancheConfig"),
-            (16, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&42u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "DepositJunior"),
-            (23, {
-                let mut payload = Vec::new();
-                payload.extend_from_slice(&42u64.to_le_bytes());
-                payload.push(99);
-                payload
-            }, "RecoverFlushedInsurance"),
+            (
+                0,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&100u64.to_le_bytes());
+                    payload.extend_from_slice(&5_000u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "InitPool",
+            ),
+            (
+                1,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "Deposit",
+            ),
+            (
+                2,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "Withdraw",
+            ),
+            (
+                3,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "FlushToInsurance",
+            ),
+            (
+                10,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "ReturnInsurance",
+            ),
+            (
+                13,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&100u64.to_le_bytes());
+                    payload.extend_from_slice(&5_000u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "InitTradingPool",
+            ),
+            (
+                15,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&1_500u16.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "AdminSetTrancheConfig",
+            ),
+            (
+                16,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "DepositJunior",
+            ),
+            (
+                23,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "RecoverFlushedInsurance",
+            ),
         ];
 
         for (tag, payload, name) in cases {
@@ -1202,7 +1238,11 @@ mod tests {
         let amount: u64 = 123_456_789;
         let mut data = vec![23u8];
         data.extend_from_slice(&amount.to_le_bytes());
-        assert_eq!(data.len(), 9, "tag 23 payload must be 1 tag + 8 amount bytes");
+        assert_eq!(
+            data.len(),
+            9,
+            "tag 23 payload must be 1 tag + 8 amount bytes"
+        );
         match StakeInstruction::unpack(&data).unwrap() {
             StakeInstruction::RecoverFlushedInsurance { amount: got } => {
                 assert_eq!(got, amount, "amount round-trips correctly")

@@ -57,7 +57,9 @@ fn test_full_senior_deposit_withdraw_cycle() {
 
     // Step 2: Deposit 5_000_000
     let deposit_amount = 5_000_000u64;
-    let lp = pool.calc_lp_for_deposit(deposit_amount).expect("calc_lp must succeed");
+    let lp = pool
+        .calc_lp_for_deposit(deposit_amount)
+        .expect("calc_lp must succeed");
     assert_eq!(lp, deposit_amount, "first depositor gets 1:1 LP");
     pool.total_deposited += deposit_amount;
     pool.total_lp_supply += lp;
@@ -68,7 +70,9 @@ fn test_full_senior_deposit_withdraw_cycle() {
     // (pool_mode=1 required for fees to count in pool_value)
     pool.pool_mode = 1;
     pool.total_fees_earned = 100_000;
-    let pool_value_with_fees = pool.total_pool_value().expect("pool value must be computable");
+    let pool_value_with_fees = pool
+        .total_pool_value()
+        .expect("pool value must be computable");
     assert_eq!(pool_value_with_fees, deposit_amount + 100_000);
 
     // Step 4: Withdraw all LP
@@ -77,12 +81,18 @@ fn test_full_senior_deposit_withdraw_cycle() {
     let collateral_back = pool
         .calc_collateral_for_withdraw(lp)
         .expect("calc_collateral must succeed");
-    assert_eq!(collateral_back, deposit_amount, "first depositor gets exact amount back");
+    assert_eq!(
+        collateral_back, deposit_amount,
+        "first depositor gets exact amount back"
+    );
 
     pool.total_withdrawn += collateral_back;
     pool.total_lp_supply -= lp;
 
-    assert_eq!(pool.total_lp_supply, 0, "LP supply must be zero after full withdrawal");
+    assert_eq!(
+        pool.total_lp_supply, 0,
+        "LP supply must be zero after full withdrawal"
+    );
     assert_eq!(
         pool.total_pool_value(),
         Some(0),
@@ -237,7 +247,10 @@ fn test_insurance_loss_exceeds_junior_spills_to_senior() {
 
     let eff_junior = pool.effective_junior_balance();
     // junior (2M) fully wiped, returns 0
-    assert_eq!(eff_junior, 0, "junior is fully wiped by a loss exceeding its balance");
+    assert_eq!(
+        eff_junior, 0,
+        "junior is fully wiped by a loss exceeding its balance"
+    );
 
     // pool_value = 15M - 5M = 10M, senior = 10M - 0 = 10M
     // But senior also lost 3M (the spill-over): senior = 10M - 0 = 10M
@@ -259,7 +272,10 @@ fn test_flush_to_insurance_cpi_tag_is_9() {
     data.push(9u8); // TAG_TOP_UP_INSURANCE
     data.extend_from_slice(&amount.to_le_bytes());
 
-    assert_eq!(data[0], 9, "FlushToInsurance must use CPI tag 9 (TopUpInsurance)");
+    assert_eq!(
+        data[0], 9,
+        "FlushToInsurance must use CPI tag 9 (TopUpInsurance)"
+    );
     assert_eq!(&data[1..9], &amount.to_le_bytes());
 }
 
@@ -318,7 +334,10 @@ fn test_set_discriminator_sets_version_and_magic() {
     let mut pool = StakePool::zeroed();
     pool.set_discriminator();
 
-    assert!(pool.validate_discriminator(), "discriminator must validate after set_discriminator");
+    assert!(
+        pool.validate_discriminator(),
+        "discriminator must validate after set_discriminator"
+    );
     assert_eq!(
         pool.version(),
         StakePool::CURRENT_VERSION,
@@ -346,7 +365,10 @@ fn test_zeroed_pool_fails_discriminator() {
 #[test]
 fn test_initialized_pool_passes_discriminator() {
     let pool = initialized_pool();
-    assert!(pool.validate_discriminator(), "Initialized pool must pass discriminator validation");
+    assert!(
+        pool.validate_discriminator(),
+        "Initialized pool must pass discriminator validation"
+    );
 }
 
 /// Pool with corrupted discriminator (one byte flipped) must fail.
@@ -587,10 +609,7 @@ fn test_flush_reduces_pool_value() {
 
     pool.total_flushed = 3_000_000; // 3M moved to insurance
     let value = pool.total_pool_value().unwrap();
-    assert_eq!(
-        value, 7_000_000,
-        "Flushed amount must reduce pool value"
-    );
+    assert_eq!(value, 7_000_000, "Flushed amount must reduce pool value");
 }
 
 /// Full flush + return roundtrip is conservative (value restored exactly).
@@ -620,7 +639,10 @@ fn test_partial_return_reflects_insurance_loss() {
 
     let value = pool.total_pool_value().unwrap();
     // 10M - 3M + 1M = 8M (2M permanently lost)
-    assert_eq!(value, 8_000_000, "Partial return must reflect the 2M insurance loss");
+    assert_eq!(
+        value, 8_000_000,
+        "Partial return must reflect the 2M insurance loss"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -631,7 +653,10 @@ fn test_partial_return_reflects_insurance_loss() {
 #[test]
 fn test_market_resolved_blocks_deposits() {
     let mut pool = initialized_pool();
-    assert!(!pool.market_resolved(), "Pool must not be resolved initially");
+    assert!(
+        !pool.market_resolved(),
+        "Pool must not be resolved initially"
+    );
 
     pool.set_market_resolved(true);
     assert!(
@@ -700,7 +725,10 @@ fn test_all_standard_instruction_tags_decode() {
     data.extend_from_slice(&50u64.to_le_bytes()); // cooldown_slots
     data.extend_from_slice(&5_000_000u64.to_le_bytes()); // deposit_cap
     match StakeInstruction::unpack(&data).unwrap() {
-        StakeInstruction::InitPool { cooldown_slots, deposit_cap } => {
+        StakeInstruction::InitPool {
+            cooldown_slots,
+            deposit_cap,
+        } => {
             assert_eq!(cooldown_slots, 50);
             assert_eq!(deposit_cap, 5_000_000);
         }
@@ -787,7 +815,10 @@ fn test_invalid_instruction_tags_rejected() {
 /// Empty instruction data must return error.
 #[test]
 fn test_empty_instruction_data_rejected() {
-    assert!(StakeInstruction::unpack(&[]).is_err(), "Empty data must be rejected");
+    assert!(
+        StakeInstruction::unpack(&[]).is_err(),
+        "Empty data must be rejected"
+    );
 }
 
 /// Truncated instruction data must return error.
@@ -859,7 +890,10 @@ fn test_deposit_pda_per_user_deterministic() {
     let (dep_b, _) = derive_deposit_pda(&program_id, &pool, &user_b);
 
     assert_eq!(dep_a1, dep_a2, "Same user must get same deposit PDA");
-    assert_ne!(dep_a1, dep_b, "Different users must get different deposit PDAs");
+    assert_ne!(
+        dep_a1, dep_b,
+        "Different users must get different deposit PDAs"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -906,7 +940,11 @@ fn test_large_amounts_no_overflow() {
     pool.total_lp_supply = u64::MAX / 2;
 
     let lp = pool.calc_lp_for_deposit(u64::MAX / 4).unwrap();
-    assert_eq!(lp, u64::MAX / 4, "Large LP calculation must use u128 intermediate");
+    assert_eq!(
+        lp,
+        u64::MAX / 4,
+        "Large LP calculation must use u128 intermediate"
+    );
 }
 
 /// Regression: fully-wiped junior LP should be able to burn worthless LP and exit.

@@ -66,8 +66,13 @@ fn accrue(pool: &mut StakePool, vault_balance: u64) {
 /// Returns (real_lp_minted_to_depositor, total_lp_supply_after).
 fn deposit_fixed(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
     let total_lp_supply_before = pool.total_lp_supply;
-    let lp_to_mint = pool.calc_lp_for_deposit(amount).expect("calc_lp_for_deposit");
-    assert!(lp_to_mint > 0, "S-4 guard: must never mint 0 LP for a nonzero deposit");
+    let lp_to_mint = pool
+        .calc_lp_for_deposit(amount)
+        .expect("calc_lp_for_deposit");
+    assert!(
+        lp_to_mint > 0,
+        "S-4 guard: must never mint 0 LP for a nonzero deposit"
+    );
 
     let mint_amount = if total_lp_supply_before == 0 {
         lp_to_mint
@@ -76,7 +81,10 @@ fn deposit_fixed(pool: &mut StakePool, vault: &mut u64, amount: u64) -> u64 {
     } else {
         lp_to_mint
     };
-    assert!(mint_amount > 0, "N7 guard: genesis deposit must mint > 0 real LP");
+    assert!(
+        mint_amount > 0,
+        "N7 guard: genesis deposit must mint > 0 real LP"
+    );
 
     pool.total_deposited += amount;
     pool.total_lp_supply += lp_to_mint; // full amount, including any dead-share portion
@@ -130,11 +138,13 @@ fn donation_then_accrue_attack_now_costs_the_attacker_real_value() {
     let attacker_genesis_deposit = MINIMUM_LIQUIDITY + 1_000; // 2,000
     let attacker_lp = deposit_fixed(&mut pool, &mut vault, attacker_genesis_deposit);
     assert_eq!(
-        attacker_lp,
-        1_000,
+        attacker_lp, 1_000,
         "attacker's REAL LP is genesis_deposit - MINIMUM_LIQUIDITY, not the full deposit"
     );
-    assert_eq!(pool.total_lp_supply, attacker_genesis_deposit, "tracked supply includes the dead shares");
+    assert_eq!(
+        pool.total_lp_supply, attacker_genesis_deposit,
+        "tracked supply includes the dead shares"
+    );
 
     // Attacker donates a large amount directly to the vault (bypassing Deposit).
     let donation = 1_000_000u64;
@@ -142,13 +152,14 @@ fn donation_then_accrue_attack_now_costs_the_attacker_real_value() {
 
     // Attacker cranks the permissionless AccrueFees, booking the donation as fees.
     accrue(&mut pool, vault);
-    assert_eq!(pool.total_fees_earned, donation, "the donation is booked as fees, as the bug describes");
+    assert_eq!(
+        pool.total_fees_earned, donation,
+        "the donation is booked as fees, as the bug describes"
+    );
 
     // Attacker immediately tries to recover 100% of their genesis position PLUS
     // the donation by withdrawing all their (real, minted) LP.
-    let attacker_withdraw_all = pool
-        .calc_collateral_for_withdraw(attacker_lp)
-        .unwrap();
+    let attacker_withdraw_all = pool.calc_collateral_for_withdraw(attacker_lp).unwrap();
     let attacker_total_recovered = attacker_withdraw_all; // they only ever put in genesis_deposit + donation
 
     // PRE-N7 baseline: attacker's LP would have been the FULL genesis deposit
@@ -237,5 +248,8 @@ fn dead_share_floor_applies_only_once_at_genesis() {
     // floor were (incorrectly) applied per-deposit, this would underflow/panic
     // or mint 0. It must mint normally (pro-rata), proving genesis-only scoping.
     let second_lp = deposit_fixed(&mut pool, &mut vault, 10);
-    assert!(second_lp > 0, "non-genesis deposits below MINIMUM_LIQUIDITY must still mint normally");
+    assert!(
+        second_lp > 0,
+        "non-genesis deposits below MINIMUM_LIQUIDITY must still mint normally"
+    );
 }

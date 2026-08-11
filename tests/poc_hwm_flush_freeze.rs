@@ -46,7 +46,10 @@ fn hwm_freeze_after_loss_blocks_all_withdrawals() {
     // A withdraw calls refresh_hwm(5, 400_000): same epoch, 400k < mark, so the mark is
     // NOT lowered (it only raises). Floor stays 50% of the stale 1,000,000 peak = 500,000.
     let mark = pool.refresh_hwm(5, 400_000);
-    assert_eq!(mark, 1_000_000, "mark stays pegged to the pre-loss peak (the bug)");
+    assert_eq!(
+        mark, 1_000_000,
+        "mark stays pegged to the pre-loss peak (the bug)"
+    );
 
     // Current TVL (400,000) is already below the 500,000 floor, so EVERY withdrawal —
     // even a zero-size one (post_tvl == current TVL) — is blocked.
@@ -73,9 +76,18 @@ fn rebaselining_hwm_on_flush_unfreezes_withdrawals() {
     assert_eq!(mark, 400_000, "mark tracks the legitimate loss");
 
     // Floor = 50% of 400,000 = 200,000. Withdrawals down to the loss-adjusted floor resume.
-    assert!(hwm_withdrawal_allowed(400_000, mark, 5000), "withdrawals resume after re-baseline");
-    assert!(hwm_withdrawal_allowed(200_000, mark, 5000), "allowed down to the loss-adjusted floor");
-    assert!(!hwm_withdrawal_allowed(199_999, mark, 5000), "floor still enforced — anti-drain intact");
+    assert!(
+        hwm_withdrawal_allowed(400_000, mark, 5000),
+        "withdrawals resume after re-baseline"
+    );
+    assert!(
+        hwm_withdrawal_allowed(200_000, mark, 5000),
+        "allowed down to the loss-adjusted floor"
+    );
+    assert!(
+        !hwm_withdrawal_allowed(199_999, mark, 5000),
+        "floor still enforced — anti-drain intact"
+    );
 }
 
 /// The crux that picks "lower the mark by the flushed amount" over "reset the mark to
@@ -95,20 +107,35 @@ fn lower_by_amount_does_not_forgive_prior_drain() {
     // Withdrawals bring TVL to 800,000; the mark does NOT move (refresh only raises).
     pool.total_withdrawn = 200_000;
     let mark_after_withdraw = pool.refresh_hwm(5, 800_000);
-    assert_eq!(mark_after_withdraw, 1_000_000, "withdrawals never lower the mark");
+    assert_eq!(
+        mark_after_withdraw, 1_000_000,
+        "withdrawals never lower the mark"
+    );
 
     // Flush 600,000 → TVL 200,000. The handler lowers the mark by the flushed amount.
     pool.total_flushed = 600_000;
     assert_eq!(pool.total_pool_value().unwrap(), 200_000);
     pool.set_epoch_high_water_tvl(pool.epoch_high_water_tvl().saturating_sub(600_000)); // -> 400,000
     let mark = pool.refresh_hwm(5, 200_000);
-    assert_eq!(mark, 400_000, "lower by the LOSS only — not down to post-flush TVL");
+    assert_eq!(
+        mark, 400_000,
+        "lower by the LOSS only — not down to post-flush TVL"
+    );
 
     // Floor = 200,000. Post-flush TVL is already at the floor → no further drain allowed.
-    assert!(hwm_withdrawal_allowed(200_000, mark, 5000), "exactly at the loss-adjusted floor");
-    assert!(!hwm_withdrawal_allowed(199_999, mark, 5000), "prior drain remembered — no new headroom");
+    assert!(
+        hwm_withdrawal_allowed(200_000, mark, 5000),
+        "exactly at the loss-adjusted floor"
+    );
+    assert!(
+        !hwm_withdrawal_allowed(199_999, mark, 5000),
+        "prior drain remembered — no new headroom"
+    );
     // reset-to-TVL would have set mark=200,000, floor=100,000, wrongly allowing TVL→100,000.
-    assert!(!hwm_withdrawal_allowed(100_000, mark, 5000), "reset-to-TVL would have allowed this — rejected");
+    assert!(
+        !hwm_withdrawal_allowed(100_000, mark, 5000),
+        "reset-to-TVL would have allowed this — rejected"
+    );
 }
 
 /// Multiple flushes in an epoch compose: mark = peak − Σ flushed (saturating).
@@ -119,7 +146,11 @@ fn multiple_flushes_compose() {
     pool.refresh_hwm(5, 1_000_000);
     pool.set_epoch_high_water_tvl(pool.epoch_high_water_tvl().saturating_sub(300_000));
     pool.set_epoch_high_water_tvl(pool.epoch_high_water_tvl().saturating_sub(300_000));
-    assert_eq!(pool.epoch_high_water_tvl(), 400_000, "two 300k flushes == one 600k flush");
+    assert_eq!(
+        pool.epoch_high_water_tvl(),
+        400_000,
+        "two 300k flushes == one 600k flush"
+    );
 }
 
 /// A flush whose amount exceeds the (stale/zero) mark saturates to 0 — floor 0, no freeze.
@@ -128,6 +159,13 @@ fn flush_exceeding_mark_saturates_to_zero() {
     let mut pool = hwm_pool();
     pool.set_epoch_high_water_tvl(100_000);
     pool.set_epoch_high_water_tvl(pool.epoch_high_water_tvl().saturating_sub(200_000));
-    assert_eq!(pool.epoch_high_water_tvl(), 0, "saturates, no underflow/panic");
-    assert!(hwm_withdrawal_allowed(0, 0, 5000), "floor 0 → no restriction");
+    assert_eq!(
+        pool.epoch_high_water_tvl(),
+        0,
+        "saturates, no underflow/panic"
+    );
+    assert!(
+        hwm_withdrawal_allowed(0, 0, 5000),
+        "floor 0 → no restriction"
+    );
 }

@@ -27,9 +27,7 @@
 
 #[cfg(kani)]
 mod kani_proofs {
-    use percolator_stake::math::{
-        calc_collateral_for_withdraw, calc_lp_for_deposit, pool_value,
-    };
+    use percolator_stake::math::{calc_collateral_for_withdraw, calc_lp_for_deposit, pool_value};
 
     // ═══════════════════════════════════════════════════════════
     // 1. LP Conservation — No Inflation
@@ -180,7 +178,6 @@ mod kani_proofs {
         let withdrawn: u64 = kani::any();
         let _ = pool_value(deposited, withdrawn);
     }
-
 
     // ═══════════════════════════════════════════════════════════
     // 3. Fairness — Monotonicity
@@ -783,8 +780,7 @@ mod kani_proofs {
         let proposed_at: u64 = kani::any();
         let timelock: u64 = kani::any();
         let now: u64 = kani::any();
-        let res =
-            percolator_stake::processor::timelock_window_elapsed(proposed_at, timelock, now);
+        let res = percolator_stake::processor::timelock_window_elapsed(proposed_at, timelock, now);
         match proposed_at.checked_add(timelock) {
             None => assert!(res.is_err()),
             Some(earliest) => assert_eq!(res, Ok(now >= earliest)),

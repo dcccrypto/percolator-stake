@@ -330,7 +330,13 @@ fn test_three_depositors_sequential_conservation() {
 // ═══════════════════════════════════════════════════════════════
 
 /// Build a mode-0 (insurance LP) tranche pool with the given ledger fields.
-fn tranche_pool(deposited: u64, withdrawn: u64, flushed: u64, returned: u64, junior_balance: u64) -> StakePool {
+fn tranche_pool(
+    deposited: u64,
+    withdrawn: u64,
+    flushed: u64,
+    returned: u64,
+    junior_balance: u64,
+) -> StakePool {
     use bytemuck::Zeroable;
     let mut pool = StakePool::zeroed();
     pool.is_initialized = 1;

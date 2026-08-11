@@ -87,7 +87,7 @@ fn mint_data_with_authority(mint_authority: &Pubkey) -> Vec<u8> {
     // [36..44] supply = 0 (already zero)
     d[44] = 6; // decimals
     d[45] = 1; // is_initialized = true
-    // freeze_authority = None (bytes 46..82 already zero)
+               // freeze_authority = None (bytes 46..82 already zero)
     d
 }
 
@@ -120,7 +120,7 @@ fn token_data(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
     d[64..72].copy_from_slice(&amount.to_le_bytes());
     // delegate = None (bytes 72..108 already zero)
     d[108] = 1; // state = Initialized
-    // is_native = None, delegated_amount = 0, close_authority = None (zero)
+                // is_native = None, delegated_amount = 0, close_authority = None (zero)
     d
 }
 
@@ -290,15 +290,15 @@ fn deposit_ix(
     Instruction {
         program_id: stake_id,
         accounts: vec![
-            AccountMeta::new(*user, true),                       // 0. user [signer, writable]
-            AccountMeta::new(pool_pda, false),                   // 1. pool_pda [writable]
-            AccountMeta::new(user_ata, false),                   // 2. user_ata [writable]
-            AccountMeta::new(vault, false),                      // 3. vault [writable]
-            AccountMeta::new(lp_mint, false),                    // 4. lp_mint [writable]
-            AccountMeta::new(user_lp_ata, false),                // 5. user_lp_ata [writable]
-            AccountMeta::new_readonly(vault_auth, false),        // 6. vault_auth
-            AccountMeta::new(deposit_pda, false),                // 7. deposit_pda [writable]
-            AccountMeta::new_readonly(token_program, false),     // 8. token_program
+            AccountMeta::new(*user, true),        // 0. user [signer, writable]
+            AccountMeta::new(pool_pda, false),    // 1. pool_pda [writable]
+            AccountMeta::new(user_ata, false),    // 2. user_ata [writable]
+            AccountMeta::new(vault, false),       // 3. vault [writable]
+            AccountMeta::new(lp_mint, false),     // 4. lp_mint [writable]
+            AccountMeta::new(user_lp_ata, false), // 5. user_lp_ata [writable]
+            AccountMeta::new_readonly(vault_auth, false), // 6. vault_auth
+            AccountMeta::new(deposit_pda, false), // 7. deposit_pda [writable]
+            AccountMeta::new_readonly(token_program, false), // 8. token_program
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false), // 9. clock
             AccountMeta::new_readonly(system_program::id(), false), // 10. system_program
         ],
@@ -388,7 +388,7 @@ fn deposit_pda_squat_adoption() {
         Account {
             lamports: squat_lamports,
             owner: system_program::id(), // System-owned: griefer can only transfer, not allocate/assign
-            data: vec![],               // empty data: griefer cannot allocate data
+            data: vec![],                // empty data: griefer cannot allocate data
             executable: false,
             rent_epoch: 0,
         },

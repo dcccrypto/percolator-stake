@@ -94,7 +94,11 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let ata_program = Pubkey::from_str(ATA_PROGRAM).unwrap();
     Pubkey::find_program_address(
-        &[vault_authority.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &[
+            vault_authority.as_ref(),
+            token_program.as_ref(),
+            mint.as_ref(),
+        ],
         &ata_program,
     )
     .0
@@ -206,9 +210,8 @@ fn send(
     // (~153 CU). Every transaction to the wrapper MUST request a 128KB heap frame; this
     // mirrors the production transaction shape. See issue #176 (v17 deploy blocker: no
     // TS client currently requests this frame).
-    let cb_heap = solana_sdk::compute_budget::ComputeBudgetInstruction::request_heap_frame(
-        128 * 1024,
-    );
+    let cb_heap =
+        solana_sdk::compute_budget::ComputeBudgetInstruction::request_heap_frame(128 * 1024);
     let cb_cu =
         solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
     let tx = Transaction::new_signed_with_payer(
@@ -418,12 +421,12 @@ fn withdraw_insurance_asset_ix(args: WithdrawInsuranceArgs) -> Instruction {
     Instruction {
         program_id: args.wrapper_id,
         accounts: vec![
-            AccountMeta::new(args.operator, true),          // operator (signer)
-            AccountMeta::new(args.market, false),            // market (writable)
-            AccountMeta::new(args.dest_token, false),        // dest_token (writable)
-            AccountMeta::new(args.wrapper_vault, false),     // vault_token (writable)
+            AccountMeta::new(args.operator, true),    // operator (signer)
+            AccountMeta::new(args.market, false),     // market (writable)
+            AccountMeta::new(args.dest_token, false), // dest_token (writable)
+            AccountMeta::new(args.wrapper_vault, false), // vault_token (writable)
             AccountMeta::new_readonly(args.wrapper_vault_auth, false), // vault_authority
-            AccountMeta::new_readonly(args.token_program, false),      // token_program
+            AccountMeta::new_readonly(args.token_program, false), // token_program
         ],
         data: encode_withdraw_insurance_asset(0, args.amount),
     }
@@ -502,15 +505,15 @@ fn recover_flushed_insurance_ix(
     Instruction {
         program_id: ctx.stake_id,
         accounts: vec![
-            AccountMeta::new_readonly(*caller, false),            // 0: caller (permissionless)
-            AccountMeta::new(ctx.pool_pda, false),                // 1: pool PDA (writable)
-            AccountMeta::new(ctx.stake_vault, false),             // 2: pool vault (dest; writable)
-            AccountMeta::new_readonly(ctx.vault_auth, false),     // 3: vault_auth PDA
-            AccountMeta::new(market, false),                      // 4: wrapper market (writable)
-            AccountMeta::new(wrapper_vault, false),               // 5: wrapper vault (source; writable)
+            AccountMeta::new_readonly(*caller, false), // 0: caller (permissionless)
+            AccountMeta::new(ctx.pool_pda, false),     // 1: pool PDA (writable)
+            AccountMeta::new(ctx.stake_vault, false),  // 2: pool vault (dest; writable)
+            AccountMeta::new_readonly(ctx.vault_auth, false), // 3: vault_auth PDA
+            AccountMeta::new(market, false),           // 4: wrapper market (writable)
+            AccountMeta::new(wrapper_vault, false),    // 5: wrapper vault (source; writable)
             AccountMeta::new_readonly(wrapper_vault_auth, false), // 6: wrapper vault auth
-            AccountMeta::new_readonly(token_program, false),      // 7: token program
-            AccountMeta::new_readonly(wrapper_id, false),         // 8: percolator program
+            AccountMeta::new_readonly(token_program, false), // 7: token program
+            AccountMeta::new_readonly(wrapper_id, false), // 8: percolator program
         ],
         data,
     }
@@ -638,7 +641,11 @@ fn flush_applies_insurance_after_bind_v17() {
         }
         other => panic!("expected Custom(8) Unauthorized, got {other:?}"),
     }
-    assert_eq!(token_amount(&svm, &pool.stake_vault), FLUSH_AMOUNT, "no tokens moved");
+    assert_eq!(
+        token_amount(&svm, &pool.stake_vault),
+        FLUSH_AMOUNT,
+        "no tokens moved"
+    );
     assert_eq!(token_amount(&svm, &wrapper_vault), 0, "no tokens moved");
 
     // Expire blockhash before the GREEN path so the flush tx hash differs from the RED attempt.
@@ -829,7 +836,11 @@ fn no_admin_drain_before_and_after_bind() {
         other => panic!("unexpected error variant from drain attempt: {other:?}"),
     }
     // No tokens moved (balance was zero anyway).
-    assert_eq!(token_amount(&svm, &admin_dest_red), 0, "no drain — balance was zero");
+    assert_eq!(
+        token_amount(&svm, &admin_dest_red),
+        0,
+        "no drain — balance was zero"
+    );
 
     // ── GREEN: full secure bind sequence — admin drain BLOCKED (no pre-rotation) ─
     // Secure bind sequence:
@@ -1239,7 +1250,11 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
         ),
     )
     .expect("flush A");
-    assert_eq!(token_amount(&svm, &wrapper_vault), 40_000, "flush A applied");
+    assert_eq!(
+        token_amount(&svm, &wrapper_vault),
+        40_000,
+        "flush A applied"
+    );
 
     // Step 2a: ROTATE insurance_authority off PDA_A to the admin wallet (tag 20)
     // before the final asset_admin burn.
@@ -1267,7 +1282,13 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
         &mut svm,
         &payer,
         &[&admin],
-        rotate_operator_stake_ix(&pool_a, wrapper_id, market, &admin.pubkey(), &admin.pubkey()),
+        rotate_operator_stake_ix(
+            &pool_a,
+            wrapper_id,
+            market,
+            &admin.pubkey(),
+            &admin.pubkey(),
+        ),
     )
     .expect("rotate insurance_operator: PDA_A → admin wallet");
 
@@ -1512,18 +1533,17 @@ fn recover_flushed_insurance_after_burn() {
     // Step 4: RecoverFlushedInsurance — PDA-signed, permissionless caller (use payer).
     // Reads pool.total_returned before to verify accounting increment.
     let pool_account_before = svm.get_account(&pool.pool_pda).unwrap();
-    let pool_state_before =
-        bytemuck::try_from_bytes::<percolator_stake::state::StakePool>(
-            &pool_account_before.data[..percolator_stake::state::STAKE_POOL_SIZE],
-        )
-        .unwrap();
+    let pool_state_before = bytemuck::try_from_bytes::<percolator_stake::state::StakePool>(
+        &pool_account_before.data[..percolator_stake::state::STAKE_POOL_SIZE],
+    )
+    .unwrap();
     let total_returned_before = pool_state_before.total_returned;
 
     svm.expire_blockhash();
     send(
         &mut svm,
         &payer,
-        &[],                   // permissionless — payer signs only as fee payer
+        &[], // permissionless — payer signs only as fee payer
         recover_flushed_insurance_ix(
             &pool,
             wrapper_id,
@@ -1531,7 +1551,7 @@ fn recover_flushed_insurance_after_burn() {
             market,
             wrapper_vault,
             wrapper_vault_auth,
-            &payer.pubkey(),   // caller (permissionless, not admin)
+            &payer.pubkey(), // caller (permissionless, not admin)
             FLUSH_AMOUNT,
         ),
     )
@@ -1551,16 +1571,13 @@ fn recover_flushed_insurance_after_burn() {
 
     // Assert: pool.total_returned incremented by FLUSH_AMOUNT.
     let pool_account_after = svm.get_account(&pool.pool_pda).unwrap();
-    let pool_state_after =
-        bytemuck::try_from_bytes::<percolator_stake::state::StakePool>(
-            &pool_account_after.data[..percolator_stake::state::STAKE_POOL_SIZE],
-        )
-        .unwrap();
+    let pool_state_after = bytemuck::try_from_bytes::<percolator_stake::state::StakePool>(
+        &pool_account_after.data[..percolator_stake::state::STAKE_POOL_SIZE],
+    )
+    .unwrap();
     assert_eq!(
         pool_state_after.total_returned,
-        total_returned_before
-            .checked_add(FLUSH_AMOUNT)
-            .unwrap(),
+        total_returned_before.checked_add(FLUSH_AMOUNT).unwrap(),
         "total_returned incremented by FLUSH_AMOUNT (conservation)"
     );
 }
@@ -1636,15 +1653,15 @@ fn recover_flushed_insurance_wrong_dest_rejected() {
         let ix = Instruction {
             program_id: stake_id,
             accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), false),    // 0: caller
-                AccountMeta::new(pool.pool_pda, false),              // 1: pool PDA
-                AccountMeta::new(attacker_dest, false),              // 2: WRONG dest (not pool.vault)
-                AccountMeta::new_readonly(pool.vault_auth, false),   // 3: vault_auth PDA
-                AccountMeta::new(market, false),                     // 4: market
-                AccountMeta::new(wrapper_vault, false),              // 5: wrapper vault
-                AccountMeta::new_readonly(wrapper_vault_auth, false),// 6: wrapper vault auth
-                AccountMeta::new_readonly(token_program, false),     // 7: token program
-                AccountMeta::new_readonly(wrapper_id, false),        // 8: percolator program
+                AccountMeta::new_readonly(payer.pubkey(), false), // 0: caller
+                AccountMeta::new(pool.pool_pda, false),           // 1: pool PDA
+                AccountMeta::new(attacker_dest, false),           // 2: WRONG dest (not pool.vault)
+                AccountMeta::new_readonly(pool.vault_auth, false), // 3: vault_auth PDA
+                AccountMeta::new(market, false),                  // 4: market
+                AccountMeta::new(wrapper_vault, false),           // 5: wrapper vault
+                AccountMeta::new_readonly(wrapper_vault_auth, false), // 6: wrapper vault auth
+                AccountMeta::new_readonly(token_program, false),  // 7: token program
+                AccountMeta::new_readonly(wrapper_id, false),     // 8: percolator program
             ],
             data,
         };
@@ -1665,7 +1682,11 @@ fn recover_flushed_insurance_wrong_dest_rejected() {
         other => panic!("expected Custom(InvalidPda=10), got {other:?}"),
     }
     // No tokens moved.
-    assert_eq!(token_amount(&svm, &attacker_dest), 0, "no drain to attacker_dest");
+    assert_eq!(
+        token_amount(&svm, &attacker_dest),
+        0,
+        "no drain to attacker_dest"
+    );
     assert_eq!(
         token_amount(&svm, &wrapper_vault),
         FLUSH_AMOUNT,
