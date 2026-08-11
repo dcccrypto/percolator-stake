@@ -56,6 +56,15 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
         with:
           toolchain: stable
+          # This action defaults to rustflags: "-D warnings" and exports it as a
+          # GLOBAL env var, so it applies to every crate compiled here —
+          # including the sibling path dependencies. That made the engine fail to
+          # build on an `unused_mut` it has never been required to satisfy
+          # (percolator/src/v16.rs:9207), breaking the wrapper .so and this whole
+          # job. Deny-warnings for THIS crate is enforced by the Clippy job, which
+          # passes -D warnings explicitly; imposing it on other repos' code is not
+          # this workflow's business.
+          rustflags: ""
 
       - name: Install Solana CLI (provides cargo-build-sbf)
         run: |
