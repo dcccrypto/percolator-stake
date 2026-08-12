@@ -52,11 +52,13 @@ jobs:
         with:
           repository: dcccrypto/percolator
           path: percolator
-          # The engine is the opposite case: its main (d448e1c9) has DIVERGED from
-          # what is deployed (3 behind / 15 ahead), and f53be74a on this branch is
-          # the engine revision that reproduces the deployed wrapper byte-for-byte.
-          # Keep this pinned until the engine's main carries the deployed lineage.
-          ref: feat/protocol-fee-taker-only
+          # Now tracks main. The engine's main HAD diverged from the deployed
+          # lineage (d448e1c9: 3 commits one way, 15 the other), which is why this
+          # was pinned to a feature branch. dcccrypto/percolator@b5ddba2e merged the
+          # deployed lineage back in, so f53be74a is an ancestor of main and main's
+          # src/ is byte-identical to it — the wrapper built from main still
+          # reproduces the deployed DhSkE7u exactly.
+          ref: main
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
