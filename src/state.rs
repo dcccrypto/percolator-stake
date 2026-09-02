@@ -105,8 +105,10 @@ pub struct StakePool {
     /// Reserved for future slot-based rate limiting if needed.
     pub last_fee_accrual_slot: u64,
 
-    /// Snapshot of engine vault balance at last fee accrual
-    /// (used to compute fee delta = new_vault - old_vault - deposits + withdrawals)
+    /// DEAD (#255). Written by `process_accrue_fees`, read by NO accounting path.
+    /// The delta formula this comment used to describe was never implemented — the
+    /// accrual baseline is `total_pool_value()`. Kept solely to preserve the v4/408
+    /// layout (`STAKE_POOL_LEN`); do not build new logic on it.
     pub last_vault_snapshot: u64,
 
     /// Pool mode: 0 = insurance LP (legacy), 1 = trading LP vault (PERC-272)

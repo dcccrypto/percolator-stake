@@ -2581,9 +2581,14 @@ fn accrue_fees_inner(pool: &mut state::StakePool, current_balance: u64) -> Progr
 /// Accrue trading fees from the percolator engine to the LP vault.
 /// Permissionless: reads vault token account balance and updates pool state.
 ///
-/// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
-/// To keep it simple and trustless: we track the vault token account balance directly.
-/// Any increase in vault balance beyond deposits is fee revenue.
+/// #255: this previously documented a snapshot-delta formula
+/// (`current_vault_balance - last_vault_snapshot - net_deposits_since_last`) that is
+/// NOT what this function implements. The accrual baseline is `total_pool_value()`,
+/// not `last_vault_snapshot`. `last_vault_snapshot` is still WRITTEN below, but no
+/// accounting path reads it; it is retained only because removing it would change
+/// `STAKE_POOL_LEN` and break the v4/408 layout. Treat it as reserved, not as state.
+///
+/// Actual behaviour: fee revenue is whatever the vault holds above `total_pool_value()`.
 fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
@@ -3385,6 +3390,17 @@ fn process_recover_flushed_insurance(
         return Err(StakeError::InvalidAccount.into());
     }
     validate_pool_version(pool)?;
+
+    // #254 / #271: fail fast if the wrapper market handed in is not THIS pool's
+    // slab. `process_flush_to_insurance` already checks the analogous
+    // `pool.slab != slab.key` (:1550); this path passed `market` straight through
+    // to the tag-57 WithdrawInsuranceAsset CPI without it. Exploitation is blocked
+    // by the wrapper (tag 57 checks the stake-pool owner), so this is
+    // defence-in-depth — but relying on the callee for a caller-side invariant is
+    // exactly the coupling the rest of this file avoids.
+    if pool.slab != market.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
 
     // Insurance LP pools only (pool_mode == 0). Mirror FlushToInsurance and ReturnInsurance.
     if pool.pool_mode != 0 {
