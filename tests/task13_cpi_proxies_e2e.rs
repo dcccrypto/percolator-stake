@@ -1331,12 +1331,33 @@ fn proxy_rejects_a_slab_that_is_not_the_pools_own_market() {
 ///     rejected, since vault_auth != asset_admin);
 ///   * post-burn, `asset_admin == [0;32]` — nothing can satisfy the gate.
 ///
-/// This test demonstrates the second half behaviourally. After the real
-/// InitPool + Bind + Burn sequence it shows that an `asset_admin`-gated wrapper
-/// instruction (tag 65, which shares exactly the same
-/// `expect_live_authority(asset_admin, ...)` gate as tag 69) is rejected for the
-/// admin — i.e. the authority is genuinely dead rather than merely moved. A
-/// proxy signing as `vault_auth` would hit the identical zero-authority check.
+/// This test demonstrates BOTH halves behaviourally, after the real
+/// InitPool + Bind + Burn sequence, using tag 65 — which shares exactly the same
+/// `expect_live_authority(asset_admin, ...)` gate as tag 69.
+///
+/// UPDATED for wrapper #416/#417 + #437/#439, both of which are in the DEPLOYED
+/// wrapper. `handle_update_asset_authority` used to let a live `asset_admin`
+/// rotate ANY of the asset's authorities, and this test's pre-burn step was a
+/// CONTROL that relied on exactly that bypass succeeding. The guard is now an
+/// allow-list of STATES rather than of kinds:
+///
+///     admin_bypass_permitted = admin_signed
+///         && (current_value == [0u8; 32] || <unsignable LP-registry PDA>)
+///
+/// so the bypass survives only where there is no holder to defend. The old
+/// control therefore asserts behaviour the wrapper deliberately removed, and it
+/// broke percolator-stake CI when that change reached `main`.
+///
+/// Rather than delete the control — which would leave both rejections
+/// indistinguishable from a malformed instruction — the test now:
+///   1. keeps a POSITIVE CONTROL, the current holder self-rotating, so the call
+///      path is proven live;
+///   2. asserts the pre-burn rejection EXPLICITLY, pinning the inversion; and
+///   3. keeps the post-burn rejection, which since #437/#439 is a second
+///      independent reason rather than the cause.
+///
+/// Net effect: this pins strictly more behaviour than before, and no longer
+/// depends on a bypass that no longer exists.
 ///
 /// Restoring tag 69 after a burn requires a WRAPPER change, which is out of
 /// scope for this task. If that ever lands, add the proxy and delete this test.
@@ -1363,12 +1384,16 @@ fn tag69_restart_asset_oracle_is_not_proxyable_after_asset_admin_burn() {
     );
     run_bind_insurance_authority(&mut e.svm, e.wrapper_id, e.stake_id, &e.admin, &e.payer, &s);
 
-    // PRE-BURN CONTROL: `BindInsuranceAuthority` has already moved
-    // insurance_operator to vault_auth, so admin is NOT the current holder of
-    // that authority. This call can only succeed via the asset_admin bypass
-    // (`admin_signed` in handle_update_asset_authority, which lets asset_admin
-    // rotate ANY of the asset's authorities). It succeeding is therefore direct
-    // evidence that asset_admin is live and equals admin.
+    // POSITIVE CONTROL: prove this instruction, these accounts and this signer
+    // actually work, by having the CURRENT HOLDER self-rotate. `oracle_authority`
+    // is still admin's after InitPool + bind, so this goes through
+    // `expect_live_authority` on the ordinary holder-consent path and never
+    // touches the asset_admin bypass.
+    //
+    // Without this the two rejections below would be indistinguishable from a
+    // malformed instruction that could never have succeeded — which is precisely
+    // how the old PRE-BURN CONTROL earned its keep, and why replacing it with
+    // nothing was not an option.
     send(
         &mut e.svm,
         &e.payer,
@@ -1376,19 +1401,52 @@ fn tag69_restart_asset_oracle_is_not_proxyable_after_asset_admin_burn() {
         direct_update_asset_authority_ix(
             e.wrapper_id,
             e.admin.pubkey(),
-            e.admin.pubkey(), // rotate insurance_operator back to admin
+            e.admin.pubkey(), // self-rotate oracle_authority: holder consents
             market,
-            2, // kind = insurance_operator
+            4, // kind = oracle_authority, still held by admin
         ),
     )
     .expect(
-        "PRE-BURN CONTROL: while asset_admin == admin, the asset_admin bypass must \
-         let admin rotate an authority it does not itself hold",
+        "POSITIVE CONTROL: the current holder must be able to self-rotate — if this \
+         fails the rejections below prove nothing about asset_admin",
     );
 
-    // `insurance_authority` (kind 1) is still vault_auth and admin does not hold
-    // it, so the post-burn attempt below targets THAT — it can only ever succeed
-    // through the same asset_admin bypass the control call just used.
+    // PRE-BURN: asset_admin is LIVE and equals admin, and it still cannot rotate an
+    // authority someone else holds.
+    //
+    // This assertion is the inverse of what this test asserted before wrapper
+    // #416/#417 and #437/#439. `handle_update_asset_authority` used to let
+    // asset_admin rotate ANY of the asset's authorities; the guard is now an
+    // allow-list of STATES rather than of kinds —
+    //
+    //     admin_bypass_permitted = admin_signed
+    //         && (current_value == [0u8; 32] || <unsignable LP-registry PDA>)
+    //
+    // — so the bypass survives only where there is NO HOLDER TO DEFEND. The
+    // wrapper's own note: "The insurance legs have already paid that price since
+    // #416/#417; this makes it uniform across all five kinds."
+    //
+    // `BindInsuranceAuthority` has moved insurance_operator to vault_auth, so it IS
+    // held, and admin is refused despite being asset_admin.
+    send(
+        &mut e.svm,
+        &e.payer,
+        &[&e.admin],
+        direct_update_asset_authority_ix(
+            e.wrapper_id,
+            e.admin.pubkey(),
+            e.admin.pubkey(),
+            market,
+            2, // kind = insurance_operator, held by vault_auth
+        ),
+    )
+    .expect_err(
+        "PRE-BURN: asset_admin must NOT be able to seize a HELD authority — this is \
+         the #416/#417 + #437/#439 inversion, and it is in the DEPLOYED wrapper",
+    );
+
+    // `insurance_authority` (kind 1) is also still vault_auth and admin does not
+    // hold it, so the post-burn attempt below targets THAT.
 
     // Burn asset_admin to [0;32] via the real stake instruction (tag 21).
     let burn_ix = Instruction {
@@ -1404,10 +1462,20 @@ fn tag69_restart_asset_oracle_is_not_proxyable_after_asset_admin_burn() {
     };
     send(&mut e.svm, &e.payer, &[&e.admin], burn_ix).expect("BurnAssetAdmin must succeed");
 
-    // POST-BURN: the same asset_admin-gated call is now rejected. asset_admin is
-    // [0;32] and `live_authority_matches` refuses a zero authority for EVERY
-    // signer — a vault_auth-signed CPI included. This is why no tag-69 proxy is
-    // shipped: there is no signer it could present that would pass.
+    // POST-BURN: still rejected, now for a SECOND independent reason. asset_admin
+    // is [0;32], so `admin_signed` is false outright, and `live_authority_matches`
+    // refuses a zero authority for every signer — a vault_auth-signed CPI included.
+    //
+    // Note honestly what this does and does not show. Since #437/#439 the burn is
+    // no longer what makes this call fail: the PRE-BURN assertion above proves it
+    // already failed while asset_admin was live. The burn removes the remaining
+    // path rather than the only one. That is why the pre-burn case is now asserted
+    // explicitly instead of being left as a control — otherwise this rejection
+    // would look like it was caused by the burn, and it is not.
+    //
+    // The conclusion the test exists for is unchanged and is now established by
+    // both halves together: there is no signer a tag-69 proxy could present that
+    // would pass, which is why none is shipped.
     let err = send(
         &mut e.svm,
         &e.payer,

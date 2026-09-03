@@ -31,34 +31,64 @@ jobs:
       # `percolator-prog/target/deploy/percolator_prog.so`. Both are gitignored
       # build artifacts, so they must be built here or those suites do not
       # exercise the on-chain code at all.
+      # #286: this used to be `ref: main` for BOTH siblings, and that is what made
+      # this trunk go red on 2026-09-02 without anyone changing percolator-stake.
+      # The wrapper is, from this repo's point of view, a SEPARATE DEPLOYED PROGRAM
+      # that keeps running its deployed build after we merge to its main — so these
+      # suites must test the bytes that are actually on chain, exactly as
+      # percolator-prog's own ci.yml pins ITS siblings and for the same stated
+      # reason. Tracking main meant an unreleased wrapper change landed here
+      # instantly, as a silent red trunk rather than a deliberate decision.
+      #
+      # Pinned to WRAPPER_DEPLOYED from percolator-prog/ci/deployed-refs.env, which
+      # is the canonical record of what is on chain. The guard step below re-reads
+      # that file from prog's CURRENT main and fails if this pin has fallen behind,
+      # so a deploy cannot quietly leave these suites testing stale bytes.
+      #
+      # Verified byte-for-byte: percolator-prog@19d5d932 built with
+      # `cargo build-sbf -- --features devnet` reproduces
+      # DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj exactly (sha256
+      # f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802 over the
+      # 1243192 content bytes; on-chain is that plus 7040 bytes of zero padding).
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: dcccrypto/percolator-prog
           path: percolator-prog
-          # main IS the deployed devnet wrapper. Verified byte-for-byte:
-          # percolator-prog@19d5d932 built with `cargo build-sbf -- --features devnet`
-          # reproduces DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj exactly
-          # (sha256 f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802
-          # over the 1243192 content bytes; on-chain is that plus 7040 bytes of
-          # zero padding). NOT feat/protocol-fee-taker-only — that remote branch is
-          # stale, 3 commits BEHIND main, so pinning it tested an older wrapper.
+          ref: 15eb8b0c599e35a1c224bfa74f92b810c78fefb7
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
+      # A second, shallow checkout of prog's CURRENT main, used ONLY to read
+      # ci/deployed-refs.env for the drift guard below. Not built, not tested.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator-prog
+          path: percolator-prog-refs
           ref: main
+          fetch-depth: 1
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       # percolator-prog has a path dependency on the engine
       # (`percolator = { path = "../percolator" }`), so the wrapper cannot build
       # without it checked out as a sibling.
+      # #286: also pinned, and for a subtler reason than the wrapper. The engine is
+      # a PATH DEPENDENCY compiled INTO the wrapper, so "wrapper 15eb8b0c" is only
+      # a complete description of the deployed bytes together with the engine
+      # commit it was built against. Leaving this on main while pinning the wrapper
+      # would still let engine merges change what these suites run.
+      #
+      # That is not hypothetical: the #286 bisect showed engine-main alone passed
+      # and wrapper-main alone passed, but the two TOGETHER failed. An unpinned
+      # engine reintroduces exactly that interaction.
+      #
+      # f53be74a is the deployed lineage and is an ancestor of main
+      # (dcccrypto/percolator@b5ddba2e merged it back), so this is a subset of main
+      # rather than a fork, and the wrapper built from it reproduces the deployed
+      # DhSkE7u.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: dcccrypto/percolator
           path: percolator
-          # Now tracks main. The engine's main HAD diverged from the deployed
-          # lineage (d448e1c9: 3 commits one way, 15 the other), which is why this
-          # was pinned to a feature branch. dcccrypto/percolator@b5ddba2e merged the
-          # deployed lineage back in, so f53be74a is an ancestor of main and main's
-          # src/ is byte-identical to it — the wrapper built from main still
-          # reproduces the deployed DhSkE7u exactly.
-          ref: main
+          ref: f53be74a
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
@@ -86,6 +116,42 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      # #286 DRIFT GUARD. Pinning is only safe if the pin is noticed when it goes
+      # stale. percolator-prog/ci/deployed-refs.env is the canonical record of what
+      # is on chain, so compare our pin against prog's CURRENT main copy of it.
+      #
+      #   pin == WRAPPER_DEPLOYED  -> these suites are testing the deployed bytes.
+      #   pin != WRAPPER_DEPLOYED  -> a deploy happened and this pin was not moved.
+      #                               FAIL, loudly, with the value to move it to.
+      #
+      # This is the half that was missing before. The old `ref: main` never went
+      # stale, it just silently tested something else; a bare pin would never go
+      # red, it would just silently test something old. Neither is a signal.
+      - name: Assert the wrapper pin still matches WRAPPER_DEPLOYED
+        run: |
+          refs=percolator-prog-refs/ci/deployed-refs.env
+          if [ ! -f "$refs" ]; then
+            echo "::error::$refs missing — cannot verify the wrapper pin is current"
+            exit 1
+          fi
+          want=$(grep -E '^WRAPPER_DEPLOYED=' "$refs" | cut -d= -f2)
+          have=$(git -C percolator-prog rev-parse HEAD)
+          echo "pinned wrapper : $have"
+          echo "WRAPPER_DEPLOYED: $want"
+          if [ -z "$want" ]; then
+            echo "::error::WRAPPER_DEPLOYED not found in $refs"
+            exit 1
+          fi
+          if [ "$have" != "$want" ]; then
+            echo "::error::wrapper pin is STALE. percolator-prog/ci/deployed-refs.env"
+            echo "::error::now says WRAPPER_DEPLOYED=$want but this workflow pins $have."
+            echo "::error::A wrapper deploy has happened. Update the ref: in this file to"
+            echo "::error::$want and re-run, reviewing any newly failing proxy tests as a"
+            echo "::error::REAL wrapper/stake incompatibility (see issue #286)."
+            exit 1
+          fi
+          echo "wrapper pin is current"
 
       - name: Build stake BPF program
         working-directory: percolator-stake
