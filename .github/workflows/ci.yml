@@ -88,7 +88,10 @@ jobs:
         with:
           repository: dcccrypto/percolator
           path: percolator
-          ref: f53be74a
+          # FULL 40-char SHA: actions/checkout resolves `ref` with `git fetch origin
+          # <ref>`, and an abbreviated SHA is not a valid fetch refspec. percolator-prog's
+          # ci.yml records that this exact mistake kept its CI from ever going green.
+          ref: f53be74aafcf5beda06890ffe3c4392637fe54bb
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
