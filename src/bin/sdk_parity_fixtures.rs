@@ -204,7 +204,9 @@ fn main() {
         out.push_str(&format!("    {tag}{comma}\n"));
     }
     out.push_str("  ],\n");
-    out.push_str(&format!("  \"stake_deposit_size\": {STAKE_DEPOSIT_SIZE},\n"));
+    out.push_str(&format!(
+        "  \"stake_deposit_size\": {STAKE_DEPOSIT_SIZE},\n"
+    ));
     out.push_str("  \"stake_pool_discriminator\": [\n");
     for (i, b) in STAKE_POOL_DISCRIMINATOR.iter().enumerate() {
         let comma = if i + 1 == STAKE_POOL_DISCRIMINATOR.len() {
