@@ -3886,9 +3886,32 @@ fn process_admin_update_backing_fee_policy(
     Ok(())
 }
 
-// ── 28: AdminUpdateTradeFeePolicy -> wrapper tag 55 (insurance_authority) ──
+// ── 28: AdminUpdateTradeFeePolicy -> wrapper tag 55 (MARKETAUTH, pool PDA signs) ──
 //
-// Accounts: identical to tag 27 above.
+// GH#286: wrapper #455 ("gate UpdateTradeFeePolicy on marketauth, like every other
+// market-wide setter") changed tag 55 to require `cfg.marketauth`. This proxy signed
+// as `vault_auth`, which is the per-asset insurance authority — so after #455 every
+// call returned Unauthorized (Custom(8)), and percolator-stake's CI went red without
+// anyone touching this repo.
+//
+// #455 is right: the trade fee is a market-wide policy, so it belongs behind
+// marketauth. `InitPool` irreversibly rotates `cfg.marketauth` to THIS pool's PDA,
+// so the pool PDA is the marketauth and is the correct signer. That makes tag 28 a
+// GROUP A proxy (marketauth-gated, pool PDA signs) rather than Group B, joining
+// tags 25 and 26.
+//
+// THE ACCOUNT LAYOUT IS DELIBERATELY UNCHANGED — still five accounts, with
+// `vault_auth` at index 2. Dropping it would be an ABI break on a deployed program
+// for no functional gain, and every existing caller and test already passes it. It
+// is still PDA-validated below, so a caller cannot substitute an arbitrary account
+// there; it simply no longer signs.
+//
+// Accounts:
+//   0. `[signer]`   Admin (must equal pool.admin)
+//   1. `[]`         Pool PDA — the marketauth; SIGNS the CPI via invoke_signed
+//   2. `[]`         Vault authority PDA — validated, no longer signs (see above)
+//   3. `[writable]` Slab / market account (wrapper-owned)
+//   4. `[]`         Percolator program
 fn process_admin_update_trade_fee_policy(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3901,25 +3924,30 @@ fn process_admin_update_trade_fee_policy(
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
 
-    let vault_auth_bump = validate_group_b_proxy(
-        program_id,
-        admin,
-        pool_pda,
-        vault_auth,
-        slab,
-        percolator_program,
-    )?;
+    // Group A checks (admin is pool.admin, pool initialised, slab matches) and the
+    // POOL bump, which is what signs now.
+    let pool_bump = validate_group_a_proxy(program_id, admin, pool_pda, slab, percolator_program)?;
 
-    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    // Keep validating account 2 even though it no longer signs: the layout still
+    // carries it, and an unvalidated account slot is an invitation.
+    let (expected_vault_auth, _vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
     cpi::cpi_update_trade_fee_policy(
         percolator_program,
-        vault_auth,
+        pool_pda,
         slab,
         trade_fee_base_bps,
-        vault_auth_seeds,
+        pool_seeds,
     )?;
 
-    msg!("AdminUpdateTradeFeePolicy: wrapper trade fee policy updated via vault_auth PDA CPI");
+    msg!(
+        "AdminUpdateTradeFeePolicy: wrapper trade fee policy updated via pool PDA CPI (marketauth)"
+    );
     Ok(())
 }
 
