@@ -17,6 +17,20 @@ bytemuck = { version = "1.14", features = ["derive"] }
 # Pin blake3 to avoid edition2024 (SBF platform-tools has Rust 1.84)
 blake3 = ">=1.5.0, <1.8.0"
 
+# GH#271 item 2 — defence in depth ahead of external audit.
+#
+# Without this, integer overflow checks are OFF in the deployed SBF release binary
+# and a future unchecked add would silently WRAP rather than revert. Nothing relies
+# on wrapping today: every accounting path uses explicit checked_*/saturating_* or
+# i128 widening (total_pool_value, principal_tvl, the deposit/withdraw/flush/return
+# handlers, and the whole math module). This is here so that stays true by
+# construction rather than by review.
+#
+# CU cost is negligible for this program's arithmetic — it is a handful of
+# comparisons on paths that already do checked math.
+[profile.release]
+overflow-checks = true
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
