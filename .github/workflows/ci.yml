@@ -194,11 +194,29 @@ jobs:
           # Read the attributes attached to this exact test, including multi-line
           # attributes. Reset at function/source boundaries so an ignored neighboring
           # test cannot satisfy the check.
-          state=$(
+          detect_tag55_state() {
             awk '
               in_attr {
                 if ($0 ~ /\][[:space:]]*$/) {
                   in_attr = 0
+                }
+                next
+              }
+
+              in_block_comment {
+                if ($0 ~ /\*\//) {
+                  in_block_comment = 0
+                }
+                next
+              }
+
+              /^[[:space:]]*\/\// {
+                next
+              }
+
+              /^[[:space:]]*\/\*/ {
+                if ($0 !~ /\*\//) {
+                  in_block_comment = 1
                 }
                 next
               }
@@ -237,11 +255,37 @@ jobs:
               END {
                 if (!found) exit 3
               }
-            ' "$test_file"
-          ) || {
-            echo "::error::could not locate $test_name and determine its #[ignore] state"
-            exit 1
-          }
+            ' "$1"
+            }
+
+            # Regression fixture for the exact false-active case caught in PR #291:
+            # Rust comment trivia between #[ignore] and #[test] must preserve ignored state.
+            comment_fixture=$(mktemp)
+
+            cat >"$comment_fixture" <<'EOF'
+            #[ignore]
+            // Temporary deployment-transition note.
+            #[test]
+            fn tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it() {}
+             EOF
+
+            if ! fixture_state=$(detect_tag55_state "$comment_fixture"); then
+              rm -f "$comment_fixture"
+              echo "::error::tag-55 ignore-state parser comment fixture could not be evaluated"
+              exit 1
+            fi
+
+            rm -f "$comment_fixture"
+
+            if [ "$fixture_state" != "ignored" ]; then
+              echo "::error::tag-55 parser must preserve #[ignore] across Rust comment trivia"
+              exit 1
+            fi
+
+            state=$(detect_tag55_state "$test_file") || {
+              echo "::error::could not locate $test_name and determine its #[ignore] state"
+              exit 1
+            }
 
           if git -C percolator-prog-refs merge-base --is-ancestor "$boundary" "$want"; then
             if [ "$state" != "active" ]; then
