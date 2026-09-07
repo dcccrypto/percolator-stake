@@ -1088,7 +1088,7 @@ fn tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it() {
             encode_proxy_trade_fee(POST_TRADE_FEE),
         ),
     )
-    .expect("stake tag 28 proxy must reach wrapper tag 55 by signing as vault_auth");
+    .expect("stake tag 28 proxy must reach wrapper tag 55 by signing as pool PDA (marketauth)");
 
     assert_eq!(
         read_u64_at(&e.svm, &market, OFF_TRADE_FEE_BASE_BPS),
