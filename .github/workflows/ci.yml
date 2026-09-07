@@ -57,14 +57,16 @@ jobs:
           ref: 15eb8b0c599e35a1c224bfa74f92b810c78fefb7
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
-      # A second, shallow checkout of prog's CURRENT main, used ONLY to read
-      # ci/deployed-refs.env for the drift guard below. Not built, not tested.
+      # A second checkout of prog's CURRENT main, used to read
+      # ci/deployed-refs.env for the drift guard below and to resolve whether
+      # WRAPPER_DEPLOYED contains wrapper #455. Full history is required for the
+      # ancestry check; this checkout is still not built or tested.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: dcccrypto/percolator-prog
           path: percolator-prog-refs
           ref: main
-          fetch-depth: 1
+          fetch-depth: 0
           token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
 
       # percolator-prog has a path dependency on the engine
@@ -155,6 +157,109 @@ jobs:
             exit 1
           fi
           echo "wrapper pin is current"
+
+      # #286/#288 DEPLOYMENT-TRANSITION GUARD.
+      #
+      # #288 intentionally keeps the tag-55 proxy regression ignored while the
+      # deployed wrapper predates #455: the current stake signer (pool PDA / marketauth)
+      # is correct for post-#455 wrappers and intentionally incompatible with the
+      # currently deployed pre-#455 wrapper, which expects vault_auth.
+      #
+      # The source already documents the removal condition: when WRAPPER_DEPLOYED
+      # advances to a commit containing #455, delete #[ignore] in the same pin-bump
+      # commit. Make that condition mechanical so a reviewer cannot update the pin
+      # and accidentally leave this regression permanently skipped.
+      - name: Assert tag-55 regression state matches deployed wrapper
+        run: |
+          refs=percolator-prog-refs/ci/deployed-refs.env
+          test_file=percolator-stake/tests/task13_cpi_proxies_e2e.rs
+          boundary=0cc58c7ca1114b951133ec0960b96a565e33bb8e # percolator-prog #455
+          test_name=tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it
+
+          want=$(sed -n 's/^WRAPPER_DEPLOYED=//p' "$refs")
+          if [[ ! "$want" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::WRAPPER_DEPLOYED must be exactly one full 40-character SHA"
+            exit 1
+          fi
+
+          if ! git -C percolator-prog-refs cat-file -e "${want}^{commit}" 2>/dev/null; then
+            echo "::error::WRAPPER_DEPLOYED=$want is not present in the full prog history"
+            exit 1
+          fi
+          if ! git -C percolator-prog-refs cat-file -e "${boundary}^{commit}" 2>/dev/null; then
+            echo "::error::tag-55 boundary commit $boundary (#455) is not present in prog history"
+            exit 1
+          fi
+
+          # Read the attributes attached to this exact test, including multi-line
+          # attributes. Reset at function/source boundaries so an ignored neighboring
+          # test cannot satisfy the check.
+          state=$(
+            awk '
+              in_attr {
+                if ($0 ~ /\][[:space:]]*$/) {
+                  in_attr = 0
+                }
+                next
+              }
+
+              /^[[:space:]]*#\[/ {
+                if ($0 ~ /^[[:space:]]*#\[ignore([[:space:]=\]])/) {
+                  ignored = 1
+                }
+
+                if ($0 !~ /\][[:space:]]*$/) {
+                  in_attr = 1
+                }
+
+                next
+              }
+
+              /^[[:space:]]*fn[[:space:]]+tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it[[:space:]]*\(/ {
+                print ignored ? "ignored" : "active"
+                found = 1
+                exit
+              }
+
+              /^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+/ {
+                ignored = 0
+                next
+              }
+
+              /^[[:space:]]*$/ {
+                next
+              }
+
+              {
+                ignored = 0
+              }
+
+              END {
+                if (!found) exit 3
+              }
+            ' "$test_file"
+          ) || {
+            echo "::error::could not locate $test_name and determine its #[ignore] state"
+            exit 1
+          }
+
+          if git -C percolator-prog-refs merge-base --is-ancestor "$boundary" "$want"; then
+            if [ "$state" != "active" ]; then
+              echo "::error::WRAPPER_DEPLOYED=$want contains #455 ($boundary),"
+              echo "::error::but $test_name is still #[ignore]."
+              echo "::error::Remove the ignore in the same commit that advances the wrapper pin"
+              echo "::error::so the tag-28 -> tag-55 coordinated-deploy regression is exercised."
+              exit 1
+            fi
+            echo "tag-55 guard: deployed wrapper contains #455; regression test is active"
+          else
+            rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::git merge-base failed while checking #455 ancestry (status $rc)"
+              exit 1
+            fi
+            echo "tag-55 guard: deployed wrapper predates #455; temporary #[ignore] is permitted"
+          fi
 
       - name: Build stake BPF program
         working-directory: percolator-stake
