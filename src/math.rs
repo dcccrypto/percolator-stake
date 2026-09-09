@@ -8,8 +8,12 @@
 /// Without this, a pool with a small real supply/value is priced using ONLY
 /// the tracked counters — an attacker who becomes sole/first LP holder, then
 /// donates raw collateral directly to the vault token account (bypassing
-/// `Deposit`) and cranks the permissionless `AccrueFees` (mode-1 pools only,
-/// since only mode-1 folds `total_fees_earned` into `total_pool_value()`),
+/// `Deposit`) and cranks the permissionless `AccrueFees` (BOTH pool modes since
+/// 2026-07-19 — mode-0 insurance pools also accrue fees, so `state.rs`'s
+/// `total_pool_value()` folds `total_fees_earned` in for mode 0 as well; this
+/// comment previously said "mode-1 pools only", which is stale and understated
+/// the reach, because `InitPool` hardcodes mode 0 and the processor notes that
+/// "every real client calls InitPool (mode 0)"),
 /// can book that donation as "fees" and inflate the tracked share price
 /// arbitrarily cheaply (the donation stays 100% attacker-owned the whole
 /// time — a later victim `Deposit` then rounds `calc_lp_for_deposit` down to
