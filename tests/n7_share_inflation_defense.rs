@@ -1,7 +1,7 @@
 //! N7 (CONSOLIDATED-PLAN §2.2) — AccrueFees donation/share-inflation defense.
 //!
 //! ── The bug ──────────────────────────────────────────────────────────────────
-//! `AccrueFees` (tag 12, permissionless, mode-1 pools only) books ANY
+//! `AccrueFees` (tag 12, permissionless, BOTH pool modes since 2026-07-19) books ANY
 //! un-attributed vault-balance delta as "fees": `total_fees_earned +=
 //! current_balance - total_pool_value()` whenever `current_balance > pool_value
 //! && total_lp_supply > 0` (`processor.rs::accrue_fees_inner`). Nothing
@@ -46,7 +46,9 @@ fn mode1_pool() -> StakePool {
     pool.bump = 255;
     pool.vault_authority_bump = 254;
     pool.admin_transferred = 1;
-    pool.pool_mode = 1; // trading LP pool — the only mode AccrueFees operates on
+    pool.pool_mode = 1; // trading LP pool. NOTE: not the only affected mode — since
+                        // 2026-07-19 total_pool_value() folds fees in for mode 0 too,
+                        // and InitPool hardcodes mode 0, so real deployments are mode 0.
     pool.set_discriminator();
     pool
 }
@@ -251,5 +253,56 @@ fn dead_share_floor_applies_only_once_at_genesis() {
     assert!(
         second_lp > 0,
         "non-genesis deposits below MINIMUM_LIQUIDITY must still mint normally"
+    );
+}
+
+/// #290 — the N7 forfeiture guarantee is SCALE-DEPENDENT, and the test above
+/// measures it at the one scale where it looks strong.
+///
+/// `donation_then_accrue_attack_now_costs_the_attacker_real_value` asserts
+/// `attacker_permanent_loss > donation / 4`, and its own comment explains why that
+/// holds: the dead shares are ~50% of the tracked supply *in that scenario*, because
+/// genesis is 2,000 against a MINIMUM_LIQUIDITY of 1,000.
+///
+/// That ratio is an artefact of the small genesis, not a property of N7. The dead-share
+/// carve-out is a FIXED MINIMUM_LIQUIDITY, so its share of the pool falls as genesis
+/// grows — and with it the attacker's forfeiture. At a realistic genesis the defence
+/// still costs the attacker something, but nothing like a quarter of the donation.
+///
+/// This test pins that so the `> donation / 4` assertion above is not read as a
+/// scale-free guarantee. It is deliberately an assertion about the DIRECTION and
+/// ROUGH MAGNITUDE of the weakening, not an exact figure, so it does not become a
+/// brittle golden value.
+#[test]
+fn n7_forfeiture_weakens_as_genesis_grows() {
+    fn forfeiture_fraction(genesis: u64, donation: u64) -> f64 {
+        let mut pool = mode1_pool();
+        let mut vault = 0u64;
+        let attacker_lp = deposit_fixed(&mut pool, &mut vault, genesis);
+        vault += donation;
+        accrue(&mut pool, vault);
+        let recovered = pool.calc_collateral_for_withdraw(attacker_lp).unwrap();
+        let loss = (genesis + donation).saturating_sub(recovered);
+        loss as f64 / donation as f64
+    }
+
+    let donation = 1_000_000u64;
+    let small = forfeiture_fraction(MINIMUM_LIQUIDITY + 1_000, donation); // the existing scenario
+    let realistic = forfeiture_fraction(2_000_000, donation);
+
+    assert!(
+        small > 0.25,
+        "sanity: the existing test's scenario really does forfeit >1/4 (got {small:.4})"
+    );
+    assert!(
+        realistic < small,
+        "forfeiture must FALL as genesis grows — the dead-share carve-out is a fixed \
+         MINIMUM_LIQUIDITY, so its share of the pool shrinks (small={small:.4}, realistic={realistic:.4})"
+    );
+    assert!(
+        realistic < 0.01,
+        "at a 2,000,000 genesis the N7 forfeiture is under 1% of the donation, so the \
+         `> donation / 4` guarantee in the test above is scale-specific and must not be \
+         read as a general property (got {realistic:.4})"
     );
 }
