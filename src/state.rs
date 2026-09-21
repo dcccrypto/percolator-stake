@@ -569,6 +569,51 @@ impl StakePool {
         self.wrapper_recoverable() == 0
     }
 
+    /// Tranche pools: the largest amount by which a permissionless
+    /// `RecoverFlushedInsurance` (tag 23) could raise [`StakePool::senior_balance`]
+    /// from the current state. Zero means `senior_balance()` is invariant under every
+    /// legal recovery, so a deposit priced at today's `senior_balance()` cannot be
+    /// sniping one.
+    ///
+    /// # Derivation
+    ///
+    /// A recovery raises `total_returned` (`R`), and `senior_balance()` as a function
+    /// of `R` is piecewise linear with three regions:
+    ///
+    /// - `R < F - jb` — the loss has spilled past junior; senior absorbs, slope 1.
+    /// - `F - jb <= R <= F` — junior absorbs; `effective_junior_balance()` rises by
+    ///   exactly what `total_pool_value()` does, slope 0. This is why the gate must
+    ///   not simply be `wrapper_recoverable() > 0`: that form fires here, where no
+    ///   recovery can move `senior_balance()` at all.
+    /// - `R > F` — `net_loss` has saturated, `effective_junior_balance()` is pinned at
+    ///   raw `junior_balance()`, and the whole recovery lands on senior, slope 1.
+    ///
+    /// `wrapper_recoverable()` is the cap tag 23 enforces on itself, so evaluating at
+    /// that bound gives the maximum. Both contributing terms are non-decreasing in the
+    /// recovered amount. The `above` term is the cumulative admin `ReturnInsurance`
+    /// not yet matched by a wrapper recovery, since `total_returned` has exactly three
+    /// increment sites:
+    /// `total_returned == total_recovered_from_wrapper + admin_returned + realized_junior_loss`.
+    ///
+    /// With `jb == 0` this collapses to `wrapper_recoverable()`, which is the
+    /// non-tranche gate — the two are one formula at different junior balances.
+    pub fn senior_recovery_exposure(&self) -> u64 {
+        let rec = self.wrapper_recoverable();
+        if rec == 0 {
+            // rec == 0 forces net_loss == 0 as well (it implies total_returned >=
+            // total_flushed), so both terms below would be 0 anyway. Short-circuit.
+            return 0;
+        }
+        let net_loss = self.total_flushed.saturating_sub(self.total_returned);
+        // Below the band: the portion of the loss that already spilled past junior
+        // (`distribute_loss`'s senior_loss), capped by what is actually recoverable.
+        let below = rec.min(net_loss.saturating_sub(self.junior_balance()));
+        // Above the band: recoverable stock in excess of the accounting shortfall.
+        let above = rec.saturating_sub(net_loss);
+        // below + above <= net_loss + (rec - net_loss) = rec, so this cannot overflow.
+        below.saturating_add(above)
+    }
+
     /// Current struct version. Increment when layout changes.
     /// v2 (size 352 -> 384): added `pending_admin` for two-step admin rotation.
     /// v3 (size 384 -> 392): added `total_recovered_from_wrapper` (H-1 re-review
