@@ -883,6 +883,39 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             );
             return Err(StakeError::InsuranceLossOutstanding.into());
         }
+    } else if pool.wrapper_recoverable() > 0 {
+        // A-H2: refuse to mint while a permissionless recovery could reprice the pool.
+        //
+        // `RecoverFlushedInsurance` (tag 23) is permissionless, so any caller can move
+        // `wrapper_recoverable()` into `total_pool_value()` at a time of their choosing.
+        // A depositor who mints first buys at the flush-marked-down price and captures
+        // the restoration pro-rata from the incumbents who bore the markdown.
+        //
+        // Gating tag 23 would not close this: the attacker only has to hold LP across any
+        // restoring event, and an unrelated caller's recover — or the admin's own
+        // `ReturnInsurance` — pays identically. Hence a mint-side gate.
+        //
+        // The quantity is `wrapper_recoverable()`, not `total_flushed - total_returned`:
+        // `ReturnInsurance` credits `total_returned` from the admin's own wallet without
+        // moving wrapper tokens, so that expression can read 0 while the whole flush is
+        // still injectable. `wrapper_recoverable()` is the cap tag 23 enforces on itself,
+        // i.e. the largest price move an unprivileged caller can cause.
+        //
+        // Not the #162 freeze: the blocked party lifts it themselves by prepending tag 23
+        // to the same transaction, and deposits reopen on `wrapper_fully_recovered()` —
+        // the condition that already gates H-1 resolution. It stays shut only when the
+        // flush genuinely cannot be pulled back, where minting would misprice in one
+        // direction or the other regardless.
+        //
+        // Scoped to the `else` arm: on a junior-absorbed loss a recovery raises
+        // `effective_junior_balance()` by what it raises `total_pool_value()`, leaving
+        // `senior_balance()` unchanged, so the #159 gate above is correctly scoped and
+        // widening this one would cost senior liveness for no security gain.
+        msg!(
+            "Deposit paused: {} of flushed insurance is still recoverable — call RecoverFlushedInsurance first",
+            pool.wrapper_recoverable(),
+        );
+        return Err(StakeError::InsuranceLossOutstanding.into());
     }
 
     // Calculate LP tokens to mint.
