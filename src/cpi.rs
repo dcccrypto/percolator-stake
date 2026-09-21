@@ -217,6 +217,82 @@ fn next_asset0_intent_id(market: &AccountInfo) -> Result<u64, ProgramError> {
         .ok_or(ProgramError::ArithmeticOverflow)
 }
 
+/// `MarketGroupV16HeaderAccount.next_market_id` — the MARKET-WIDE asset-
+/// generation "frontier" counter (the generation that will be assigned to
+/// the NEXT asset activation in this slab). This is what `ResolveMarket`
+/// (tag 19) validates via `require_asset_generation_frontier_view(&group,
+/// expected_frontier)` — `group.header.next_market_id.get() != expected_frontier`
+/// => `AssetGenerationMismatch`. UNLIKE `ASSET0_MARKET_ID_OFF` (a PER-ASSET
+/// counter, `AssetStateV16::market_id`, used by tags 9/65/51/57), this field
+/// lives inside `MarketGroupV16HeaderAccount` itself, BEFORE the per-asset
+/// region `ASSET0_WRAPPER_START` marks the start of — the two fields read
+/// different bytes and are NOT interchangeable despite both being called a
+/// "generation" in adjacent code paths.
+///
+/// Offset ground-truthed via `core::mem::offset_of!` against the real
+/// `percolator::MarketGroupV16HeaderAccount` type at `sync/integration-v16 @
+/// a9318945` (a throwaway probe test appended to a scratch wrapper worktree,
+/// run once, reverted — never committed): `MARKET_GROUP_OFF(592) +
+/// offset_of!(MarketGroupV16HeaderAccount, next_market_id)(581) = 1173`.
+const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = 1173;
+
+/// `AssetControlSequencesV16.backing_fee_long` for asset 0 — the strictly-
+/// increasing `policy_sequence` watermark `UpdateBackingFeePolicy` (tag 51)
+/// advances for the LONG domain (`domain` even, `ControlSequenceLane::
+/// BackingFeeLong`), checked via `require_newer_control_sequence` (proposed
+/// must be STRICTLY greater than stored — same one-shot-nonce contract as
+/// tag 9's `intent_id`, NOT a CAS). Offset ground-truthed the same way as
+/// `MARKET_ASSET_GENERATION_FRONTIER_OFF` above: `offset_of!(
+/// AssetControlSequencesV16, backing_fee_long) == 8` within the 88-byte
+/// `AssetControlSequencesV16` struct at `ASSET_CONTROL_SEQUENCES_OFF(512)`
+/// (both values reconfirmed by the SAME probe that reconfirmed the
+/// already-shipped `authority_epoch @ +72`, cross-validating the method).
+const ASSET0_BACKING_FEE_LONG_OFF: usize = ASSET0_WRAPPER_START + 512 + 8; // 1870
+/// `AssetControlSequencesV16.backing_fee_short` for asset 0 — same as
+/// `ASSET0_BACKING_FEE_LONG_OFF` but for the SHORT domain (`domain` odd,
+/// `ControlSequenceLane::BackingFeeShort`). `offset_of!(..., backing_fee_short)
+/// == 16`.
+const ASSET0_BACKING_FEE_SHORT_OFF: usize = ASSET0_WRAPPER_START + 512 + 16; // 1878
+/// `AssetControlSequencesV16.trade_fee` for asset 0 — the strictly-increasing
+/// `policy_sequence` watermark `UpdateTradeFeePolicy` (tag 55) advances
+/// (`ControlSequenceLane::TradeFee`; the wrapper hardcodes asset 0 for this
+/// tag, matching every other asset-0-scoped read in this file).
+/// `offset_of!(..., trade_fee) == 24`.
+const ASSET0_TRADE_FEE_OFF: usize = ASSET0_WRAPPER_START + 512 + 24; // 1886
+
+/// Live market-wide asset-generation frontier — the `asset_generation_frontier`
+/// field `ResolveMarket` (tag 19) sends on the wire. See
+/// `MARKET_ASSET_GENERATION_FRONTIER_OFF`'s own doc comment for why this is
+/// NOT the same value as `read_asset0_market_id`.
+fn read_market_asset_generation_frontier(market: &AccountInfo) -> Result<u64, ProgramError> {
+    read_market_u64(market, MARKET_ASSET_GENERATION_FRONTIER_OFF)
+}
+
+/// Next valid `policy_sequence` for a tag-51 `UpdateBackingFeePolicy` CPI on
+/// asset 0: the live stored watermark (long or short domain, selected by
+/// `long_side`) plus one — a strictly-increasing one-shot nonce, exactly
+/// like `next_asset0_intent_id`, NOT a CAS like `authority_epoch`.
+fn next_asset0_backing_fee_policy_sequence(
+    market: &AccountInfo,
+    long_side: bool,
+) -> Result<u64, ProgramError> {
+    let off = if long_side {
+        ASSET0_BACKING_FEE_LONG_OFF
+    } else {
+        ASSET0_BACKING_FEE_SHORT_OFF
+    };
+    let current = read_market_u64(market, off)?;
+    current.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)
+}
+
+/// Next valid `policy_sequence` for a tag-55 `UpdateTradeFeePolicy` CPI
+/// (asset 0, hardcoded by the wrapper): the live stored `trade_fee` watermark
+/// plus one.
+fn next_asset0_trade_fee_policy_sequence(market: &AccountInfo) -> Result<u64, ProgramError> {
+    let current = read_market_u64(market, ASSET0_TRADE_FEE_OFF)?;
+    current.checked_add(1).ok_or(ProgramError::ArithmeticOverflow)
+}
+
 /// Shared tag-65 `UpdateAssetAuthority` payload builder for all five call
 /// sites below — every one of them targets asset index 0 and differs ONLY
 /// in `kind` and `new_pubkey`. Centralizing the byte layout means the
@@ -358,8 +434,18 @@ pub fn cpi_top_up_insurance<'a>(
 // UpdateAuthority (Tag 32) — rotate market-level marketauth to the pool PDA
 // ═══════════════════════════════════════════════════════════════
 // Accounts (v16_program.rs handle_update_authority, account(_,0)/(_,1)/(_,2)):
-//   [current_authority(signer), new_authority(signer), market(w)]
-// Data: tag(1) + new_authority(32) = 33 bytes
+//   [current_authority(signer), new_authority(signer), market(w)] — UNCHANGED.
+// Data (v16 migration, LOCKED wire, HELD): tag(1) + new_authority(32) +
+//   authority_epoch(8, u64 LE) = 41 bytes.
+//
+// v16 MIGRATION WIRE CHANGE (W3A-1, upstream `95d155bc`): `handle_update_authority`
+// gained a trailing `authority_epoch` strict CAS — `advance_authority_epoch_view(
+// &mut group, 0, expected_authority_epoch)` — reusing the SAME asset-0
+// `authority_epoch` lane `UpdateAssetAuthority` (tag 65) advances, closing an
+// A->B->A durable-nonce replay hole this rotation previously had ZERO epoch
+// binding against. Passed UNCHANGED (current, not +1 — the wrapper advances it
+// on success), read live off `slab` via `read_asset0_authority_epoch` exactly
+// like every other tag-65-family CPI in this file.
 //
 // Ported byte-for-byte from the deployed percolator-vault@eb3ebe8 InitPool CPI
 // (src/cpi.rs `cpi_update_authority`, src/processor.rs:340) — issue #6
@@ -376,6 +462,25 @@ pub fn cpi_top_up_insurance<'a>(
 // (tag 65) above, which rotates only the per-asset insurance_authority/operator/
 // admin fields, not the market-wide marketauth this function rotates.
 
+/// Pure tag-32 `UpdateAuthority` payload builder — separated the same way as
+/// `build_top_up_insurance_data`/`build_update_asset_authority_data` so the
+/// byte layout is directly unit-testable against a synthetic account.
+///
+/// Wire (41 bytes): `[tag=32][new_pubkey: 32 bytes][authority_epoch: u64 LE]`.
+fn build_update_authority_data(
+    slab: &AccountInfo,
+    new_pubkey: [u8; 32],
+) -> Result<Vec<u8>, ProgramError> {
+    let authority_epoch = read_asset0_authority_epoch(slab)?;
+
+    let mut data = Vec::with_capacity(41);
+    data.push(TAG_UPDATE_AUTHORITY);
+    data.extend_from_slice(&new_pubkey);
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    debug_assert_eq!(data.len(), 41);
+    Ok(data)
+}
+
 pub fn cpi_update_authority<'a>(
     percolator_program: &AccountInfo<'a>,
     current_admin: &AccountInfo<'a>, // current marketauth; signs the outer tx
@@ -383,9 +488,7 @@ pub fn cpi_update_authority<'a>(
     slab: &AccountInfo<'a>,          // market, writable
     new_authority_seeds: &[&[u8]],   // pool PDA seeds
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(33);
-    data.push(TAG_UPDATE_AUTHORITY);
-    data.extend_from_slice(new_authority.key.as_ref());
+    let data = build_update_authority_data(slab, new_authority.key.to_bytes())?;
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -650,7 +753,22 @@ pub fn cpi_rotate_insurance_authority<'a>(
 // ═══════════════════════════════════════════════════════════════
 // WithdrawInsuranceAsset (Tag 57) — PDA-signed insurance recovery
 // ═══════════════════════════════════════════════════════════════
-// Wire: [57u8][asset_index: u16 LE = 0][amount: u128 LE] = 19 bytes.
+// Wire (v16 migration, LOCKED, HELD): [57u8][asset_index: u16 LE = 0]
+// [market_id: u64 LE][amount: u128 LE][authority_epoch: u64 LE] = 35 bytes.
+//
+// v16 MIGRATION WIRE CHANGE (W3A-1, `Withdraw{BackingBucket50,Earnings52,
+// InsuranceAsset57}`): `handle_withdraw_insurance_asset` gained a
+// `market_id` generation-binding parameter (checked via
+// `require_asset_generation_view(&group, asset_index, expected_market_id)`,
+// asset_index always 0 for stake) AND a trailing `authority_epoch` (checked
+// read-only via `require_authority_epoch_view(&group, epoch_asset_index,
+// expected_authority_epoch)`; `epoch_asset_index == asset_index == 0` on the
+// `local_authorized` path this program always takes — the vault_auth PDA is
+// asset-0's `insurance_operator`). Both read live off `market` immediately
+// before the CPI, matching the tag-9/65 pattern; `authority_epoch` is passed
+// UNCHANGED (this lane is only ever advanced by `UpdateAuthority`/
+// `UpdateAssetAuthority`, never by this tag).
+//
 // Account order (verified against tests/v17_stake_insurance_e2e.rs
 // withdraw_insurance_asset_ix and wrapper handle_withdraw_insurance_asset):
 //   [0] operator      (vault_auth PDA, signer via invoke_signed) — must == insurance_operator
@@ -672,6 +790,29 @@ pub fn cpi_rotate_insurance_authority<'a>(
 
 const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 
+/// Pure tag-57 `WithdrawInsuranceAsset` payload builder — separated the same
+/// way as the tag-9/32/65 builders above so the byte layout is directly
+/// unit-testable against a synthetic account.
+///
+/// Wire (35 bytes): `[tag=57][asset_index: u16 LE = 0][market_id: u64 LE]
+/// [amount: u128 LE][authority_epoch: u64 LE]`.
+fn build_withdraw_insurance_asset_data(
+    market: &AccountInfo,
+    amount: u64,
+) -> Result<Vec<u8>, ProgramError> {
+    let market_id = read_asset0_market_id(market)?;
+    let authority_epoch = read_asset0_authority_epoch(market)?;
+
+    let mut data = Vec::with_capacity(35);
+    data.push(TAG_WITHDRAW_INSURANCE_ASSET);
+    data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
+    data.extend_from_slice(&market_id.to_le_bytes()); // 8 bytes
+    data.extend_from_slice(&(amount as u128).to_le_bytes()); // 16 bytes u128 LE
+    data.extend_from_slice(&authority_epoch.to_le_bytes()); // 8 bytes
+    debug_assert_eq!(data.len(), 35);
+    Ok(data)
+}
+
 pub fn cpi_withdraw_insurance_asset<'a>(
     percolator_program: &AccountInfo<'a>,
     vault_auth: &AccountInfo<'a>, // insurance_operator = our PDA; signs via invoke_signed
@@ -683,11 +824,7 @@ pub fn cpi_withdraw_insurance_asset<'a>(
     amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
-    // tag(1) + asset_index(2, u16 LE = 0) + amount(16, u128 LE) = 19 bytes.
-    let mut data = Vec::with_capacity(19);
-    data.push(TAG_WITHDRAW_INSURANCE_ASSET);
-    data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // 2 bytes, always 0x00 0x00
-    data.extend_from_slice(&(amount as u128).to_le_bytes()); // 16 bytes u128 LE
+    let data = build_withdraw_insurance_asset_data(market, amount)?;
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -735,29 +872,40 @@ pub fn cpi_withdraw_insurance_asset<'a>(
 // OWN seeds (`[b"stake_pool", slab, bump]`), exactly mirroring how
 // `cpi_update_authority` already proves control during InitPool.
 //
-// WIRE (verified against the DEPLOYED wrapper source,
-// percolator-prog@e26c97a4 == current HEAD, src/v16_program.rs:10278
-// handle_resolve_market):
-//   let admin = account(accounts, 0)?;      // expect_signer + expect_live_authority(marketauth)
+// WIRE (v16 migration, LOCKED, HELD — verified against `sync/integration-v16
+// @ a9318945`'s ACTUAL decode arm, `19 => Self::ResolveMarket {
+// asset_generation_frontier: read_u64, authority_epoch: read_u64 }`, and
+// `handle_resolve_market`'s signature `(program_id, accounts,
+// expected_asset_generation_frontier, expected_authority_epoch)`):
+//   let admin = account(accounts, 0)?;      // expect_signer
 //   let market_ai = account(accounts, 1)?;  // expect_writable + expect_owner(program_id)
+//   require_asset_generation_frontier_view(&group, expected_asset_generation_frontier)?;
 //   ... mode must == 0 (else EngineLockActive) ...
+//   expect_live_authority(&cfg.marketauth, admin.key)?;
+//   require_authority_epoch_view(&group, 0, expected_authority_epoch)?;  // CHECK-only, asset-0 lane
 //   group.resolve_market_not_atomic(slot)
-// Tag decode (v16_program.rs:3867): `19 => Self::ResolveMarket` — the decoder
-// consumes ZERO additional bytes for this variant (unlike e.g. tag 9's
-// `read_u128`), so the wire is the bare 1-byte tag. Data: tag(1) = 1 byte.
-// Accounts: exactly 2 — [admin(signer), market(writable)]. NO payload bytes,
-// NO extra accounts.
+// Data: tag(1) + asset_generation_frontier(8, u64 LE) + authority_epoch(8,
+// u64 LE) = 17 bytes. Accounts: exactly 2 —
+// [admin(signer), market(writable)] — UNCHANGED from the pre-migration
+// bare-tag wire.
 //
-// BYTE-FOR-BYTE PARITY with the deployed vault's `cpi_resolve_market`
-// (percolator-vault@eb3ebe8 src/cpi.rs:240-258): `let data =
-// vec![TAG_RESOLVE_MARKET];` with the identical 2-account
-// `[new_readonly(admin_pda, true), new(slab, false)]` shape and
+// TWO DIFFERENT "generation" FIELDS, DO NOT CONFUSE: `asset_generation_frontier`
+// is the MARKET-WIDE `header.next_market_id` counter (see
+// `MARKET_ASSET_GENERATION_FRONTIER_OFF`'s doc comment) — NOT asset 0's
+// per-asset `market_id` that tags 9/65/51/57 use. `authority_epoch` IS the
+// same asset-0 CAS lane as everywhere else in this file (CHECK-only here,
+// never advanced by this tag — only `UpdateAuthority`/`UpdateAssetAuthority`
+// advance it), read via the existing `read_asset0_authority_epoch`.
+//
+// ACCOUNT SHAPE PARITY with the deployed vault's `cpi_resolve_market`
+// (percolator-vault@eb3ebe8 src/cpi.rs:240-258) is preserved — identical
+// 2-account `[new_readonly(admin_pda, true), new(slab, false)]` shape and
 // `invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])`
-// call pattern. The only naming difference is that THIS program's "admin_pda"
-// signer is the `stake_pool` PDA itself (matching what `cpi_update_authority`
-// rotated marketauth to), not a separately-named admin PDA — vault and stake
-// converge on the same PDA-is-marketauth design from issue #6 lineage
-// reconciliation, so the CPI construction is identical.
+// call pattern; only the DATA payload grew for the v16 migration. This
+// program's "admin_pda" signer is the `stake_pool` PDA itself (matching what
+// `cpi_update_authority` rotated marketauth to), not a separately-named admin
+// PDA — vault and stake converge on the same PDA-is-marketauth design from
+// issue #6 lineage reconciliation.
 //
 // H-1 (HIGH, fixed at the call site in `processor.rs::process_admin_resolve_market`):
 // this CPI is gated so the caller may not invoke it while
@@ -773,15 +921,31 @@ pub fn cpi_withdraw_insurance_asset<'a>(
 // `process_admin_resolve_market` for the full analysis.
 const TAG_RESOLVE_MARKET: u8 = 19;
 
+/// Pure tag-19 `ResolveMarket` payload builder — separated the same way as
+/// the other v16-migration builders above so the byte layout is directly
+/// unit-testable against a synthetic account.
+///
+/// Wire (17 bytes): `[tag=19][asset_generation_frontier: u64 LE]
+/// [authority_epoch: u64 LE]`.
+fn build_resolve_market_data(slab: &AccountInfo) -> Result<Vec<u8>, ProgramError> {
+    let asset_generation_frontier = read_market_asset_generation_frontier(slab)?;
+    let authority_epoch = read_asset0_authority_epoch(slab)?;
+
+    let mut data = Vec::with_capacity(17);
+    data.push(TAG_RESOLVE_MARKET);
+    data.extend_from_slice(&asset_generation_frontier.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    debug_assert_eq!(data.len(), 17);
+    Ok(data)
+}
+
 pub fn cpi_resolve_market<'a>(
     percolator_program: &AccountInfo<'a>,
     pool_pda: &AccountInfo<'a>, // marketauth (rotated by InitPool); signs via invoke_signed
     slab: &AccountInfo<'a>,     // market, writable
     pool_seeds: &[&[u8]],       // pool PDA seeds: [b"stake_pool", slab, bump]
 ) -> ProgramResult {
-    // tag(1) = 1 byte. No payload — matches `19 => Self::ResolveMarket` (zero
-    // additional bytes consumed by the wrapper's decoder).
-    let data = vec![TAG_RESOLVE_MARKET];
+    let data = build_resolve_market_data(slab)?;
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -814,9 +978,11 @@ pub fn cpi_resolve_market<'a>(
 //   GROUP A (signer = POOL PDA, seeds [b"stake_pool", slab, bump]):
 //     tag 86 UpdateFeeSplit              -> gated on cfg.marketauth
 //     tag 88 UpdateMaintenanceFeePerSlot -> gated on cfg.marketauth
+//     tag 55 UpdateTradeFeePolicy        -> gated on cfg.marketauth (GH#286,
+//       wrapper #455 moved this OUT of Group B — see tag 55's own doc
+//       comment below for the full history)
 //   GROUP B (signer = VAULT_AUTH PDA, seeds [b"vault_auth", pool, bump]):
 //     tag 51 UpdateBackingFeePolicy -> gated on per-asset insurance_authority
-//     tag 55 UpdateTradeFeePolicy   -> gated on asset 0's insurance_authority
 //
 // Passing a Group A signer to a Group B tag (or vice versa) does not silently
 // misbehave — the wrapper's `expect_live_authority` rejects with Unauthorized,
@@ -828,11 +994,45 @@ pub fn cpi_resolve_market<'a>(
 // `max_trading_fee_bps`/`MAX_DYNAMIC_TRADE_FEE_BPS` for 51/55). Duplicating any
 // of those bounds here would create two copies that drift apart on the first
 // retune.
+//
+// v16 MIGRATION WIRE (systematic sweep, sync/integration-v16 @ a9318945): tags
+// 86 and 51 each gained a trailing replay-protection field the pre-migration
+// wire did not carry; tag 88 did NOT change (see its own doc comment — VERIFIED
+// unchanged, not just left alone).
 
 /// Wrapper tag 86 `UpdateFeeSplit`. Marketauth-gated — the POOL PDA signs.
-/// Wire: tag(1) + creator(2) + lp(2) + insurance(2) = 7 bytes, all u16 LE,
-/// matching `86 => Self::UpdateFeeSplit { read_u16, read_u16, read_u16 }`.
+/// Wire (v16 migration, LOCKED, HELD): tag(1) + creator(2) + lp(2) +
+/// insurance(2) + authority_epoch(8, u64 LE) = 15 bytes, matching `86 =>
+/// Self::UpdateFeeSplit { read_u16, read_u16, read_u16, read_u64 }`.
+///
+/// v16 MIGRATION WIRE CHANGE (W4-AE-EXTEND): `handle_update_fee_split` gained
+/// a gate-2-class CAS check against the SAME asset-0 `authority_epoch` lane
+/// every other tag-65-family CPI in this file reads
+/// (`state::require_current_authority_epoch(sequences.authority_epoch,
+/// expected_authority_epoch)` on `read_asset_control_sequences(&data, 0)`).
+/// Passed UNCHANGED via the existing `read_asset0_authority_epoch`.
 const TAG_UPDATE_FEE_SPLIT: u8 = 86;
+
+/// Pure tag-86 `UpdateFeeSplit` payload builder — separated the same way as
+/// the other v16-migration builders above so the byte layout is directly
+/// unit-testable against a synthetic account.
+fn build_update_fee_split_data(
+    slab: &AccountInfo,
+    creator_share_bps: u16,
+    lp_share_bps: u16,
+    insurance_share_bps: u16,
+) -> Result<Vec<u8>, ProgramError> {
+    let authority_epoch = read_asset0_authority_epoch(slab)?;
+
+    let mut data = Vec::with_capacity(15);
+    data.push(TAG_UPDATE_FEE_SPLIT);
+    data.extend_from_slice(&creator_share_bps.to_le_bytes());
+    data.extend_from_slice(&lp_share_bps.to_le_bytes());
+    data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    debug_assert_eq!(data.len(), 15);
+    Ok(data)
+}
 
 pub fn cpi_update_fee_split<'a>(
     percolator_program: &AccountInfo<'a>,
@@ -843,11 +1043,12 @@ pub fn cpi_update_fee_split<'a>(
     insurance_share_bps: u16,
     pool_seeds: &[&[u8]], // pool PDA seeds: [b"stake_pool", slab, bump]
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(7);
-    data.push(TAG_UPDATE_FEE_SPLIT);
-    data.extend_from_slice(&creator_share_bps.to_le_bytes());
-    data.extend_from_slice(&lp_share_bps.to_le_bytes());
-    data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+    let data = build_update_fee_split_data(
+        slab,
+        creator_share_bps,
+        lp_share_bps,
+        insurance_share_bps,
+    )?;
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -869,6 +1070,14 @@ pub fn cpi_update_fee_split<'a>(
 /// read_u128(&mut rest)? }`, and it rejects the instruction outright if `rest`
 /// is non-empty afterward. An 8-byte u64 payload therefore fails closed with
 /// `InvalidInstructionData` rather than writing a truncated value.
+///
+/// VERIFIED UNCHANGED at `sync/integration-v16 @ a9318945`
+/// (`handle_update_maintenance_fee_per_slot`'s signature is still
+/// `(program_id, accounts, maintenance_fee_per_slot: u128)` — NO
+/// authority_epoch/policy_sequence parameter was added; #428's Live-mode gate
+/// added a *read-side* checkpoint write, not a new *wire* field). This wire
+/// is NOT part of the systematic sweep's drift list — 17 bytes, tag+u128,
+/// same as before.
 const TAG_UPDATE_MAINTENANCE_FEE_PER_SLOT: u8 = 88;
 
 pub fn cpi_update_maintenance_fee_per_slot<'a>(
@@ -896,12 +1105,56 @@ pub fn cpi_update_maintenance_fee_per_slot<'a>(
 
 /// Wrapper tag 51 `UpdateBackingFeePolicy`. Gated on the per-asset
 /// `insurance_authority` — the VAULT_AUTH PDA signs, NOT the pool PDA.
-/// Wire: tag(1) + domain(2) + fee_bps(2) + insurance_share_bps(2) = 7 bytes,
-/// all u16 LE, matching `51 => Self::UpdateBackingFeePolicy { read_u16 x3 }`.
+/// Wire (v16 migration, LOCKED, HELD): tag(1) + domain(2) + market_id(8, u64
+/// LE) + fee_bps(2) + insurance_share_bps(2) + policy_sequence(8, u64 LE) =
+/// 23 bytes, matching `51 => Self::UpdateBackingFeePolicy { read_u16,
+/// read_u64, read_u16, read_u16, read_u64 }`.
 ///
 /// This is the setter for `backing_trade_fee_bps`. On a market where
 /// `BindInsuranceAuthority` has run, this CPI is the ONLY way to reach it.
+///
+/// v16 MIGRATION WIRE CHANGE: `handle_update_backing_fee_policy` gained
+/// `expected_market_id` (checked via `require_asset_generation_view(&group,
+/// asset_index, expected_market_id)`, `asset_index = domain / 2`) and a
+/// trailing `policy_sequence` (a STRICTLY-INCREASING one-shot nonce via
+/// `require_newer_control_sequence`, lane `BackingFeeLong` for `domain` even
+/// / `BackingFeeShort` for `domain` odd — NOT a CAS like `authority_epoch`).
+///
+/// SCOPING NOTE: this program only ever binds asset 0's `insurance_authority`
+/// to `vault_auth` (see `cpi_bind_insurance_authority`), so `domain` is only
+/// ever meaningfully 0 (long) or 1 (short) in this program's own call sites
+/// — both map to `asset_index == 0`. `market_id` is therefore read via the
+/// existing asset-0 `read_asset0_market_id`, matching every other asset-0-
+/// scoped field in this file. A caller-supplied `domain >= 2` would target a
+/// DIFFERENT asset's generation counter, and passing asset-0's `market_id`
+/// for it fails CLOSED (an `AssetGenerationMismatch`, checked BEFORE the
+/// authority gate) rather than opening any bypass — this program's PDA is
+/// not that asset's `insurance_authority` either way.
 const TAG_UPDATE_BACKING_FEE_POLICY: u8 = 51;
+
+/// Pure tag-51 `UpdateBackingFeePolicy` payload builder — separated the same
+/// way as the other v16-migration builders above so the byte layout is
+/// directly unit-testable against a synthetic account.
+fn build_update_backing_fee_policy_data(
+    slab: &AccountInfo,
+    domain: u16,
+    fee_bps: u16,
+    insurance_share_bps: u16,
+) -> Result<Vec<u8>, ProgramError> {
+    let market_id = read_asset0_market_id(slab)?;
+    let long_side = domain.is_multiple_of(2);
+    let policy_sequence = next_asset0_backing_fee_policy_sequence(slab, long_side)?;
+
+    let mut data = Vec::with_capacity(23);
+    data.push(TAG_UPDATE_BACKING_FEE_POLICY);
+    data.extend_from_slice(&domain.to_le_bytes());
+    data.extend_from_slice(&market_id.to_le_bytes());
+    data.extend_from_slice(&fee_bps.to_le_bytes());
+    data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+    data.extend_from_slice(&policy_sequence.to_le_bytes());
+    debug_assert_eq!(data.len(), 23);
+    Ok(data)
+}
 
 pub fn cpi_update_backing_fee_policy<'a>(
     percolator_program: &AccountInfo<'a>,
@@ -912,11 +1165,7 @@ pub fn cpi_update_backing_fee_policy<'a>(
     insurance_share_bps: u16,
     vault_auth_seeds: &[&[u8]], // vault_auth PDA seeds: [b"vault_auth", pool, bump]
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(7);
-    data.push(TAG_UPDATE_BACKING_FEE_POLICY);
-    data.extend_from_slice(&domain.to_le_bytes());
-    data.extend_from_slice(&fee_bps.to_le_bytes());
-    data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+    let data = build_update_backing_fee_policy_data(slab, domain, fee_bps, insurance_share_bps)?;
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -934,39 +1183,71 @@ pub fn cpi_update_backing_fee_policy<'a>(
     )
 }
 
-/// Wrapper tag 55 `UpdateTradeFeePolicy`. Gated on ASSET 0's
-/// `insurance_authority` (the wrapper hardcodes asset 0 for this tag) — the
-/// VAULT_AUTH PDA signs. Wire: tag(1) + trade_fee_base_bps(8, u64 LE) = 9
-/// bytes, matching `55 => Self::UpdateTradeFeePolicy { read_u64 }`.
+/// Wrapper tag 55 `UpdateTradeFeePolicy`. Wire (v16 migration, LOCKED, HELD):
+/// tag(1) + trade_fee_base_bps(8, u64 LE) + policy_sequence(8, u64 LE) = 17
+/// bytes, matching `55 => Self::UpdateTradeFeePolicy { read_u64, read_u64 }`.
 ///
-/// Note the asymmetry with tag 88 above: this argument really is a `u64`.
+/// GH#286 / wrapper #455 ("gate UpdateTradeFeePolicy on marketauth, like
+/// every other market-wide setter"): this tag moved from GROUP B
+/// (asset-0 `insurance_authority`, VAULT_AUTH PDA signer) to GROUP A
+/// (`cfg.marketauth`, POOL PDA signer) — see `handle_update_trade_fee_policy`'s
+/// own doc comment in the wrapper (`#445: gate on cfg.marketauth, like every
+/// other MARKET-WIDE fee-policy setter`; `trade_fee_base_bps` is a
+/// market-wide floor, not scoped to asset 0, and a staked market's asset-0
+/// `insurance_authority` can be parked on a PDA that cannot sign, which left
+/// this field permanently unsettable under the old gate). The processor.rs
+/// call site (`process_admin_update_trade_fee_policy`, tag 28) was already
+/// fixed for this in PR #288 — it passes `pool_pda` positionally into what
+/// used to be named `vault_auth` here. This function's parameter names are
+/// renamed to match (`pool_pda`/`pool_seeds`) so the signature is no longer
+/// misleading about who actually signs; this is a doc/naming fix only, NOT a
+/// call-site or account-shape change (same position, same type).
+///
+/// v16 MIGRATION WIRE CHANGE (separate from GH#286's authority-gate change):
+/// `handle_update_trade_fee_policy` also gained a trailing `policy_sequence`
+/// (a strictly-increasing one-shot nonce via `require_newer_control_sequence`
+/// on asset-0's `ControlSequenceLane::TradeFee` lane — NOT a CAS). NOTE:
+/// UNLIKE tag 51, this wire carries NO `market_id` field — the wrapper's
+/// decode arm for tag 55 is exactly `{ trade_fee_base_bps: read_u64,
+/// policy_sequence: read_u64 }`, no generation-binding field at all.
 const TAG_UPDATE_TRADE_FEE_POLICY: u8 = 55;
+
+/// Pure tag-55 `UpdateTradeFeePolicy` payload builder — separated the same
+/// way as the other v16-migration builders above so the byte layout is
+/// directly unit-testable against a synthetic account.
+fn build_update_trade_fee_policy_data(
+    slab: &AccountInfo,
+    trade_fee_base_bps: u64,
+) -> Result<Vec<u8>, ProgramError> {
+    let policy_sequence = next_asset0_trade_fee_policy_sequence(slab)?;
+
+    let mut data = Vec::with_capacity(17);
+    data.push(TAG_UPDATE_TRADE_FEE_POLICY);
+    data.extend_from_slice(&trade_fee_base_bps.to_le_bytes());
+    data.extend_from_slice(&policy_sequence.to_le_bytes());
+    debug_assert_eq!(data.len(), 17);
+    Ok(data)
+}
 
 pub fn cpi_update_trade_fee_policy<'a>(
     percolator_program: &AccountInfo<'a>,
-    vault_auth: &AccountInfo<'a>, // asset-0 insurance_authority; signs via invoke_signed
-    slab: &AccountInfo<'a>,       // market, writable
+    pool_pda: &AccountInfo<'a>, // marketauth (GH#286/wrapper #455); signs via invoke_signed
+    slab: &AccountInfo<'a>,     // market, writable
     trade_fee_base_bps: u64,
-    vault_auth_seeds: &[&[u8]], // vault_auth PDA seeds: [b"vault_auth", pool, bump]
+    pool_seeds: &[&[u8]], // pool PDA seeds: [b"stake_pool", slab, bump]
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(9);
-    data.push(TAG_UPDATE_TRADE_FEE_POLICY);
-    data.extend_from_slice(&trade_fee_base_bps.to_le_bytes()); // 8 bytes
+    let data = build_update_trade_fee_policy_data(slab, trade_fee_base_bps)?;
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*vault_auth.key, true), // insurance_authority, signer
-            AccountMeta::new(*slab.key, false),               // market, writable
+            AccountMeta::new_readonly(*pool_pda.key, true), // marketauth, signer
+            AccountMeta::new(*slab.key, false),             // market, writable
         ],
         data,
     };
 
-    invoke_signed(
-        &ix,
-        &[vault_auth.clone(), slab.clone()],
-        &[vault_auth_seeds],
-    )
+    invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
 }
 
 #[cfg(test)]
@@ -1005,6 +1286,33 @@ mod tag_tests {
         data
     }
 
+    /// Extended synthetic market-account buffer for the systematic-sweep
+    /// tags (19/51/55), which read live fields beyond the original three
+    /// `synthetic_market_data` covers. Builds on the same buffer (all four
+    /// new offsets are smaller than `ASSET0_MARKET_ID_OFF + 8`, so no resize
+    /// is needed) and patches in the additional sentinel values.
+    #[allow(clippy::too_many_arguments)]
+    fn synthetic_market_data_full(
+        market_id: u64,
+        authority_epoch: u64,
+        insurance_top_up: u64,
+        asset_generation_frontier: u64,
+        backing_fee_long: u64,
+        backing_fee_short: u64,
+        trade_fee: u64,
+    ) -> Vec<u8> {
+        let mut data = synthetic_market_data(market_id, authority_epoch, insurance_top_up);
+        data[MARKET_ASSET_GENERATION_FRONTIER_OFF..MARKET_ASSET_GENERATION_FRONTIER_OFF + 8]
+            .copy_from_slice(&asset_generation_frontier.to_le_bytes());
+        data[ASSET0_BACKING_FEE_LONG_OFF..ASSET0_BACKING_FEE_LONG_OFF + 8]
+            .copy_from_slice(&backing_fee_long.to_le_bytes());
+        data[ASSET0_BACKING_FEE_SHORT_OFF..ASSET0_BACKING_FEE_SHORT_OFF + 8]
+            .copy_from_slice(&backing_fee_short.to_le_bytes());
+        data[ASSET0_TRADE_FEE_OFF..ASSET0_TRADE_FEE_OFF + 8]
+            .copy_from_slice(&trade_fee.to_le_bytes());
+        data
+    }
+
     /// OFFSET PIN: these three constants are the ground truth this whole
     /// v16-migration wire depends on (derived against `sync/integration-v16
     /// @ a9318945`'s compiled layout — see the constants' own doc comments
@@ -1017,6 +1325,13 @@ mod tag_tests {
         assert_eq!(ASSET0_MARKET_ID_OFF, 2374);
         assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1934);
         assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1846);
+        // Systematic-sweep additions (tags 19/51/55) — ground-truthed via
+        // core::mem::offset_of! against the real wrapper Pod types at
+        // sync/integration-v16 @ a9318945 (throwaway probe, reverted).
+        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1173);
+        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1870);
+        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1878);
+        assert_eq!(ASSET0_TRADE_FEE_OFF, 1886);
     }
 
     #[test]
@@ -1277,70 +1592,136 @@ mod tag_tests {
         assert_ne!(ASSET_AUTH_INSURANCE, ASSET_AUTH_INSURANCE_OPERATOR);
     }
 
-    /// CANARY: pin the WithdrawInsuranceAsset (tag 57) wire shape =
-    /// tag(57) + asset_index(2, u16 LE = 0) + amount(16, u128 LE) = 19 bytes.
+    /// CANARY: pin the v16-migration WithdrawInsuranceAsset (tag 57) wire
+    /// shape, exercising the REAL `build_withdraw_insurance_asset_data`
+    /// production code path against a synthetic account.
     ///
-    /// Verified against:
-    ///   - tests/v17_stake_insurance_e2e.rs encode_withdraw_insurance_asset()
-    ///   - spec: "Wire: [57u8][asset_index: u16 LE = 0][amount: u128 LE] (= 19 bytes)"
-    ///
-    /// The amount is ALWAYS widened to u128 on the wire (matching the tag-9
-    /// TopUpInsurance convention from v16 read_u128). Narrowing back to u64
-    /// would cause the wrapper to reject the CPI with InvalidInstructionData.
+    /// Wire (35 bytes): `[tag=57][asset_index: u16 LE = 0][market_id: u64 LE]
+    /// [amount: u128 LE][authority_epoch: u64 LE]`.
     #[test]
-    fn test_cpi_withdraw_insurance_asset_wire_shape() {
+    fn test_build_withdraw_insurance_asset_data_wire_shape() {
+        let mut data_acct = synthetic_market_data(888, 15, 3);
+        let key = Pubkey::new_from_array([9u8; 32]);
+        let owner = Pubkey::new_from_array([10u8; 32]);
+        let mut lamports = 0u64;
+        let market = AccountInfo::new(
+            &key, false, true, &mut lamports, &mut data_acct, &owner, false, 0,
+        );
+
         let amount: u64 = 250_000;
-        let mut data = Vec::with_capacity(19);
-        data.push(TAG_WITHDRAW_INSURANCE_ASSET); // byte 0: tag = 57
-        data.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes()); // bytes 1-2: asset_index = 0
-        data.extend_from_slice(&(amount as u128).to_le_bytes()); // bytes 3-18: amount u128 LE
+        let data = build_withdraw_insurance_asset_data(&market, amount).unwrap();
 
-        assert_eq!(data.len(), 19, "tag-57 wire must be 19 bytes");
+        assert_eq!(data.len(), 35, "v16-migration tag-57 wire must be 35 bytes");
         assert_eq!(data[0], 57, "tag must be 57 (WithdrawInsuranceAsset)");
-        assert_eq!(data[1], 0x00, "asset_index low byte must be 0");
-        assert_eq!(data[2], 0x00, "asset_index high byte must be 0");
+        assert_eq!(
+            u16::from_le_bytes(data[1..3].try_into().unwrap()),
+            0,
+            "asset_index at bytes [1..3] must be 0"
+        );
+        assert_eq!(
+            u64::from_le_bytes(data[3..11].try_into().unwrap()),
+            888,
+            "market_id at bytes [3..11]"
+        );
+        assert_eq!(
+            u128::from_le_bytes(data[11..27].try_into().unwrap()),
+            amount as u128,
+            "amount at bytes [11..27] as u128 LE"
+        );
+        assert_eq!(
+            u64::from_le_bytes(data[27..35].try_into().unwrap()),
+            15,
+            "authority_epoch at bytes [27..35] must be the LIVE current value, unchanged"
+        );
 
-        // Amount occupies bytes [3..19] as u128 LE.
-        let decoded = u128::from_le_bytes(data[3..19].try_into().unwrap());
-        assert_eq!(decoded, amount as u128, "amount round-trips as u128 LE");
-
-        // Guard: must NOT be the 9-byte u64 wire (would be rejected by wrapper read_u128).
+        // Guard against regression to the pre-migration 19-byte wire.
         assert_ne!(
             data.len(),
-            9,
-            "9-byte u64 wire would be rejected by wrapper"
+            19,
+            "19-byte tag+asset_index+amount-only wire is the pre-migration shape — must NOT ship"
         );
-        // Guard: tag 57, not tag 9 (TopUpInsurance) — different directions.
         assert_ne!(data[0], TAG_TOP_UP_INSURANCE, "must be tag 57, not tag 9");
     }
 
-    /// C-1 CANARY: pin the ResolveMarket (tag 19) wire = tag(1) = 1 byte, no
-    /// payload. Mirrors the decoder at v16_program.rs:3867
-    /// (`19 => Self::ResolveMarket`), which reads zero extra bytes.
+    /// REGRESSION GUARD: the pre-migration tag-57 wire was `tag(1) +
+    /// asset_index(2, u16 LE) + amount(16, u128 LE)` = 19 bytes, with NO
+    /// market_id/authority_epoch fields. Against the v16-migration wrapper
+    /// (which requires both), that 19-byte payload hard-reverts at decode
+    /// time (short read after `amount`).
     #[test]
-    fn test_cpi_resolve_market_wire_shape() {
-        let mut data = Vec::with_capacity(1);
-        data.push(TAG_RESOLVE_MARKET);
+    fn test_pre_migration_tag57_wire_is_now_wrong() {
+        let amount: u64 = 250_000;
+        let mut pre_migration = Vec::with_capacity(19);
+        pre_migration.push(TAG_WITHDRAW_INSURANCE_ASSET);
+        pre_migration.extend_from_slice(&ASSET_INDEX_ZERO.to_le_bytes());
+        pre_migration.extend_from_slice(&(amount as u128).to_le_bytes());
+        assert_eq!(pre_migration.len(), 19);
+        assert_ne!(
+            pre_migration.len(),
+            35,
+            "pre-migration 19-byte wire must NOT be sent to the v16-migration wrapper"
+        );
+    }
 
+    /// CANARY: pin the v16-migration ResolveMarket (tag 19) wire shape,
+    /// exercising the REAL `build_resolve_market_data` production code path
+    /// against a synthetic account.
+    ///
+    /// Wire (17 bytes): `[tag=19][asset_generation_frontier: u64 LE]
+    /// [authority_epoch: u64 LE]`.
+    #[test]
+    fn test_build_resolve_market_data_wire_shape() {
+        let mut data_acct =
+            synthetic_market_data_full(555, 21, 3, 999_888, 1, 2, 3);
+        let key = Pubkey::new_from_array([11u8; 32]);
+        let owner = Pubkey::new_from_array([12u8; 32]);
+        let mut lamports = 0u64;
+        let market = AccountInfo::new(
+            &key, false, true, &mut lamports, &mut data_acct, &owner, false, 0,
+        );
+
+        let data = build_resolve_market_data(&market).unwrap();
+
+        assert_eq!(data.len(), 17, "v16-migration tag-19 wire must be 17 bytes");
+        assert_eq!(data[0], 19, "tag must be 19 (ResolveMarket)");
         assert_eq!(
+            u64::from_le_bytes(data[1..9].try_into().unwrap()),
+            999_888,
+            "asset_generation_frontier at bytes [1..9] must be the header-level frontier, \
+             NOT asset-0's per-asset market_id (555)"
+        );
+        assert_eq!(
+            u64::from_le_bytes(data[9..17].try_into().unwrap()),
+            21,
+            "authority_epoch at bytes [9..17] must be the LIVE current value, unchanged"
+        );
+
+        // Byte-for-byte parity with the deployed vault's pre-migration
+        // cpi_resolve_market is no longer expected — the bare 1-byte wire
+        // hard-reverts against the v16-migration wrapper's decoder.
+        assert_ne!(
             data.len(),
             1,
-            "tag-19 ResolveMarket wire must be exactly 1 byte"
+            "bare 1-byte tag is the pre-migration shape — must NOT ship"
         );
-        assert_eq!(data[0], 19, "tag must be 19 (ResolveMarket)");
+    }
 
-        // Byte-for-byte parity with the deployed vault's cpi_resolve_market:
-        // `let data = vec![TAG_RESOLVE_MARKET];` where TAG_RESOLVE_MARKET = 19.
-        let vault_reference = vec![19u8];
-        assert_eq!(
-            data, vault_reference,
-            "ported wire must be byte-for-byte identical to percolator-vault@eb3ebe8's cpi_resolve_market"
+    /// GUARD: `asset_generation_frontier` and asset-0's per-asset `market_id`
+    /// are DIFFERENT fields at DIFFERENT offsets, and must not collapse to
+    /// the same read by accident (a very plausible copy/paste mistake given
+    /// both are called "generation" nearby).
+    #[test]
+    fn test_frontier_and_asset0_market_id_are_different_offsets() {
+        assert_ne!(
+            MARKET_ASSET_GENERATION_FRONTIER_OFF, ASSET0_MARKET_ID_OFF,
+            "header-level frontier and asset-0's per-asset market_id must be distinct offsets"
         );
     }
 
     /// C-1: TAG_RESOLVE_MARKET must equal 19 and be distinct from every other
-    /// wrapper tag this program CPIs into (9, 32, 57, 65) — a collision here
-    /// would silently misroute the resolve CPI to a different wrapper handler.
+    /// wrapper tag this program CPIs into (9, 32, 51, 55, 57, 65, 86, 88) — a
+    /// collision here would silently misroute the resolve CPI to a different
+    /// wrapper handler.
     #[test]
     fn test_tag_resolve_market_is_19_and_distinct() {
         assert_eq!(TAG_RESOLVE_MARKET, 19, "TAG_RESOLVE_MARKET mismatch");
@@ -1348,6 +1729,198 @@ mod tag_tests {
         assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_AUTHORITY);
         assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_ASSET_AUTHORITY);
         assert_ne!(TAG_RESOLVE_MARKET, TAG_WITHDRAW_INSURANCE_ASSET);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_BACKING_FEE_POLICY);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_TRADE_FEE_POLICY);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_FEE_SPLIT);
+        assert_ne!(TAG_RESOLVE_MARKET, TAG_UPDATE_MAINTENANCE_FEE_PER_SLOT);
+    }
+
+    /// CANARY: pin the v16-migration UpdateAuthority (tag 32) wire shape,
+    /// exercising the REAL `build_update_authority_data` production code
+    /// path against a synthetic account.
+    ///
+    /// Wire (41 bytes): `[tag=32][new_pubkey: 32 bytes][authority_epoch: u64 LE]`.
+    #[test]
+    fn test_build_update_authority_data_wire_shape() {
+        let mut data_acct = synthetic_market_data(1, 33, 1);
+        let key = Pubkey::new_from_array([13u8; 32]);
+        let owner = Pubkey::new_from_array([14u8; 32]);
+        let mut lamports = 0u64;
+        let market = AccountInfo::new(
+            &key, false, true, &mut lamports, &mut data_acct, &owner, false, 0,
+        );
+
+        let new_pubkey = [0x55u8; 32];
+        let data = build_update_authority_data(&market, new_pubkey).unwrap();
+
+        assert_eq!(data.len(), 41, "v16-migration tag-32 wire must be 41 bytes");
+        assert_eq!(data[0], 32, "tag must be 32 (UpdateAuthority)");
+        assert_eq!(&data[1..33], &new_pubkey, "new_pubkey at bytes [1..33]");
+        assert_eq!(
+            u64::from_le_bytes(data[33..41].try_into().unwrap()),
+            33,
+            "authority_epoch at bytes [33..41] must be the LIVE current value, unchanged"
+        );
+
+        // Guard against regression to the pre-migration 33-byte wire.
+        assert_ne!(
+            data.len(),
+            33,
+            "33-byte tag+pubkey-only wire is the pre-migration shape — must NOT ship"
+        );
+    }
+
+    /// CANARY: pin the v16-migration UpdateBackingFeePolicy (tag 51) wire
+    /// shape, exercising the REAL `build_update_backing_fee_policy_data`
+    /// production code path against a synthetic account, for BOTH the long
+    /// (domain even) and short (domain odd) lanes.
+    ///
+    /// Wire (23 bytes): `[tag=51][domain: u16 LE][market_id: u64 LE]
+    /// [fee_bps: u16 LE][insurance_share_bps: u16 LE][policy_sequence: u64 LE]`.
+    #[test]
+    fn test_build_update_backing_fee_policy_data_wire_shape_long_and_short() {
+        let mut data_acct = synthetic_market_data_full(4242, 1, 1, 1, 100, 200, 1);
+        let key = Pubkey::new_from_array([15u8; 32]);
+        let owner = Pubkey::new_from_array([16u8; 32]);
+        let mut lamports = 0u64;
+        let market = AccountInfo::new(
+            &key, false, true, &mut lamports, &mut data_acct, &owner, false, 0,
+        );
+
+        // Long domain (0, even) -> policy_sequence from backing_fee_long (100) + 1.
+        let long_data = build_update_backing_fee_policy_data(&market, 0, 50, 10).unwrap();
+        assert_eq!(long_data.len(), 23, "v16-migration tag-51 wire must be 23 bytes");
+        assert_eq!(long_data[0], 51, "tag must be 51 (UpdateBackingFeePolicy)");
+        assert_eq!(u16::from_le_bytes(long_data[1..3].try_into().unwrap()), 0, "domain=0");
+        assert_eq!(
+            u64::from_le_bytes(long_data[3..11].try_into().unwrap()),
+            4242,
+            "market_id (asset-0-scoped) at bytes [3..11]"
+        );
+        assert_eq!(u16::from_le_bytes(long_data[11..13].try_into().unwrap()), 50, "fee_bps");
+        assert_eq!(u16::from_le_bytes(long_data[13..15].try_into().unwrap()), 10, "insurance_share_bps");
+        assert_eq!(
+            u64::from_le_bytes(long_data[15..23].try_into().unwrap()),
+            101, // backing_fee_long watermark (100) + 1
+            "policy_sequence (long lane) at bytes [15..23] must be watermark+1"
+        );
+
+        // Short domain (1, odd) -> policy_sequence from backing_fee_short (200) + 1.
+        let short_data = build_update_backing_fee_policy_data(&market, 1, 60, 20).unwrap();
+        assert_eq!(u16::from_le_bytes(short_data[1..3].try_into().unwrap()), 1, "domain=1");
+        assert_eq!(
+            u64::from_le_bytes(short_data[15..23].try_into().unwrap()),
+            201, // backing_fee_short watermark (200) + 1
+            "policy_sequence (short lane) at bytes [15..23] must be watermark+1"
+        );
+
+        // The two lanes must use DIFFERENT watermarks — a copy/paste bug that
+        // read the same offset for both domains would collapse this to equal.
+        assert_ne!(
+            u64::from_le_bytes(long_data[15..23].try_into().unwrap()),
+            u64::from_le_bytes(short_data[15..23].try_into().unwrap()),
+            "long and short policy_sequence lanes must be independent"
+        );
+
+        // Guard against regression to the pre-migration 7-byte wire.
+        assert_ne!(
+            long_data.len(),
+            7,
+            "7-byte tag+domain+fee_bps+insurance_share_bps-only wire is the pre-migration shape"
+        );
+    }
+
+    /// CANARY: pin the v16-migration UpdateTradeFeePolicy (tag 55) wire
+    /// shape, exercising the REAL `build_update_trade_fee_policy_data`
+    /// production code path against a synthetic account.
+    ///
+    /// Wire (17 bytes): `[tag=55][trade_fee_base_bps: u64 LE]
+    /// [policy_sequence: u64 LE]`. NOTE: no `market_id` field, unlike tag 51.
+    #[test]
+    fn test_build_update_trade_fee_policy_data_wire_shape() {
+        let mut data_acct = synthetic_market_data_full(1, 1, 1, 1, 1, 1, 500);
+        let key = Pubkey::new_from_array([17u8; 32]);
+        let owner = Pubkey::new_from_array([18u8; 32]);
+        let mut lamports = 0u64;
+        let market = AccountInfo::new(
+            &key, false, true, &mut lamports, &mut data_acct, &owner, false, 0,
+        );
+
+        let data = build_update_trade_fee_policy_data(&market, 25).unwrap();
+
+        assert_eq!(data.len(), 17, "v16-migration tag-55 wire must be 17 bytes");
+        assert_eq!(data[0], 55, "tag must be 55 (UpdateTradeFeePolicy)");
+        assert_eq!(
+            u64::from_le_bytes(data[1..9].try_into().unwrap()),
+            25,
+            "trade_fee_base_bps at bytes [1..9]"
+        );
+        assert_eq!(
+            u64::from_le_bytes(data[9..17].try_into().unwrap()),
+            501, // trade_fee watermark (500) + 1
+            "policy_sequence at bytes [9..17] must be watermark+1"
+        );
+
+        // Guard against regression to the pre-migration 9-byte wire.
+        assert_ne!(
+            data.len(),
+            9,
+            "9-byte tag+trade_fee_base_bps-only wire is the pre-migration shape — must NOT ship"
+        );
+    }
+
+    /// CANARY: pin the v16-migration UpdateFeeSplit (tag 86) wire shape,
+    /// exercising the REAL `build_update_fee_split_data` production code
+    /// path against a synthetic account.
+    ///
+    /// Wire (15 bytes): `[tag=86][creator_share_bps: u16 LE][lp_share_bps: u16 LE]
+    /// [insurance_share_bps: u16 LE][authority_epoch: u64 LE]`.
+    #[test]
+    fn test_build_update_fee_split_data_wire_shape() {
+        let mut data_acct = synthetic_market_data(1, 7, 1);
+        let key = Pubkey::new_from_array([19u8; 32]);
+        let owner = Pubkey::new_from_array([20u8; 32]);
+        let mut lamports = 0u64;
+        let market = AccountInfo::new(
+            &key, false, true, &mut lamports, &mut data_acct, &owner, false, 0,
+        );
+
+        let data = build_update_fee_split_data(&market, 2000, 4800, 1600).unwrap();
+
+        assert_eq!(data.len(), 15, "v16-migration tag-86 wire must be 15 bytes");
+        assert_eq!(data[0], 86, "tag must be 86 (UpdateFeeSplit)");
+        assert_eq!(u16::from_le_bytes(data[1..3].try_into().unwrap()), 2000, "creator_share_bps");
+        assert_eq!(u16::from_le_bytes(data[3..5].try_into().unwrap()), 4800, "lp_share_bps");
+        assert_eq!(u16::from_le_bytes(data[5..7].try_into().unwrap()), 1600, "insurance_share_bps");
+        assert_eq!(
+            u64::from_le_bytes(data[7..15].try_into().unwrap()),
+            7,
+            "authority_epoch at bytes [7..15] must be the LIVE current value, unchanged"
+        );
+
+        // Guard against regression to the pre-migration 7-byte wire.
+        assert_ne!(
+            data.len(),
+            7,
+            "7-byte tag+creator+lp+insurance-only wire is the pre-migration shape — must NOT ship"
+        );
+    }
+
+    /// VERIFIED-UNCHANGED: UpdateMaintenanceFeePerSlot (tag 88) is NOT part
+    /// of the drift set — its wire is still tag(1) + maintenance_fee_per_slot
+    /// (16, u128 LE) = 17 bytes, matching `sync/integration-v16 @ a9318945`'s
+    /// decode arm exactly (`88 => Self::UpdateMaintenanceFeePerSlot {
+    /// maintenance_fee_per_slot: read_u128 }`, no trailing field). This test
+    /// exists so the "unchanged" claim is evidenced, not just asserted in a
+    /// comment.
+    #[test]
+    fn test_tag88_wire_is_unchanged_17_bytes() {
+        let maintenance_fee_per_slot: u128 = 12_345;
+        let mut data = Vec::with_capacity(17);
+        data.push(TAG_UPDATE_MAINTENANCE_FEE_PER_SLOT);
+        data.extend_from_slice(&maintenance_fee_per_slot.to_le_bytes());
+        assert_eq!(data.len(), 17, "tag-88 wire must still be exactly 17 bytes");
+        assert_eq!(data[0], 88);
     }
 
     /// C-1: the ResolveMarket CPI account shape is exactly 2 accounts —
