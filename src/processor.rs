@@ -867,14 +867,35 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // reconciliation against the bound market's real insurance balance (deferred — tight
     // coupling, needs LiteSVM verification vs a live market). v17 ships Accept-&-document.
     if pool.tranche_enabled() {
-        let net_loss = pool.total_flushed.saturating_sub(pool.total_returned);
-        if net_loss > pool.junior_balance() {
+        // A-H3: gate on how much a recovery could ADD to `senior_balance()`, not on
+        // whether senior is currently depressed.
+        //
+        // #159 gated on `net_loss > junior_balance()`. That measured the right thing
+        // only while `total_returned` moved solely with wrapper tokens. `ReturnInsurance`
+        // (tag 10) credits it from the admin's own wallet, so `net_loss` can read 0 while
+        // `wrapper_recoverable()` is still the whole flush and the permissionless tag 23
+        // is still armed — and because `effective_junior_balance()` saturates at raw
+        // `junior_balance()` once `net_loss` is 0, that recovery lands entirely on senior.
+        //
+        // Reusing the non-tranche arm's `wrapper_recoverable() > 0` would over-block: on a
+        // junior-absorbed loss a recovery raises `effective_junior_balance()` by what it
+        // raises `total_pool_value()`, leaving `senior_balance()` invariant and nothing to
+        // snipe. `senior_recovery_exposure()` (state.rs) is zero in exactly that region.
+        //
+        // Strict superset of #159: `wrapper_recoverable() >= net_loss` always, so
+        // `net_loss > junior_balance()` implies `exposure > 0`. Replacing the predicate
+        // can only add blocking.
+        //
+        // #162 is unchanged in kind — same permissionless lift, same reopen condition as
+        // the H-1 resolve gate.
+        let exposure = pool.senior_recovery_exposure();
+        if exposure > 0 {
             msg!(
-                "DepositSenior paused: insurance loss spilled past junior (net_loss {} > junior_balance {}); flushed {} > returned {}",
-                net_loss,
+                "DepositSenior paused: a recovery could raise senior_balance() by {} (recoverable {}, net_loss {}, junior_balance {}) — call RecoverFlushedInsurance first",
+                exposure,
+                pool.wrapper_recoverable(),
+                pool.total_flushed.saturating_sub(pool.total_returned),
                 pool.junior_balance(),
-                pool.total_flushed,
-                pool.total_returned
             );
             return Err(StakeError::InsuranceLossOutstanding.into());
         }
@@ -901,11 +922,6 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         // the condition that already gates H-1 resolution. It stays shut only when the
         // flush genuinely cannot be pulled back, where minting would misprice in one
         // direction or the other regardless.
-        //
-        // Scoped to the `else` arm: on a junior-absorbed loss a recovery raises
-        // `effective_junior_balance()` by what it raises `total_pool_value()`, leaving
-        // `senior_balance()` unchanged, so the #159 gate above is correctly scoped and
-        // widening this one would cost senior liveness for no security gain.
         msg!(
             "Deposit paused: {} of flushed insurance is still recoverable — call RecoverFlushedInsurance first",
             pool.wrapper_recoverable(),
