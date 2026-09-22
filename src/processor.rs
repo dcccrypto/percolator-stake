@@ -508,9 +508,14 @@ fn process_init_pool(
     {
         const PERCOLATOR_MAINNET: Pubkey =
             solana_program::pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
+        // v18 coordinated fresh-ID redeploy (2026-09-22): the devnet wrapper moved to a
+        // brand-new program address (GnwdeQr…) so no pre-existing v17 account survives under
+        // it. This allowlist must trust that fresh id; the prior devnet wrapper (DhSkE7u…, v17)
+        // is abandoned, not trusted. Mirrors percolator-nft cpi_v16.rs PERCOLATOR_DEVNET and the
+        // wrapper's compiled-in devnet pin — all three move together.
         #[cfg(feature = "devnet")]
         const PERCOLATOR_DEVNET: Pubkey =
-            solana_program::pubkey!("DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj");
+            solana_program::pubkey!("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ");
         let is_valid = *percolator_program.key == PERCOLATOR_MAINNET;
         #[cfg(feature = "devnet")]
         let is_valid = is_valid || *percolator_program.key == PERCOLATOR_DEVNET;
