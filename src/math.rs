@@ -14,7 +14,7 @@
 /// comment previously said "mode-1 pools only", which is stale and understated
 /// the reach, because `InitPool` hardcodes mode 0 and the processor notes that
 /// "every real client calls InitPool (mode 0)"),
-/// can book that donation as "fees" and inflate the tracked share price
+/// could book that donation as "fees" and inflate the tracked share price
 /// arbitrarily cheaply (the donation stays 100% attacker-owned the whole
 /// time — a later victim `Deposit` then rounds `calc_lp_for_deposit` down to
 /// 0 and reverts with `ZeroSharesMinted`, DoSing every deposit below the
@@ -22,6 +22,13 @@
 /// denominator of the pro-rata ratio makes every donation-then-accrue round
 /// cost the attacker a small, permanent, unrecoverable dilution against the
 /// virtual (unowned) share — the classic single-asset-vault countermeasure.
+///
+/// #290 UPDATE: for mode-0 pools the donation half of this vector is now closed at
+/// the source. `AccrueFees` and the pre-accrue guard book surplus only up to the
+/// wrapper's not-yet-booked tag-87 payouts (`processor.rs::accrue_fees_inner`), so
+/// a raw donation no longer moves a mode-0 share price at all. The offset and the
+/// MINIMUM_LIQUIDITY lock remain the defense for mode-1 pools, and remain
+/// defense-in-depth for mode 0.
 /// Kept at the minimal canonical value of 1 (not scaled to token decimals):
 /// larger offsets would materially reprice small-magnitude test/production
 /// pools (see math.rs unit tests), and the primary defense against the
@@ -450,9 +457,93 @@ pub fn hwm_withdrawal_allowed(
 // StakePool::total_pool_value() (i128-widened, total_returned- and
 // realized_junior_loss-aware) — see process_flush_to_insurance / #202.
 
+/// #290 — mode-0 fee attribution (pure; used by `processor::accrue_fees_inner`).
+///
+/// Inputs: the vault `surplus` over `total_pool_value()`, the wrapper's cumulative
+/// tag-87 payout counter `wrapper_paid`, and the pool's attribution `cursor` plus
+/// its `armed` flag. Returns `(cursor', attributable)`: the cursor to store
+/// (always armed afterwards) and the amount of surplus that may be booked as fees.
+/// The caller advances `cursor'` by whatever it actually books (at most
+/// `attributable`).
+///
+/// - Armed: `attributable = min(surplus, wrapper_paid - cursor)`, and the cursor is
+///   unchanged. The subtraction saturates, so a counter below the cursor attributes
+///   nothing.
+/// - Un-armed (pool created before #290; the cursor bytes hold a stale snapshot):
+///   the cursor is re-based to `wrapper_paid - min(surplus, wrapper_paid)`. The
+///   first accrual therefore books what the legacy code would have booked, capped
+///   at the wrapper's lifetime payouts.
+///
+/// `None` only if a re-based cursor does not fit in u64. That needs more than
+/// u64::MAX atoms of lifetime payouts, which is unreachable for an SPL token.
+pub fn mode0_attributable_fees(
+    surplus: u64,
+    wrapper_paid: u128,
+    cursor: u64,
+    armed: bool,
+) -> Option<(u64, u64)> {
+    let cursor = if armed {
+        cursor
+    } else {
+        let credit_now = (surplus as u128).min(wrapper_paid);
+        u64::try_from(wrapper_paid - credit_now).ok()?
+    };
+    let unbooked = wrapper_paid.saturating_sub(cursor as u128);
+    // min(surplus, unbooked) <= surplus <= u64::MAX, so the narrowing is lossless.
+    let attributable = (surplus as u128).min(unbooked) as u64;
+    Some((cursor, attributable))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #290 mode-0 fee attribution ──
+
+    #[test]
+    fn test_290_armed_books_only_unbooked_wrapper_payouts() {
+        // Donation only: counter == cursor, so nothing is attributable.
+        assert_eq!(
+            mode0_attributable_fees(100_000_000, 5_000, 5_000, true),
+            Some((5_000, 0))
+        );
+        // Payout of 7_777 on top of a 100M donation: exactly the payout.
+        assert_eq!(
+            mode0_attributable_fees(100_007_777, 12_777, 5_000, true),
+            Some((5_000, 7_777))
+        );
+        // Surplus smaller than unbooked (not all payouts in the vault yet).
+        assert_eq!(mode0_attributable_fees(10, 1_000, 0, true), Some((0, 10)));
+        // Counter below cursor attributes nothing (saturating).
+        assert_eq!(mode0_attributable_fees(10, 5, 9, true), Some((9, 0)));
+    }
+
+    #[test]
+    fn test_290_unarmed_rebases_stale_snapshot() {
+        // Legacy pool: stale snapshot ignored; books min(surplus, paid) once.
+        assert_eq!(
+            mode0_attributable_fees(5_000, 5_000, 987_654_321, false),
+            Some((0, 5_000))
+        );
+        assert_eq!(
+            mode0_attributable_fees(9_000, 5_000, 1, false),
+            Some((0, 5_000))
+        );
+        assert_eq!(
+            mode0_attributable_fees(2_000, 5_000, 1, false),
+            Some((3_000, 2_000))
+        );
+        // Fresh pool before any payout: donation credits nothing.
+        assert_eq!(
+            mode0_attributable_fees(1_000_000, 0, 0, false),
+            Some((0, 0))
+        );
+        // Unreachable u64 overflow of a re-based cursor fails closed.
+        assert_eq!(
+            mode0_attributable_fees(0, u64::MAX as u128 + 1, 0, false),
+            None
+        );
+    }
 
     // ── Basic Behavior ──
 

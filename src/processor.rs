@@ -696,7 +696,7 @@ fn process_init_pool(
     // pre-seed guard (total_lp_supply>0) cannot be bypassed by a stale field.
     pool.total_fees_earned = 0;
     pool.last_fee_accrual_slot = 0;
-    pool.last_vault_snapshot = 0;
+    pool.mode0_fees_attributed = 0;
     pool.pool_mode = 0; // InitTradingPool overrides to 1 after this call
     pool.pending_admin = [0u8; 32];
     pool.set_discriminator();
@@ -730,6 +730,8 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     let token_program = next_account_info(accounts_iter)?;
     let clock_sysvar = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
+    // #290: wrapper market account (pool.slab). Required for a mode-0 pool; see pre_accrue_fee_modes.
+    let fee_slab = accounts_iter.next();
 
     if !user.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -836,7 +838,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // (Rebase note #160: KEEP main's pre_accrue_fee_modes (PR #148 refactor, renamed
     // 2026-07-19) — #160's branch predated it and carried the old inline accrue block,
     // which is dropped here. The senior recovery-snipe gate below is added AFTER it.)
-    pre_accrue_fee_modes(pool, vault)?;
+    pre_accrue_fee_modes(pool, vault, fee_slab, true)?;
 
     // Insurance recovery-snipe gate (SENIOR path) — completes #150 for the senior tranche
     // (see #159). When tranches are on and a flushed loss has spilled PAST junior into
@@ -1140,6 +1142,9 @@ fn process_withdraw(
     let deposit_pda = next_account_info(accounts_iter)?;
     let token_program = next_account_info(accounts_iter)?;
     let clock_sysvar = next_account_info(accounts_iter)?;
+    // #290: OPTIONAL wrapper market account (pool.slab). When present, pending wrapper-paid
+    // fees are accrued before pricing; when absent the accrual is skipped (see pre_accrue_fee_modes).
+    let fee_slab = accounts_iter.next();
 
     if !user.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1293,7 +1298,7 @@ fn process_withdraw(
     // the withdrawer realizes their fair share of earned fees (and the HWM floor sees true
     // TVL) rather than redeeming at the stale pre-accrual price. Reads the vault balance
     // before the vault->user transfer below; pool.vault verified above.
-    pre_accrue_fee_modes(pool, vault)?;
+    pre_accrue_fee_modes(pool, vault, fee_slab, false)?;
 
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
@@ -2534,8 +2539,35 @@ fn apply_minimum_liquidity_lock(
 /// it: deposit/withdraw pricing for mode 0 now crystallizes the surplus
 /// FIRST, exactly as it always has for mode 1. The body's logic below is
 /// UNCHANGED — only the predicate and this function's name differ.
-fn pre_accrue_fee_modes(pool: &mut state::StakePool, vault: &AccountInfo) -> ProgramResult {
+///
+/// #290: a mode-0 pool books only surplus the wrapper can account for (see
+/// `accrue_fees_inner`), which needs the pool's wrapper market account (`slab`).
+/// `require_slab` is true on the paths that MINT LP (Deposit, DepositJunior): minting
+/// at a price that has not yet absorbed pending wrapper-paid fees is exactly the #136
+/// JIT capture, so those paths refuse to run without it. Withdraw passes false and
+/// skips the accrual when the slab is absent. Redeeming at the not-yet-accrued price
+/// can only under-pay the withdrawer, never over-pay them, so it is not an attack.
+fn pre_accrue_fee_modes(
+    pool: &mut state::StakePool,
+    vault: &AccountInfo,
+    slab: Option<&AccountInfo>,
+    require_slab: bool,
+) -> ProgramResult {
     if pool.pool_mode <= 1 {
+        let wrapper_paid = if pool.pool_mode == 0 {
+            match slab {
+                Some(slab_ai) => Some(wrapper_fee_payouts(pool, slab_ai)?),
+                None if require_slab => {
+                    msg!(
+                        "#290: mode-0 pool requires the wrapper market (slab) account to price LP"
+                    );
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                }
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
         if *vault.owner != crate::spl_token::id() {
             return Err(ProgramError::IllegalOwner);
         }
@@ -2550,7 +2582,7 @@ fn pre_accrue_fee_modes(pool: &mut state::StakePool, vault: &AccountInfo) -> Pro
             }
             acct.amount
         };
-        accrue_fees_inner(pool, current_balance)?;
+        accrue_fees_inner(pool, current_balance, wrapper_paid)?;
     }
     Ok(())
 }
@@ -2564,17 +2596,77 @@ fn pre_accrue_fee_modes(pool: &mut state::StakePool, vault: &AccountInfo) -> Pro
 /// would be mis-credited as fees. The caller must have already confirmed the vault key +
 /// SPL-Token ownership. Mutates only `pool`. No-op when there is no surplus or no LP
 /// holders, preserving the first-depositor bootstrap / anti-brick guard.
-fn accrue_fees_inner(pool: &mut state::StakePool, current_balance: u64) -> ProgramResult {
-    // total_pool_value() = deposited - withdrawn - flushed + returned + fees_earned (mode 1)
-    // — the authoritative expected balance; any excess is un-accrued fee revenue.
+///
+/// #290 — FEE ATTRIBUTION (mode 0). `wrapper_paid` is the wrapper market's cumulative
+/// tag-87 payout counter (`insurance_reserve_withdrawn_atoms`, see
+/// `state::read_wrapper_insurance_reserve_withdrawn`), required for mode 0 and ignored
+/// for mode 1. A mode-0 pool books
+///
+///   fee_delta = min(vault surplus, wrapper_paid - mode0_fees_attributed)
+///
+/// and advances `mode0_fees_attributed` by the same amount. Before this, ANY surplus
+/// was booked, so a dominant LP could donate X straight into the vault, crank the
+/// permissionless AccrueFees, and inflate the share price at a cost of only
+/// `(MINIMUM_LIQUIDITY + 1) x price`, independent of pool size: a deposit DoS
+/// (`ZeroSharesMinted`), rounding-dust capture, and a corrupted fee ledger on the
+/// insurance backstop. A donation advances no wrapper counter, so it is now
+/// never booked: it stays in the vault as unpriced surplus. Only the donor loses it,
+/// and it cannot move the share price.
+///
+/// Migration: pools created before #290 carry a stale vault snapshot in the cursor
+/// bytes and an unset `fee_attribution_armed` flag. The first attributed accrual arms
+/// the cursor at `wrapper_paid - min(surplus, wrapper_paid)`. That accrual therefore
+/// books what the legacy code would have booked, capped at the wrapper's lifetime
+/// payouts, and every later accrual is strictly attributed. For a pool created after
+/// this change, `wrapper_paid` is 0 until the first real tag-87 payout (tag 87 needs a
+/// bound, initialized pool), so arming it credits nothing.
+///
+/// Mode-1 (trading) pools are not paid by tag 87. Their accrual is unchanged: any
+/// surplus is booked, as accepted in #274.
+fn accrue_fees_inner(
+    pool: &mut state::StakePool,
+    current_balance: u64,
+    wrapper_paid: Option<u128>,
+) -> ProgramResult {
+    // total_pool_value() = deposited - withdrawn - flushed + returned + fees_earned
+    // — the authoritative expected balance; any excess is un-accrued vault surplus.
     let pool_value = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+    let surplus = current_balance.saturating_sub(pool_value);
+
+    let fee_delta = if pool.pool_mode == 0 {
+        let paid = wrapper_paid.ok_or(StakeError::InvalidAccount)?;
+        let (cursor, attributable) = crate::math::mode0_attributable_fees(
+            surplus,
+            paid,
+            pool.mode0_fees_attributed,
+            pool.fee_attribution_armed(),
+        )
+        .ok_or(StakeError::Overflow)?;
+        pool.mode0_fees_attributed = cursor;
+        pool.set_fee_attribution_armed(true);
+        if surplus > attributable {
+            msg!(
+                "AccrueFees: {} of vault surplus is not attributable to wrapper fee payouts; not booked (#290)",
+                surplus - attributable
+            );
+        }
+        attributable
+    } else {
+        surplus
+    };
 
     // Only accrue when there are active LP holders. Accruing at total_lp_supply == 0
     // would set total_fees_earned > 0 at zero supply, tripping calc_lp_for_deposit's
     // orphaned-value guard and permanently bricking the first deposit (an attacker can
-    // donate 1 token to the vault pre-first-deposit to trigger it).
-    if current_balance > pool_value && pool.total_lp_supply > 0 {
-        let fee_delta = current_balance - pool_value;
+    // donate 1 token to the vault pre-first-deposit to trigger it). For mode 0 the
+    // cursor is NOT advanced either, so the payout stays bookable once LPs exist.
+    if fee_delta > 0 && pool.total_lp_supply > 0 {
+        if pool.pool_mode == 0 {
+            pool.mode0_fees_attributed = pool
+                .mode0_fees_attributed
+                .checked_add(fee_delta)
+                .ok_or(StakeError::Overflow)?;
+        }
 
         // Snapshot pre-fee tranche balances BEFORE incrementing total_fees_earned.
         // senior_balance() derives from total_pool_value() which includes
@@ -2627,17 +2719,40 @@ fn accrue_fees_inner(pool: &mut state::StakePool, current_balance: u64) -> Progr
     Ok(())
 }
 
+/// #290: validate `slab_ai` as THIS pool's wrapper market and read its cumulative
+/// tag-87 payout counter. The key must equal `pool.slab` and the owner must equal
+/// `pool.percolator_program`, so a caller cannot substitute a forged counter.
+fn wrapper_fee_payouts(
+    pool: &state::StakePool,
+    slab_ai: &AccountInfo,
+) -> Result<u128, ProgramError> {
+    if slab_ai.key.to_bytes() != pool.slab {
+        msg!("#290: slab account does not match pool.slab");
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if slab_ai.owner.to_bytes() != pool.percolator_program {
+        msg!("#290: slab account is not owned by pool.percolator_program");
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = slab_ai.try_borrow_data()?;
+    state::read_wrapper_insurance_reserve_withdrawn(&data).ok_or_else(|| {
+        msg!("#290: slab is not a live wrapper market account");
+        StakeError::InvalidAccount.into()
+    })
+}
+
 /// Accrue trading fees from the percolator engine to the LP vault.
 /// Permissionless: reads vault token account balance and updates pool state.
 ///
 /// #255: this previously documented a snapshot-delta formula
-/// (`current_vault_balance - last_vault_snapshot - net_deposits_since_last`) that is
-/// NOT what this function implements. The accrual baseline is `total_pool_value()`,
-/// not `last_vault_snapshot`. `last_vault_snapshot` is still WRITTEN below, but no
-/// accounting path reads it; it is retained only because removing it would change
-/// `STAKE_POOL_LEN` and break the v4/408 layout. Treat it as reserved, not as state.
+/// (`current_vault_balance - last_vault_snapshot - net_deposits_since_last`) that was
+/// never implemented. The accrual baseline is `total_pool_value()`.
 ///
-/// Actual behaviour: fee revenue is whatever the vault holds above `total_pool_value()`.
+/// Behaviour: a mode-1 pool books whatever the vault holds above `total_pool_value()`.
+/// A mode-0 pool (#290) books that surplus only up to the wrapper's not-yet-booked
+/// tag-87 payouts, read from the slab passed at account index 4. The offset-272 bytes
+/// that held the dead `last_vault_snapshot` are now that attribution cursor
+/// (`mode0_fees_attributed`), so this instruction no longer writes a vault snapshot.
 fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
@@ -2648,6 +2763,8 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     let pool_ai = next_account_info(accounts_iter)?;
     let vault_ai = next_account_info(accounts_iter)?;
     let clock_ai = next_account_info(accounts_iter)?;
+    // #290: wrapper market account (pool.slab) — required for mode 0, ignored for mode 1.
+    let slab_ai = accounts_iter.next();
 
     // BUG-3: Validate pool account ownership and non-emptiness before reading it.
     // Without these guards, an attacker can pass an arbitrary account as pool_ai;
@@ -2737,10 +2854,19 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     // #136: fold any un-accrued vault surplus into share price via the shared helper,
     // so this permissionless instruction and the deposit/withdraw pre-accrue guard apply
     // byte-identical accounting (snapshot-before-increment + tranche distribution).
-    accrue_fees_inner(pool, current_balance)?;
+    // #290: mode 0 books only wrapper-attributable surplus, so it needs the slab.
+    let wrapper_paid = if pool.pool_mode == 0 {
+        let slab_ai = slab_ai.ok_or_else(|| {
+            msg!("AccrueFees: mode-0 pool requires the wrapper market (slab) account");
+            ProgramError::NotEnoughAccountKeys
+        })?;
+        Some(wrapper_fee_payouts(pool, slab_ai)?)
+    } else {
+        None
+    };
+    accrue_fees_inner(pool, current_balance, wrapper_paid)?;
 
     pool.last_fee_accrual_slot = clock.slot;
-    pool.last_vault_snapshot = current_balance;
 
     Ok(())
 }
@@ -2928,6 +3054,8 @@ fn process_deposit_junior(
     let token_program = next_account_info(accounts_iter)?;
     let clock_sysvar = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
+    // #290: wrapper market account (pool.slab). Required for a mode-0 pool; see pre_accrue_fee_modes.
+    let fee_slab = accounts_iter.next();
 
     if !user.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3028,7 +3156,7 @@ fn process_deposit_junior(
     // (Rebase note #150: this pre_accrue_fee_modes call (renamed 2026-07-19) is from
     // PR #148 — KEEP it. The InsuranceLossOutstanding gate below is added AFTER it, not in
     // place of it, so #148's JIT fee-snipe guard stays intact.)
-    pre_accrue_fee_modes(pool, vault)?;
+    pre_accrue_fee_modes(pool, vault, fee_slab, true)?;
 
     // Pause junior deposits while an insurance loss is OUTSTANDING (flushed but not
     // yet returned). effective_junior_balance() applies the pool's CURRENT net_loss

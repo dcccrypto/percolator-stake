@@ -346,6 +346,7 @@ fn deposit_ix(
     vault_auth: Pubkey,
     deposit_pda: Pubkey,
     amount: u64,
+    slab: Pubkey,
 ) -> Instruction {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let mut data = vec![1u8]; // tag = Deposit
@@ -364,6 +365,7 @@ fn deposit_ix(
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
             AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(slab, false), // 11. wrapper market (#290)
         ],
         data,
     }
@@ -376,6 +378,7 @@ fn accrue_fees_ix(
     caller: &Pubkey,
     pool_pda: Pubkey,
     vault: Pubkey,
+    slab: Pubkey,
 ) -> Instruction {
     Instruction {
         program_id: stake_id,
@@ -384,9 +387,23 @@ fn accrue_fees_ix(
             AccountMeta::new(pool_pda, false),        // 1. pool PDA [writable]
             AccountMeta::new_readonly(vault, false),  // 2. vault [readonly, balance only]
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false), // 3. clock
+            AccountMeta::new_readonly(slab, false),   // 4. wrapper market (#290)
         ],
         data: vec![12u8], // tag = AccrueFees
     }
+}
+
+/// #290: simulate the wrapper's tag-87 `WithdrawInsuranceReserveToStake` bookkeeping
+/// on the REAL wrapper-initialized market account: advance
+/// `insurance_reserve_withdrawn_atoms` (account bytes [560..576), u128 LE) by
+/// `amount`, exactly as the wrapper does at the transfer site. Callers move the
+/// matching tokens into the vault themselves.
+fn advance_wrapper_fee_counter(svm: &mut LiteSVM, market: &Pubkey, amount: u64) {
+    let mut acct = svm.get_account(market).expect("market exists");
+    let off = percolator_stake::state::WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN;
+    let cur = u128::from_le_bytes(acct.data[off..off + 16].try_into().unwrap());
+    acct.data[off..off + 16].copy_from_slice(&(cur + amount as u128).to_le_bytes());
+    svm.set_account(*market, acct).unwrap();
 }
 
 fn read_pool(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
@@ -512,6 +529,7 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
         accts.vault_auth,
         genesis_deposit_pda,
         GENESIS_DEPOSIT,
+        accts.slab,
     );
     send(&mut svm, &payer, &[&genesis_lp], genesis_dep_ix).unwrap_or_else(|e| {
         panic!(
@@ -553,6 +571,9 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
         &accts.vault_auth,
         vault_balance_before_attacker_deposit,
     );
+    // #290: the wrapper books the same payout in its tag-87 counter, which is what
+    // makes this surplus attributable fee revenue rather than a raw donation.
+    advance_wrapper_fee_counter(&mut svm, &accts.slab, SURPLUS);
 
     // ---- Correctness oracle, computed independently via the crate's own
     // public pure-math functions -- never by re-deriving the formula, and
@@ -604,9 +625,15 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
         accts.vault_auth,
         attacker_deposit_pda,
         ATTACKER_DEPOSIT,
+        accts.slab,
     );
-    let attacker_accrue_ix =
-        accrue_fees_ix(stake_id, &attacker.pubkey(), accts.pool_pda, accts.vault);
+    let attacker_accrue_ix = accrue_fees_ix(
+        stake_id,
+        &attacker.pubkey(),
+        accts.pool_pda,
+        accts.vault,
+        accts.slab,
+    );
 
     send_batch(
         &mut svm,
