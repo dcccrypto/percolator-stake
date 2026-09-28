@@ -259,7 +259,11 @@ To make the program immutable (no further upgrades possible):
 solana program set-upgrade-authority <PROGRAM_ID> --final
 ```
 
-The current deployment upgrade authority pubkey and governance process should be documented here by the maintainers.
+**Current state (observed 2026-09-28, devnet only):** the stake program `GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3`
+is upgradeable by `FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7`, a **single EOA** that also upgrades the
+devnet wrapper, nft and match programs. That is tolerated only because devnet holds no real value
+and there is no mainnet deployment. The mainnet requirement above is **not yet met**. The per-program
+table, policy and rotation plan are in [`docs/SECURITY-UPGRADE-AUTHORITY.md`](docs/SECURITY-UPGRADE-AUTHORITY.md).
 
 **Enforcement (#240):** this requirement is gated by
 [`scripts/check-upgrade-authority.sh`](scripts/check-upgrade-authority.sh) — it fails CI
