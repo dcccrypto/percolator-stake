@@ -74,7 +74,8 @@ pub enum StakeInstruction {
     ///
     /// Accounts:
     ///   0. `[signer, writable]` Admin (pays rent, becomes pool admin)
-    ///   1. `[]` Slab account (the percolator market)
+    ///   1. `[writable]` Slab account (the percolator market; written by the
+    ///      marketauth admin-handoff CPI — `process_init_pool` rejects a read-only slab)
     ///   2. `[writable]` Pool PDA (stake_pool, to be created)
     ///   3. `[writable]` LP Mint (to be created, authority = vault_auth PDA)
     ///   4. `[writable]` Vault token account (to be created, authority = vault_auth PDA)
