@@ -267,7 +267,7 @@ jobs:
             // Temporary deployment-transition note.
             #[test]
             fn tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it() {}
-             EOF
+          EOF
 
             if ! fixture_state=$(detect_tag55_state "$comment_fixture"); then
               rm -f "$comment_fixture"
