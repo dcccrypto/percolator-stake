@@ -788,4 +788,42 @@ mod kani_proofs {
         kani::cover!(res == Ok(true));
         kani::cover!(res == Ok(false));
     }
+
+    /// PROOF (#290): mode-0 fee attribution never books a donation. Over ALL
+    /// inputs: the attributable amount never exceeds the vault surplus, and, once
+    /// the caller books it, the cursor never passes the wrapper's payout counter
+    /// (given an armed cursor that had not passed it). So cumulative booked fees
+    /// are bounded by cumulative wrapper payouts. With nothing unbooked, nothing is
+    /// attributable whatever the surplus. That last case is the donation. Covers
+    /// prove the booking, donation-only and legacy-arming branches are all reachable.
+    /// No multiplication, so full-width u64/u128 is tractable.
+    #[kani::proof]
+    fn kani_290_mode0_attribution_bounded_by_wrapper_payouts() {
+        let surplus: u64 = kani::any();
+        let paid: u128 = kani::any();
+        let cursor: u64 = kani::any();
+        let armed: bool = kani::any();
+        if armed {
+            kani::assume(cursor as u128 <= paid);
+        }
+        let r = percolator_stake::math::mode0_attributable_fees(surplus, paid, cursor, armed);
+        let Some((c2, a)) = r else {
+            // Only an un-armed re-base whose cursor exceeds u64 may fail.
+            assert!(!armed && paid > u64::MAX as u128);
+            return;
+        };
+        assert!(a <= surplus);
+        assert!(c2 as u128 + a as u128 <= paid);
+        if armed {
+            assert_eq!(c2, cursor);
+            if cursor as u128 == paid {
+                assert_eq!(a, 0);
+            }
+        } else {
+            assert_eq!(a as u128, core::cmp::min(surplus as u128, paid));
+        }
+        kani::cover!(armed && a > 0);
+        kani::cover!(armed && surplus > 0 && a == 0);
+        kani::cover!(!armed && a > 0);
+    }
 }

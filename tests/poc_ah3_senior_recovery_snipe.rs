@@ -328,6 +328,7 @@ fn deposit_like_ix(
             AccountMeta::new_readonly(c.token_program, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
             AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(c.market, false), // #290: wrapper market
         ],
         data,
     }

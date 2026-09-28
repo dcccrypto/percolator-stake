@@ -1,29 +1,31 @@
-//! Task 11 — mode-0 insurance pools accrue fees.
+//! #290 — mode-0 fee attribution: a raw vault donation must never be booked as fees.
 //!
-//! Before this change, `AccrueFees` (tag 12) was gated to `pool_mode == 1`
-//! (`processor.rs::process_accrue_fees`) and `total_pool_value()` only folded
-//! `total_fees_earned` in for mode 1 (`state.rs::total_pool_value`). Every real
-//! client calls `InitPool`, which hardcodes `pool_mode = 0` — so fee accrual was
-//! reachable in the source but UNREACHABLE by any real pool. Mode-0 stakers had
-//! a downside leg (`FlushToInsurance`) and no upside leg at all.
+//! Before #290, `accrue_fees_inner` booked ANY vault balance above
+//! `total_pool_value()` as fee revenue, and mode-0 pools (every pool `InitPool`
+//! creates) fold `total_fees_earned` into their share price. A dominant LP could
+//! donate X straight into the vault with a plain SPL Transfer and crank the
+//! permissionless `AccrueFees`. That inflated the share price at a cost of only
+//! `(MINIMUM_LIQUIDITY + 1) x price`, whatever the pool size: every deposit below the
+//! price reverted `ZeroSharesMinted`, rounding dust accrued to the attacker, and
+//! `total_fees_earned` on the insurance backstop was corrupted.
 //!
-//! This test loads the REAL stake .so + REAL v17 wrapper .so into one LiteSVM
-//! instance (mirroring `n6_marketauth_rotation_e2e.rs`) and drives the actual
-//! instruction dispatcher for the full lifecycle: InitMarket (wrapper) ->
-//! InitPool (stake, mode 0 by construction, CPIs the wrapper to rotate
-//! marketauth) -> Deposit (real, genesis deposit) -> [inject a vault surplus,
-//! the one explicitly-authorized forgery — see task-11-brief.md step 3] ->
-//! AccrueFees (real). We assert on the REAL post-instruction pool state read
-//! back out of LiteSVM, not on anything we set by hand.
+//! Post-fix, a mode-0 pool books surplus only up to the wrapper's not-yet-booked
+//! tag-87 payouts (`insurance_reserve_withdrawn_atoms`, read from `pool.slab`).
 //!
-//! Because this exercises `target/deploy/percolator_stake.so`, rebuild the SBF
-//! artifact with `cargo build-sbf --no-default-features` after changing source
-//! code; otherwise a stale artifact silently tests old behavior.
+//! REAL binaries: `target/deploy/percolator_stake.so` plus the sibling
+//! `percolator-prog/target/deploy/percolator_prog.so`, under LiteSVM. The donation
+//! is a REAL SPL Token `Transfer`. The two stand-ins for a real tag-87 payout (the
+//! vault balance bump and the wrapper counter bump) are applied TOGETHER, exactly
+//! as the wrapper's handler does. Rebuild the stake .so
+//! (`cargo build-sbf -- --features devnet`) after changing source.
+//!
+//! Negative control: with `src/processor.rs` reverted to the pre-#290 accrual,
+//! `donation_is_not_booked_as_fees_and_does_not_block_deposits` and
+//! `legacy_pool_is_armed_once_then_strictly_attributed` FAIL.
 
 use litesvm::LiteSVM;
 use percolator_stake::state::{
-    derive_deposit_pda, derive_pool_pda, derive_vault_authority, StakePool, MINIMUM_LIQUIDITY,
-    STAKE_POOL_SIZE,
+    derive_deposit_pda, derive_pool_pda, derive_vault_authority, StakePool, STAKE_POOL_SIZE,
 };
 use solana_sdk::{
     account::Account,
@@ -385,44 +387,67 @@ fn read_pool(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
     *bytemuck::from_bytes::<StakePool>(&data[..STAKE_POOL_SIZE])
 }
 
-/// End-to-end: InitPool (mode 0 by construction) -> Deposit (genesis) -> a vault
-/// surplus lands in the vault (the ONLY forged state in this test, per
-/// task-11-brief.md step 3 / the task's explicit permission) -> the REAL,
-/// permissionless AccrueFees instruction. Asserts on real post-instruction state:
-/// `total_fees_earned` grows by EXACTLY the surplus, and `total_pool_value()`
-/// (computed by the crate's own method on the state read back from LiteSVM) grows
-/// by the same amount.
-#[test]
-fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
+fn write_pool(svm: &mut LiteSVM, pool_pda: &Pubkey, pool: &StakePool) {
+    let mut acct = svm.get_account(pool_pda).unwrap();
+    acct.data[..STAKE_POOL_SIZE].copy_from_slice(bytemuck::bytes_of(pool));
+    svm.set_account(*pool_pda, acct).unwrap();
+}
+
+/// A REAL SPL Token `Transfer` (tag 3): the raw-donation primitive. No vault
+/// signature is needed to send tokens INTO a token account.
+fn spl_transfer_ix(source: Pubkey, dest: Pubkey, owner: &Pubkey, amount: u64) -> Instruction {
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+        accounts: vec![
+            AccountMeta::new(source, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new_readonly(*owner, true),
+        ],
+        data,
+    }
+}
+
+/// Which account to pass in the trailing #290 slab slot.
+enum S {
+    Real,
+    Missing,
+    Other(Pubkey),
+}
+
+struct World {
+    svm: LiteSVM,
+    stake_id: Pubkey,
+    wrapper_id: Pubkey,
+    accts: InitPoolAccounts,
+    payer: Keypair,
+    admin: Keypair,
+}
+
+/// Real InitMarket (wrapper) -> real InitPool (stake, mode 0). `None` if the .so
+/// artifacts are missing (the suite's SKIP convention).
+fn world() -> Option<World> {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
         eprintln!(
-            "SKIP mode0_pool_accrues_fees_via_real_accrue_fees_instruction: .so missing \
-             (stake={} wrapper={}) -- run `cargo build-sbf --no-default-features` in \
-             percolator-stake and percolator-prog first",
+            "SKIP mode0_fee_attribution_e2e: .so missing (stake={} wrapper={})",
             so.display(),
             wso.display()
         );
-        return;
+        return None;
     }
-
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     svm.add_program_from_file(stake_id, so).unwrap();
     svm.add_program_from_file(wrapper_id, wso).unwrap();
-
     let admin = Keypair::new();
-    let user = Keypair::new();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
-    svm.airdrop(&user.pubkey(), 20_000_000_000).unwrap();
-
-    // ---- InitPool (real instruction; pool_mode = 0 is InitPool's hardcoded
-    // default -- see processor.rs:672. This is the path EVERY real client uses. ----
     let (_market, accts) = setup(
         &mut svm,
         wrapper_id,
@@ -437,126 +462,307 @@ fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
         &[&admin],
         init_pool_ix(stake_id, &accts, 5, 0),
     )
-    .unwrap_or_else(|e| panic!("InitPool must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
-
-    let pool_before_deposit = read_pool(&svm, &accts.pool_pda);
-    assert_eq!(
-        pool_before_deposit.pool_mode, 0,
-        "InitPool must produce a mode-0 pool"
-    );
-    assert_eq!(
-        pool_before_deposit.total_fees_earned, 0,
-        "genesis pool has no fees yet"
-    );
-
-    // ---- Deposit (real instruction; genesis deposit, so LP = amount - MINIMUM_LIQUIDITY). ----
-    let user_ata = Pubkey::new_unique();
-    set_token_account(
-        &mut svm,
-        user_ata,
-        &accts.collateral_mint,
-        &user.pubkey(),
-        10_000,
-    );
-    let user_lp_ata = Pubkey::new_unique();
-    set_token_account(&mut svm, user_lp_ata, &accts.lp_mint, &user.pubkey(), 0);
-    let (deposit_pda, _) = derive_deposit_pda(&stake_id, &accts.pool_pda, &user.pubkey());
-
-    let deposit_amount: u64 = 2_000;
-    assert!(
-        deposit_amount > MINIMUM_LIQUIDITY,
-        "must clear the N7 dead-share floor"
-    );
-    let dep_ix = deposit_ix(
+    .unwrap_or_else(|e| panic!("InitPool.\nLogs:\n{}", e.meta.logs.join("\n")));
+    assert_eq!(read_pool(&svm, &accts.pool_pda).pool_mode, 0);
+    Some(World {
+        svm,
         stake_id,
-        &user.pubkey(),
-        accts.pool_pda,
-        user_ata,
-        accts.vault,
-        accts.lp_mint,
-        user_lp_ata,
-        accts.vault_auth,
+        wrapper_id,
+        accts,
+        payer,
+        admin,
+    })
+}
+
+struct User {
+    kp: Keypair,
+    ata: Pubkey,
+    lp_ata: Pubkey,
+}
+
+fn user(w: &mut World, balance: u64) -> User {
+    let kp = Keypair::new();
+    w.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+    let ata = Pubkey::new_unique();
+    let lp_ata = Pubkey::new_unique();
+    set_token_account(
+        &mut w.svm,
+        ata,
+        &w.accts.collateral_mint,
+        &kp.pubkey(),
+        balance,
+    );
+    set_token_account(&mut w.svm, lp_ata, &w.accts.lp_mint, &kp.pubkey(), 0);
+    User { kp, ata, lp_ata }
+}
+
+fn deposit(
+    w: &mut World,
+    u: &User,
+    amount: u64,
+    slab: S,
+) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let (deposit_pda, _) = derive_deposit_pda(&w.stake_id, &w.accts.pool_pda, &u.kp.pubkey());
+    let mut ix = deposit_ix(
+        w.stake_id,
+        &u.kp.pubkey(),
+        w.accts.pool_pda,
+        u.ata,
+        w.accts.vault,
+        w.accts.lp_mint,
+        u.lp_ata,
+        w.accts.vault_auth,
         deposit_pda,
-        deposit_amount,
-        accts.slab,
+        amount,
+        w.accts.slab,
     );
-    send(&mut svm, &payer, &[&user], dep_ix)
-        .unwrap_or_else(|e| panic!("Deposit must succeed.\nLogs:\n{}", e.meta.logs.join("\n")));
+    match slab {
+        S::Real => {}
+        S::Other(k) => ix.accounts.last_mut().unwrap().pubkey = k,
+        S::Missing => {
+            ix.accounts.pop();
+        }
+    }
+    let payer = w.payer.insecure_clone();
+    send(&mut w.svm, &payer, &[&u.kp], ix)
+}
 
-    let pool_before_accrue = read_pool(&svm, &accts.pool_pda);
-    assert_eq!(
-        pool_before_accrue.pool_mode, 0,
-        "pool_mode is immutable after InitPool"
-    );
-    assert_eq!(
-        token_amount(&svm, &accts.vault),
-        deposit_amount,
-        "vault must hold exactly the real deposit before any surplus is added"
-    );
-    let pool_value_before = pool_before_accrue
-        .total_pool_value()
-        .expect("pool value must be computable pre-accrual");
-    assert_eq!(
-        pool_value_before, deposit_amount,
-        "pre-accrual: tpv == the real deposit, no fees yet"
-    );
-
-    // ---- The ONE authorized forgery (task-11-brief.md step 3 / task instructions'
-    // "Explicit permission" section): set the vault's token balance directly to
-    // simulate the wrapper pushing the insurance leg of the trade-fee split into
-    // this mode-0 pool's vault. Everything else in this test is real instruction
-    // execution; nothing about pool state, deposits, or total_fees_earned is forged. ----
-    let surplus: u64 = 4_242;
-    set_token_account(
-        &mut svm,
-        accts.vault,
-        &accts.collateral_mint,
-        &accts.vault_auth,
-        deposit_amount + surplus,
-    );
-    // #290: the wrapper books the same payout in its tag-87 counter, which is what
-    // makes this surplus attributable fee revenue rather than a raw donation.
-    advance_wrapper_fee_counter(&mut svm, &accts.slab, surplus);
-
-    // ---- AccrueFees (real, permissionless instruction; caller is an unrelated
-    // third party to prove permissionlessness). Pre-fix this reverted with
-    // InvalidPoolMode for a mode-0 pool; post-fix it must succeed. ----
-    let cranker = Keypair::new();
-    svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
-    let acc_ix = accrue_fees_ix(
-        stake_id,
+fn accrue(w: &mut World, slab: S) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let cranker = Keypair::new(); // unrelated third party: AccrueFees is permissionless
+    w.svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let mut ix = accrue_fees_ix(
+        w.stake_id,
         &cranker.pubkey(),
-        accts.pool_pda,
-        accts.vault,
-        accts.slab,
+        w.accts.pool_pda,
+        w.accts.vault,
+        w.accts.slab,
     );
-    send(&mut svm, &payer, &[&cranker], acc_ix).unwrap_or_else(|e| {
-        panic!(
-            "AccrueFees must succeed on a mode-0 pool after Task 11's mode-gate relax.\nLogs:\n{}",
-            e.meta.logs.join("\n")
-        )
-    });
+    match slab {
+        S::Real => {}
+        S::Other(k) => ix.accounts.last_mut().unwrap().pubkey = k,
+        S::Missing => {
+            ix.accounts.pop();
+        }
+    }
+    let payer = w.payer.insecure_clone();
+    send(&mut w.svm, &payer, &[&cranker], ix)
+}
 
-    // ---- Assertions on the REAL post-instruction state. ----
-    let pool_after = read_pool(&svm, &accts.pool_pda);
+/// Stand-in for one real tag-87 payout: tokens land in the vault AND the wrapper's
+/// counter advances by the same amount, as `handle_withdraw_insurance_reserve_to_stake`
+/// does in one instruction.
+fn wrapper_pays_fees(w: &mut World, amount: u64) {
+    let bal = token_amount(&w.svm, &w.accts.vault);
+    set_token_account(
+        &mut w.svm,
+        w.accts.vault,
+        &w.accts.collateral_mint,
+        &w.accts.vault_auth,
+        bal + amount,
+    );
+    let slab = w.accts.slab;
+    advance_wrapper_fee_counter(&mut w.svm, &slab, amount);
+}
+
+fn logs(e: &litesvm::types::FailedTransactionMetadata) -> String {
+    format!("{:?}\n{}", e.err, e.meta.logs.join("\n"))
+}
+
+/// Layout canary: the offset this program reads (`[560..576)`) must be the
+/// wrapper's `insurance_reserve_withdrawn_atoms` in the REAL wrapper binary. The
+/// neighbouring fee-share defaults InitMarket writes (creator/lp/insurance =
+/// 1600/4800/1600 bps at `[576..582)`) pin the end of the four u128 counters, and
+/// a fresh market's counter must read 0.
+#[test]
+fn wrapper_counter_offset_matches_real_wrapper_layout() {
+    let Some(w) = world() else { return };
+    let data = w.svm.get_account(&w.accts.slab).unwrap().data;
+    let u16_at = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
     assert_eq!(
-        pool_after.pool_mode, 0,
-        "AccrueFees must not mutate pool_mode"
+        (u16_at(576), u16_at(578), u16_at(580)),
+        (1600, 4800, 1600),
+        "WrapperConfigV16 fee shares moved: the four u128 counters no longer end at \
+         account byte 576, so WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN is stale"
     );
     assert_eq!(
-        pool_after.total_fees_earned, surplus,
-        "total_fees_earned must grow by EXACTLY the vault surplus"
+        percolator_stake::state::read_wrapper_insurance_reserve_withdrawn(&data),
+        Some(0),
+        "fresh market: magic/kind must parse and the tag-87 counter must be 0"
     );
-    let pool_value_after = pool_after
+    let _ = (&w.wrapper_id, &w.admin);
+}
+
+/// The #290 PoC shape (genesis 2,000,000; donation 100,000,000 via a REAL SPL
+/// Transfer; third-party AccrueFees; 50-token victim deposit), then a real-shaped
+/// fee payout that MUST still be booked in full.
+#[test]
+fn donation_is_not_booked_as_fees_and_does_not_block_deposits() {
+    let Some(mut w) = world() else { return };
+    const GENESIS: u64 = 2_000_000;
+    const DONATION: u64 = 100_000_000;
+
+    let attacker = user(&mut w, GENESIS + DONATION);
+    deposit(&mut w, &attacker, GENESIS, S::Real)
+        .unwrap_or_else(|e| panic!("genesis deposit: {}", logs(&e)));
+    let tpv_before = read_pool(&w.svm, &w.accts.pool_pda)
         .total_pool_value()
-        .expect("pool value must be computable post-accrual");
+        .unwrap();
+    assert_eq!(tpv_before, GENESIS);
+
+    // Raw donation: a real SPL Transfer into the vault.
+    let payer = w.payer.insecure_clone();
+    let akp = attacker.kp.insecure_clone();
+    send(
+        &mut w.svm,
+        &payer,
+        &[&akp],
+        spl_transfer_ix(attacker.ata, w.accts.vault, &akp.pubkey(), DONATION),
+    )
+    .unwrap_or_else(|e| panic!("SPL donation transfer: {}", logs(&e)));
+    assert_eq!(token_amount(&w.svm, &w.accts.vault), GENESIS + DONATION);
+
+    // Permissionless crank. Pre-#290 this booked all 100,000,000 as fees.
+    accrue(&mut w, S::Real).unwrap_or_else(|e| panic!("AccrueFees: {}", logs(&e)));
+    let pool = read_pool(&w.svm, &w.accts.pool_pda);
     assert_eq!(
-        pool_value_after,
-        pool_value_before + surplus,
-        "total_pool_value() must grow by EXACTLY the surplus for a mode-0 pool"
+        pool.total_fees_earned, 0,
+        "#290: a raw donation must NOT be booked as fee revenue"
     );
     assert_eq!(
-        pool_after.total_deposited, deposit_amount,
-        "sanity: total_deposited untouched by AccrueFees (fees are a separate field)"
+        pool.total_pool_value().unwrap(),
+        tpv_before,
+        "#290: a raw donation must not move the share price"
     );
+
+    // The DoS the donation used to cause: a 50-token deposit reverted
+    // ZeroSharesMinted at the pumped price (51 per LP). It must now mint.
+    let victim = user(&mut w, 1_000);
+    deposit(&mut w, &victim, 50, S::Real)
+        .unwrap_or_else(|e| panic!("#290: small deposit must not be priced out: {}", logs(&e)));
+    assert!(
+        token_amount(&w.svm, &victim.lp_ata) > 0,
+        "victim must receive LP at the un-inflated price"
+    );
+
+    // A real-shaped wrapper payout IS still fee revenue, booked in full and no more.
+    const FEES: u64 = 7_777;
+    wrapper_pays_fees(&mut w, FEES);
+    accrue(&mut w, S::Real).unwrap_or_else(|e| panic!("AccrueFees: {}", logs(&e)));
+    let pool = read_pool(&w.svm, &w.accts.pool_pda);
+    assert_eq!(
+        pool.total_fees_earned, FEES,
+        "wrapper-paid fees must be booked exactly, the donation still excluded"
+    );
+    assert_eq!(
+        pool.mode0_fees_attributed, FEES,
+        "cursor tracks booked payouts"
+    );
+    assert!(pool.fee_attribution_armed());
+
+    // Idempotent: a second crank books nothing more.
+    accrue(&mut w, S::Real).unwrap_or_else(|e| panic!("AccrueFees: {}", logs(&e)));
+    assert_eq!(read_pool(&w.svm, &w.accts.pool_pda).total_fees_earned, FEES);
+}
+
+/// A pool created before #290 has `fee_attribution_armed == false` and a stale
+/// vault snapshot in the cursor bytes. The first accrual books what the legacy
+/// code would have booked, capped at the wrapper's lifetime payouts. From then on,
+/// accrual is strictly attributed.
+#[test]
+fn legacy_pool_is_armed_once_then_strictly_attributed() {
+    let Some(mut w) = world() else { return };
+    let lp = user(&mut w, 1_000_000);
+    deposit(&mut w, &lp, 1_000_000, S::Real)
+        .unwrap_or_else(|e| panic!("genesis deposit: {}", logs(&e)));
+
+    // Rewind the pool to its pre-#290 shape: un-armed, stale snapshot bytes.
+    let mut pool = read_pool(&w.svm, &w.accts.pool_pda);
+    pool.set_fee_attribution_armed(false);
+    pool.mode0_fees_attributed = 987_654_321; // a stale vault-balance snapshot
+    write_pool(&mut w.svm, &w.accts.pool_pda, &pool);
+
+    // Pending, un-accrued wrapper payout of 5,000 at upgrade time.
+    wrapper_pays_fees(&mut w, 5_000);
+    accrue(&mut w, S::Real).unwrap_or_else(|e| panic!("AccrueFees: {}", logs(&e)));
+    let pool = read_pool(&w.svm, &w.accts.pool_pda);
+    assert!(
+        pool.fee_attribution_armed(),
+        "first attributed accrual arms the cursor"
+    );
+    assert_eq!(
+        pool.total_fees_earned, 5_000,
+        "pending payout at upgrade is booked"
+    );
+    assert_eq!(
+        pool.mode0_fees_attributed, 5_000,
+        "stale snapshot replaced by the counter"
+    );
+
+    // After arming, a donation is ignored.
+    let d = user(&mut w, 3_000_000);
+    let payer = w.payer.insecure_clone();
+    let dkp = d.kp.insecure_clone();
+    send(
+        &mut w.svm,
+        &payer,
+        &[&dkp],
+        spl_transfer_ix(d.ata, w.accts.vault, &dkp.pubkey(), 3_000_000),
+    )
+    .unwrap();
+    accrue(&mut w, S::Real).unwrap_or_else(|e| panic!("AccrueFees: {}", logs(&e)));
+    assert_eq!(
+        read_pool(&w.svm, &w.accts.pool_pda).total_fees_earned,
+        5_000
+    );
+}
+
+/// The slab is load-bearing, so it must be required where it matters and
+/// unforgeable where supplied.
+#[test]
+fn slab_account_is_required_and_validated() {
+    let Some(mut w) = world() else { return };
+    let lp = user(&mut w, 10_000_000);
+    deposit(&mut w, &lp, 1_000_000, S::Real)
+        .unwrap_or_else(|e| panic!("genesis deposit: {}", logs(&e)));
+
+    // Missing: mode-0 AccrueFees and Deposit refuse (a Deposit without it could mint
+    // at a price that has not absorbed pending wrapper fees: the #136 JIT capture).
+    let e = accrue(&mut w, S::Missing).expect_err("mode-0 AccrueFees without slab must fail");
+    assert!(logs(&e).contains("NotEnoughAccountKeys"), "{}", logs(&e));
+    let e =
+        deposit(&mut w, &lp, 1_000, S::Missing).expect_err("mode-0 Deposit without slab must fail");
+    assert!(logs(&e).contains("NotEnoughAccountKeys"), "{}", logs(&e));
+
+    // Forged: an account owned by some other program, claiming a huge counter.
+    let forged = Pubkey::new_unique();
+    let mut data = w.svm.get_account(&w.accts.slab).unwrap().data;
+    let off = percolator_stake::state::WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN;
+    data[off..off + 16].copy_from_slice(&(u64::MAX as u128).to_le_bytes());
+    w.svm
+        .set_account(
+            forged,
+            Account {
+                lamports: 1_000_000_000,
+                data: data.clone(),
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    accrue(&mut w, S::Other(forged)).expect_err("slab != pool.slab must fail");
+
+    // Owner gate: the real slab key, re-owned by a foreign program and carrying
+    // the forged counter, must be refused with IllegalOwner.
+    let real = w.svm.get_account(&w.accts.slab).unwrap();
+    let mut reowned = real.clone();
+    reowned.owner = Pubkey::new_unique();
+    reowned.data = data;
+    w.svm.set_account(w.accts.slab, reowned).unwrap();
+    let e = accrue(&mut w, S::Real).expect_err("slab owner != pool.percolator_program must fail");
+    assert!(logs(&e).contains("IllegalOwner"), "{}", logs(&e));
+    w.svm.set_account(w.accts.slab, real).unwrap();
+
+    // Nothing was booked through any refused path.
+    assert_eq!(read_pool(&w.svm, &w.accts.pool_pda).total_fees_earned, 0);
 }
