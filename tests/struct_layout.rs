@@ -72,7 +72,7 @@ fn test_stake_pool_zeroed_is_not_initialized() {
     // PERC-272 fields default to zero (insurance LP mode, no fees accrued)
     assert_eq!(pool.total_fees_earned, 0);
     assert_eq!(pool.last_fee_accrual_slot, 0);
-    assert_eq!(pool.last_vault_snapshot, 0);
+    assert_eq!(pool.mode0_fees_attributed, 0);
     assert_eq!(pool.pool_mode, 0);
 }
 
@@ -97,7 +97,7 @@ fn test_bytemuck_roundtrip_pool() {
     // PERC-272 fields
     pool.total_fees_earned = 555_000;
     pool.last_fee_accrual_slot = 9_999_999;
-    pool.last_vault_snapshot = 1_200_000;
+    pool.mode0_fees_attributed = 1_200_000;
     pool.pool_mode = 1;
 
     // Serialize
@@ -117,7 +117,7 @@ fn test_bytemuck_roundtrip_pool() {
     // fee accounting and pool mode on-chain
     assert_eq!(recovered.total_fees_earned, 555_000);
     assert_eq!(recovered.last_fee_accrual_slot, 9_999_999);
-    assert_eq!(recovered.last_vault_snapshot, 1_200_000);
+    assert_eq!(recovered.mode0_fees_attributed, 1_200_000);
     assert_eq!(recovered.pool_mode, 1);
 }
 
@@ -176,7 +176,7 @@ fn test_stake_pool_field_offsets() {
     // PERC-272 fields — offsets 256..288 were previously unverified
     assert_eq!(&pool.total_fees_earned as *const _ as usize - base, 256);
     assert_eq!(&pool.last_fee_accrual_slot as *const _ as usize - base, 264);
-    assert_eq!(&pool.last_vault_snapshot as *const _ as usize - base, 272);
+    assert_eq!(&pool.mode0_fees_attributed as *const _ as usize - base, 272);
     assert_eq!(&pool.pool_mode as *const _ as usize - base, 280);
     assert_eq!(&pool._mode_padding as *const _ as usize - base, 281);
     // v2: pending_admin[32] inserted at 288, pushing _reserved to 320.

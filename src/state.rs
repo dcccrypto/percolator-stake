@@ -105,11 +105,20 @@ pub struct StakePool {
     /// Reserved for future slot-based rate limiting if needed.
     pub last_fee_accrual_slot: u64,
 
-    /// DEAD (#255). Written by `process_accrue_fees`, read by NO accounting path.
-    /// The delta formula this comment used to describe was never implemented — the
-    /// accrual baseline is `total_pool_value()`. Kept solely to preserve the v4/408
-    /// layout (`STAKE_POOL_LEN`); do not build new logic on it.
-    pub last_vault_snapshot: u64,
+    /// #290 fee-attribution cursor (mode-0 pools only). Offset 272, same bytes as
+    /// the field formerly named `last_vault_snapshot`.
+    ///
+    /// The cumulative number of atoms of the wrapper's tag-87 insurance-leg payouts
+    /// (`WrapperConfigV16::insurance_reserve_withdrawn_atoms`) that this pool has
+    /// already booked into `total_fees_earned`. A mode-0 accrual books at most
+    /// `wrapper_counter - mode0_fees_attributed` of vault surplus, so a raw SPL
+    /// donation, which advances no wrapper counter, can never be booked as fees.
+    ///
+    /// Meaningful only once `fee_attribution_armed()` is set (`_reserved[60]`).
+    /// Before #290 these bytes held a write-only vault-balance snapshot (#255: read by
+    /// no accounting path), so an un-armed pool's value is ignored and replaced on
+    /// the first attributed accrual. See `processor::accrue_fees_inner`.
+    pub mode0_fees_attributed: u64,
 
     /// Pool mode: 0 = insurance LP (legacy), 1 = trading LP vault (PERC-272)
     /// Trading LP vault earns trading fees and gates OI.
@@ -354,7 +363,8 @@ impl StakePool {
     //   [49..51] = junior_fee_mult_bps: u16 (LE, default 20000 = 2x)
     //   [51..59] = realized_junior_loss: u64 (LE)
     //   [59]     = asset_admin_burned (0=false, 1=true)
-    //   [60..64] = free
+    //   [60]     = fee_attribution_armed (#290; 0=legacy, 1=armed)
+    //   [61..64] = free
     // ════════════════════════════════════════════════════════════
 
     /// Whether the market has been resolved (blocks new deposits).
@@ -457,6 +467,18 @@ impl StakePool {
     /// Set the BurnAssetAdmin completion flag. Stored at `_reserved[59]`.
     pub fn set_asset_admin_burned(&mut self, burned: bool) {
         self._reserved[59] = if burned { 1 } else { 0 };
+    }
+
+    /// #290: whether `mode0_fees_attributed` holds a live attribution cursor.
+    /// Stored at `_reserved[60]`. Unset on every pool created before #290, whose
+    /// offset-272 bytes still hold a stale vault-balance snapshot.
+    pub fn fee_attribution_armed(&self) -> bool {
+        self._reserved[60] == 1
+    }
+
+    /// Set the #290 fee-attribution armed flag. Stored at `_reserved[60]`.
+    pub fn set_fee_attribution_armed(&mut self, armed: bool) {
+        self._reserved[60] = if armed { 1 } else { 0 };
     }
 
     /// #242 timelock: the `cooldown_slots` INCREASE awaiting commit. Backed by the
@@ -824,6 +846,58 @@ impl StakePool {
 
 /// Derive the stake pool PDA for a given slab.
 /// This PDA also becomes the wrapper admin after TransferAdmin.
+// ════════════════════════════════════════════════════════════════════════════
+// #290 — WRAPPER FEE-PAYOUT COUNTER (read-only cross-program layout contract)
+//
+// Mode-0 fee revenue arrives as a bare SPL transfer from the wrapper's
+// permissionless tag 87 (`WithdrawInsuranceReserveToStake`) into `pool.vault`,
+// indistinguishable on the token account from a raw donation. The wrapper does,
+// however, keep a monotonic ledger of exactly those transfers:
+// `WrapperConfigV16::insurance_reserve_withdrawn_atoms`, advanced by the
+// TRANSFERRED amount at the same site that issues the transfer, and whose only
+// legal destination is this pool's vault (`load_bound_stake_pool`). Reading it
+// lets `AccrueFees` book wrapper-paid fees and nothing else.
+//
+// Offsets (identical in the deployed wrapper a9318945 (v18), the v18.1
+// candidate 3262608b, and the CI-pinned v17 wrapper 15eb8b0c):
+//   [0..8)   MAGIC            = 0x5045_5243_5631_3600 ("PERCV16\0")
+//   [8..10)  VERSION          (17 or 18: not checked, the config layout below
+//                              is the same in both)
+//   [10]     kind             = KIND_MARKET (1)
+//   [16..592) WrapperConfigV16 (WRAPPER_CONFIG_LEN = 576); its four u128 fee
+//            counters sit at config 496..560 in the order lp_accrued,
+//            lp_withdrawn, insurance_reserve_accrued, insurance_reserve_withdrawn
+//   => insurance_reserve_withdrawn_atoms = account bytes [560..576), u128 LE.
+//
+// `tests/mode0_fee_attribution_e2e.rs` pins this against a REAL wrapper .so by
+// checking the neighbouring fee-share defaults (1600/4800/1600) at [576..582).
+// If the wrapper ever moves this field, that test fails; update the constant
+// here and redeploy together.
+// ════════════════════════════════════════════════════════════════════════════
+pub const WRAPPER_MAGIC: u64 = 0x5045_5243_5631_3600;
+pub const WRAPPER_KIND_MARKET: u8 = 1;
+pub const WRAPPER_OFF_KIND: usize = 10;
+pub const WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN: usize = 16 + 544;
+
+/// Read `insurance_reserve_withdrawn_atoms` from a wrapper market account's raw
+/// bytes. Returns `None` if the account is too short, is not initialized with the
+/// wrapper magic, or is not a market (e.g. a closed-market tombstone).
+pub fn read_wrapper_insurance_reserve_withdrawn(data: &[u8]) -> Option<u128> {
+    let end = WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN.checked_add(16)?;
+    if data.len() < end {
+        return None;
+    }
+    let magic = u64::from_le_bytes(data[0..8].try_into().ok()?);
+    if magic != WRAPPER_MAGIC || data[WRAPPER_OFF_KIND] != WRAPPER_KIND_MARKET {
+        return None;
+    }
+    Some(u128::from_le_bytes(
+        data[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..end]
+            .try_into()
+            .ok()?,
+    ))
+}
+
 pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"stake_pool", slab.as_ref()], program_id)
 }
@@ -845,6 +919,49 @@ pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wrapper_market_bytes(counter: u128) -> Vec<u8> {
+        let mut d = vec![0u8; 592];
+        d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
+        d[8..10].copy_from_slice(&18u16.to_le_bytes());
+        d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
+        d[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN + 16]
+            .copy_from_slice(&counter.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn test_290_read_wrapper_counter() {
+        assert_eq!(WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN, 560);
+        assert_eq!(
+            read_wrapper_insurance_reserve_withdrawn(&wrapper_market_bytes(123_456)),
+            Some(123_456)
+        );
+        // Too short.
+        assert_eq!(read_wrapper_insurance_reserve_withdrawn(&[0u8; 575]), None);
+        // Wrong magic.
+        let mut d = wrapper_market_bytes(1);
+        d[0] ^= 1;
+        assert_eq!(read_wrapper_insurance_reserve_withdrawn(&d), None);
+        // Not a market (e.g. portfolio kind 2, or a tombstone).
+        let mut d = wrapper_market_bytes(1);
+        d[WRAPPER_OFF_KIND] = 2;
+        assert_eq!(read_wrapper_insurance_reserve_withdrawn(&d), None);
+    }
+
+    #[test]
+    fn test_290_attribution_flag_is_reserved_60_and_independent() {
+        let mut p = StakePool::zeroed();
+        assert!(!p.fee_attribution_armed());
+        p.set_fee_attribution_armed(true);
+        assert_eq!(p._reserved[60], 1);
+        assert!(!p.asset_admin_burned(), "[59] untouched");
+        assert_eq!(p.realized_junior_loss(), 0, "[51..59] untouched");
+        p.set_asset_admin_burned(true);
+        assert!(p.fee_attribution_armed());
+        p.set_fee_attribution_armed(false);
+        assert!(p.asset_admin_burned());
+    }
 
     #[test]
     fn test_stake_pool_size() {

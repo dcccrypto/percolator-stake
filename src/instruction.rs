@@ -103,6 +103,10 @@ pub enum StakeInstruction {
     ///   8. `[]` Token program
     ///   9. `[]` Clock sysvar
     ///  10. `[]` System program
+    ///  11. `[]` Wrapper market (`pool.slab`). #290: REQUIRED when the pool is
+    ///      mode 0 (every `InitPool` pool), because it supplies the tag-87 fee-payout
+    ///      counter that pending fees are attributed against before pricing. Ignored
+    ///      for mode 1.
     Deposit { amount: u64 },
 
     /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown.
@@ -118,6 +122,10 @@ pub enum StakeInstruction {
     ///   7. `[writable]` Deposit PDA (per-user, cooldown check)
     ///   8. `[]` Token program
     ///   9. `[]` Clock sysvar
+    ///  10. `[]` OPTIONAL wrapper market (`pool.slab`). #290: when present on a mode-0
+    ///      pool, pending wrapper-paid fees are accrued before pricing the redemption.
+    ///      When absent, that accrual is skipped, so the withdrawer redeems at the
+    ///      not-yet-accrued (lower or equal) price. Clients should always pass it.
     Withdraw { lp_amount: u64 },
 
     /// 3: CPI into percolator wrapper's TopUpInsurance to move collateral from
@@ -349,6 +357,10 @@ pub enum StakeInstruction {
     ///   1. `[writable]` Pool PDA
     ///   2. `[]` Pool vault token account (read balance)
     ///   3. `[]` Clock sysvar
+    ///   4. `[]` Wrapper market (`pool.slab`). #290: REQUIRED for mode 0, ignored
+    ///      for mode 1. A mode-0 pool books vault surplus only up to the wrapper's
+    ///      not-yet-booked `insurance_reserve_withdrawn_atoms` (tag-87 payouts). Any
+    ///      other surplus (a raw donation) stays unpriced in the vault.
     AccrueFees,
 
     /// 13: Initialize pool in trading LP mode (pool_mode = 1).
@@ -375,7 +387,7 @@ pub enum StakeInstruction {
 
     /// 16: Deposit into the junior (first-loss) tranche.
     ///
-    /// Accounts: same as Deposit
+    /// Accounts: same as Deposit, including the #290 wrapper market at index 11.
     DepositJunior { amount: u64 },
 
     /// 18: Admin marks the pool as market-resolved (blocks new deposits).

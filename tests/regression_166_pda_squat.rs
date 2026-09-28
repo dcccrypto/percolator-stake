@@ -227,6 +227,25 @@ fn inject_pool(
     )
     .unwrap();
 
+    // #290: a mode-0 Deposit reads the wrapper's tag-87 counter from `pool.slab`,
+    // which must be owned by `pool.percolator_program` (zeroed here => the System
+    // program id) and carry the wrapper market header. Counter = 0.
+    let mut slab_data = vec![0u8; 592];
+    slab_data[0..8].copy_from_slice(&percolator_stake::state::WRAPPER_MAGIC.to_le_bytes());
+    slab_data[percolator_stake::state::WRAPPER_OFF_KIND] =
+        percolator_stake::state::WRAPPER_KIND_MARKET;
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: slab_data,
+            owner: Pubkey::new_from_array(pool.percolator_program),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
     (pool_pda, vault_auth)
 }
 
@@ -283,6 +302,7 @@ fn deposit_ix(
     vault_auth: Pubkey,
     deposit_pda: Pubkey,
     amount: u64,
+    slab: Pubkey,
 ) -> Instruction {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     let mut data = vec![1u8]; // tag = Deposit
@@ -301,6 +321,7 @@ fn deposit_ix(
             AccountMeta::new_readonly(token_program, false), // 8. token_program
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false), // 9. clock
             AccountMeta::new_readonly(system_program::id(), false), // 10. system_program
+            AccountMeta::new_readonly(slab, false), // 11. wrapper market (#290)
         ],
         data,
     }
@@ -439,6 +460,7 @@ fn deposit_pda_squat_adoption() {
         vault_auth,
         deposit_pda,
         deposit_amount,
+        slab,
     );
 
     send(&mut svm, &payer, &[&user], ix).unwrap_or_else(|e| {
@@ -578,6 +600,7 @@ fn deposit_pda_clean_path_unaffected() {
             vault_auth,
             deposit_pda,
             1_500,
+            slab,
         ),
     )
     .unwrap_or_else(|e| {
