@@ -362,6 +362,10 @@ pub enum StakeInstruction {
     ///      for mode 1. A mode-0 pool books vault surplus only up to the wrapper's
     ///      not-yet-booked `insurance_reserve_withdrawn_atoms` (tag-87 payouts). Any
     ///      other surplus (a raw donation) stays unpriced in the vault.
+    ///
+    /// F3: refused with `NoRealLpHolders` (29) when `total_lp_supply <=
+    /// MINIMUM_LIQUIDITY` (only the N7 dead shares exist). Nothing is written; the
+    /// pushed fees stay in the vault and are booked once a real staker deposits.
     AccrueFees,
 
     /// 13: Initialize pool in trading LP mode (pool_mode = 1).

@@ -92,3 +92,14 @@ fn test_all_errors_are_custom() {
         assert!(matches!(pe, ProgramError::Custom(_)));
     }
 }
+
+/// F3: NoRealLpHolders is appended at the END of the enum so no existing code
+/// shifts. SDK error tables map 29 to it.
+#[test]
+fn test_f3_no_real_lp_holders_code_is_29() {
+    assert_eq!(StakeError::DepositBelowMinimumLiquidity as u32, 28);
+    assert_eq!(StakeError::NoRealLpHolders as u32, 29);
+    let pe: ProgramError = StakeError::NoRealLpHolders.into();
+    assert_eq!(pe, ProgramError::Custom(29));
+    assert!(percolator_stake::error::error_hint(29).starts_with("No real LP holders"));
+}

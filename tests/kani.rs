@@ -826,4 +826,36 @@ mod kani_proofs {
         kani::cover!(armed && surplus > 0 && a == 0);
         kani::cover!(!armed && a > 0);
     }
+
+    /// PROOF (F3, fee-flow audit 2026-09-29): the accrual guard admits a pool iff it
+    /// holds at least one REAL LP share above the N7 dead-share floor. Over ALL u64
+    /// supplies (the real function, full width): `has_real_lp_holders(s)` is exactly
+    /// `s > MINIMUM_LIQUIDITY`; when it admits, the real (non-dead) supply
+    /// `s - MINIMUM_LIQUIDITY` is at least 1 and cannot underflow; a pool holding only
+    /// the dead shares (s == MINIMUM_LIQUIDITY), or less (legacy pools, fresh pools),
+    /// is refused. Covers prove the refuse branch, the admit branch, and both sides
+    /// of the exact boundary are reachable, so the proof is not vacuous.
+    #[kani::proof]
+    fn kani_f3_accrual_requires_real_lp_above_dead_shares() {
+        use percolator_stake::state::MINIMUM_LIQUIDITY;
+        let supply: u64 = kani::any();
+        let ok = percolator_stake::math::has_real_lp_holders(supply);
+        assert_eq!(ok, supply > MINIMUM_LIQUIDITY);
+        if ok {
+            let real = supply.checked_sub(MINIMUM_LIQUIDITY);
+            assert!(matches!(real, Some(r) if r >= 1));
+        } else {
+            assert!(supply <= MINIMUM_LIQUIDITY);
+        }
+        kani::cover!(!ok, "COVER: refuse branch reachable");
+        kani::cover!(ok, "COVER: admit branch reachable");
+        kani::cover!(
+            supply == MINIMUM_LIQUIDITY && !ok,
+            "COVER: dead-shares-only pool is refused"
+        );
+        kani::cover!(
+            supply == MINIMUM_LIQUIDITY + 1 && ok,
+            "COVER: one real share is admitted"
+        );
+    }
 }
