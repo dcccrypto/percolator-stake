@@ -5473,3 +5473,88 @@ mod tests {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Kani (push 2026-09-30, Anvil): F3 dead-share accrual guard, proved on the REAL
+// `accrue_fees_inner` (private, hence in-crate). Run locally only:
+//   cargo kani --lib --harness kani_f3
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(kani)]
+mod kani_f3_dead_share_guard {
+    use super::*;
+    use crate::state::{StakePool, MINIMUM_LIQUIDITY};
+
+    fn any_pool() -> StakePool {
+        let bytes: [u8; core::mem::size_of::<StakePool>()] = kani::any();
+        bytemuck::pod_read_unaligned(&bytes[..])
+    }
+
+    /// With only the N7 dead shares outstanding, NO path through the accrual helper
+    /// books a fee: total_fees_earned, the junior sub-balance and the pool value are
+    /// untouched. And nothing is lost: for a mode-0 pool, the amount a later accrual
+    /// (with real holders) can attribute is exactly what this one would have booked.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_f3_dead_share_only_pool_books_nothing_and_loses_nothing() {
+        let mut pool = any_pool();
+        let supply = pool.total_lp_supply;
+        kani::assume(supply <= MINIMUM_LIQUIDITY);
+        let before = pool;
+        let balance: u64 = kani::any();
+        let paid: u128 = kani::any();
+        let wrapper_paid = if pool.pool_mode == 0 { Some(paid) } else { None };
+        let pv_before = before.total_pool_value();
+        let r = accrue_fees_inner(&mut pool, balance, wrapper_paid);
+
+        if r.is_ok() {
+            let pv = pv_before.unwrap();
+            let surplus = balance.saturating_sub(pv);
+            assert_eq!(pool.total_fees_earned, before.total_fees_earned);
+            assert_eq!(pool.junior_balance(), before.junior_balance());
+            assert_eq!(pool.total_pool_value(), pv_before);
+            if before.pool_mode == 0 {
+                let (_, would_book) = crate::math::mode0_attributable_fees(
+                    surplus,
+                    paid,
+                    before.mode0_fees_attributed,
+                    before.fee_attribution_armed(),
+                )
+                .unwrap();
+                let (_, still_bookable) = crate::math::mode0_attributable_fees(
+                    surplus,
+                    paid,
+                    pool.mode0_fees_attributed,
+                    pool.fee_attribution_armed(),
+                )
+                .unwrap();
+                assert_eq!(still_bookable, would_book);
+                kani::cover!(would_book > 0 && supply == MINIMUM_LIQUIDITY,
+                    "mode 0: a real payout is pending on a dead-share-only pool");
+            } else {
+                kani::cover!(surplus > 0 && supply == MINIMUM_LIQUIDITY,
+                    "mode 1: surplus pending on a dead-share-only pool");
+            }
+            kani::cover!(surplus > 0 && supply > 0,
+                "surplus pending with the old `> 0` gate open");
+        }
+    }
+
+    /// Positive side: one real share above the floor and a pending surplus DOES book
+    /// (the guard is not an always-refuse).
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_f3_real_holder_pool_still_books() {
+        let mut pool = any_pool();
+        kani::assume(pool.total_lp_supply > MINIMUM_LIQUIDITY);
+        kani::assume(pool.pool_mode == 1);
+        kani::assume(!pool.tranche_enabled());
+        let before = pool;
+        let balance: u64 = kani::any();
+        let r = accrue_fees_inner(&mut pool, balance, None);
+        if let (Ok(()), Some(pv)) = (r, before.total_pool_value()) {
+            let surplus = balance.saturating_sub(pv);
+            assert_eq!(pool.total_fees_earned, before.total_fees_earned + surplus);
+            kani::cover!(surplus > 0, "fees booked above the floor");
+        }
+    }
+}
