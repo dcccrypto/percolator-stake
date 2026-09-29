@@ -2667,7 +2667,15 @@ fn accrue_fees_inner(
     // orphaned-value guard and permanently bricking the first deposit (an attacker can
     // donate 1 token to the vault pre-first-deposit to trigger it). For mode 0 the
     // cursor is NOT advanced either, so the payout stays bookable once LPs exist.
-    if fee_delta > 0 && pool.total_lp_supply > 0 {
+    //
+    // F3: "active LP holders" means REAL shares above the N7 dead-share floor, not
+    // `total_lp_supply > 0` (the counter includes the MINIMUM_LIQUIDITY dead shares).
+    // This helper also runs as the Deposit/DepositJunior pre-accrue, so without this
+    // the first real depositor into a dead-share-only pool would book every pending
+    // payout to the dead shares just before minting. Here it is a silent skip, not a
+    // refusal, so deposits and withdrawals are never blocked; the permissionless
+    // AccrueFees instruction refuses explicitly (NoRealLpHolders) before reaching here.
+    if fee_delta > 0 && crate::math::has_real_lp_holders(pool.total_lp_supply) {
         if pool.pool_mode == 0 {
             pool.mode0_fees_attributed = pool
                 .mode0_fees_attributed
@@ -2819,6 +2827,24 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     if pool.pool_mode > 1 {
         msg!("AccrueFees: unknown pool mode");
         return Err(StakeError::InvalidPoolMode.into());
+    }
+
+    // F3 (fee-flow audit 2026-09-29): refuse when the only LP supply is the N7
+    // MINIMUM_LIQUIDITY dead-share floor. total_lp_supply counts those dead shares,
+    // so the `> 0` gate in accrue_fees_inner used to pass and book the whole surplus
+    // to shares no one can ever redeem. Checked before the vault is read and before
+    // any write to `pool`, so a refused call changes nothing. Any fee tokens the
+    // wrapper already pushed (tag 87) stay in the vault, un-booked, and the mode-0
+    // attribution cursor is not advanced, so they remain bookable once a real staker
+    // exists. Mirrors the wrapper LP vault's
+    // `total_lp_shares_outstanding <= LP_VAULT_MINIMUM_LIQUIDITY` refusal.
+    if !crate::math::has_real_lp_holders(pool.total_lp_supply) {
+        msg!(
+            "AccrueFees: pool has no real LP holders (total_lp_supply={} <= MINIMUM_LIQUIDITY={}); nothing booked (F3)",
+            pool.total_lp_supply,
+            state::MINIMUM_LIQUIDITY
+        );
+        return Err(StakeError::NoRealLpHolders.into());
     }
 
     // FINDING-3: Verify vault key BEFORE reading vault data.

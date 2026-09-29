@@ -85,6 +85,12 @@ pub enum StakeError {
     /// below MINIMUM_LIQUIDITY at genesis are rejected rather than silently minting
     /// 0 (or underflowing) LP to the first depositor.
     DepositBelowMinimumLiquidity = 28,
+    /// F3 (fee-flow audit 2026-09-29): `AccrueFees` refused because the pool's only
+    /// LP supply is the N7 `MINIMUM_LIQUIDITY` dead-share floor
+    /// (`total_lp_supply <= MINIMUM_LIQUIDITY`). Fees booked now would belong to
+    /// shares nobody can redeem. Nothing is booked; the fee tokens stay in the vault
+    /// and are booked by the first accrual after a real staker deposits.
+    NoRealLpHolders = 29,
 }
 
 impl From<StakeError> for ProgramError {
@@ -126,6 +132,7 @@ pub fn error_hint(code: u32) -> &'static str {
         26 => "Timelock not elapsed — the proposed cooldown increase is not yet applicable; wait for the timelock window to pass (#242)",
         27 => "No pending cooldown proposal — there is no proposed cooldown increase to apply; propose one first, or it was cancelled (#242)",
         28 => "Deposit below minimum liquidity — the pool's first-ever deposit must exceed MINIMUM_LIQUIDITY so a permanent dead-share floor can be locked (N7 anti-inflation hardening); deposit a larger amount",
+        29 => "No real LP holders — the pool's only LP supply is the MINIMUM_LIQUIDITY dead-share floor, so AccrueFees refuses to book fees nobody could redeem; the fees stay in the vault and are booked once a real staker deposits (F3)",
         _ => "Unknown error — check the error code and pool state",
     }
 }

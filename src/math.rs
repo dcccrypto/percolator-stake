@@ -494,9 +494,39 @@ pub fn mode0_attributable_fees(
     Some((cursor, attributable))
 }
 
+/// F3 (fee-flow audit 2026-09-29) — the pool has at least one REAL LP share.
+///
+/// `total_lp_supply` counts the N7 `MINIMUM_LIQUIDITY` dead shares, which are never
+/// SPL-minted to anyone and can never be redeemed (see `state::MINIMUM_LIQUIDITY`).
+/// Once every real staker has exited, the counter settles at exactly that floor.
+/// Fees booked in that state are credited pro rata to the dead shares only, so they
+/// are permanently unredeemable, and the inflated share price is simply charged to the
+/// next depositor. Fee accrual is therefore allowed only ABOVE the floor. Mirrors the
+/// wrapper LP vault's `total_lp_shares_outstanding <= LP_VAULT_MINIMUM_LIQUIDITY`
+/// refusal.
+pub fn has_real_lp_holders(total_lp_supply: u64) -> bool {
+    total_lp_supply > crate::state::MINIMUM_LIQUIDITY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── F3: dead-share-only accrual guard ──
+
+    #[test]
+    fn test_f3_has_real_lp_holders_boundary() {
+        let m = crate::state::MINIMUM_LIQUIDITY;
+        assert!(!has_real_lp_holders(0));
+        assert!(!has_real_lp_holders(1));
+        assert!(!has_real_lp_holders(m - 1));
+        assert!(
+            !has_real_lp_holders(m),
+            "only the dead shares: no real holder"
+        );
+        assert!(has_real_lp_holders(m + 1), "one real share above the floor");
+        assert!(has_real_lp_holders(u64::MAX));
+    }
 
     // ── #290 mode-0 fee attribution ──
 
