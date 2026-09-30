@@ -5549,6 +5549,29 @@ mod kani_f3_dead_share_guard {
         }
     }
 
+    /// Mode-1, no-tranche slice of the dead-share proof (same assertion). Exists so the
+    /// negative control (guard reverted to `> 0`) has a domain small enough for CBMC to find the
+    /// counterexample quickly.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    #[kani::solver(kissat)]
+    #[kani::stub(std::fmt::format, stub_format)]
+    #[kani::stub(solana_program::log::sol_log, stub_log)]
+    fn kani_f3_dead_share_only_mode1_books_nothing() {
+        let mut pool = any_pool();
+        let supply = pool.total_lp_supply;
+        kani::assume(supply <= MINIMUM_LIQUIDITY);
+        kani::assume(pool.pool_mode == 1);
+        kani::assume(!pool.tranche_enabled());
+        let before = pool;
+        let balance: u64 = kani::any();
+        let r = accrue_fees_inner(&mut pool, balance, None);
+        if let (Ok(()), Some(pv)) = (r, before.total_pool_value()) {
+            kani::cover!(balance > pv && supply > 0, "surplus pending with the old gate open");
+            assert_eq!(pool.total_fees_earned, before.total_fees_earned);
+        }
+    }
+
     /// Positive side: one real share above the floor and a pending surplus DOES book
     /// (the guard is not an always-refuse).
     #[kani::proof]
