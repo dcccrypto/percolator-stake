@@ -5494,6 +5494,7 @@ mod kani_f3_dead_share_guard {
     /// untouched. And nothing is lost: for a mode-0 pool, the amount a later accrual
     /// (with real holders) can attribute is exactly what this one would have booked.
     #[kani::proof]
+    #[kani::solver(kissat)]
     #[kani::unwind(2)]
     fn kani_f3_dead_share_only_pool_books_nothing_and_loses_nothing() {
         let mut pool = any_pool();
@@ -5542,6 +5543,7 @@ mod kani_f3_dead_share_guard {
     /// Positive side: one real share above the floor and a pending surplus DOES book
     /// (the guard is not an always-refuse).
     #[kani::proof]
+    #[kani::solver(kissat)]
     #[kani::unwind(2)]
     fn kani_f3_real_holder_pool_still_books() {
         let mut pool = any_pool();
