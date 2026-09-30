@@ -1094,4 +1094,57 @@ mod kani_proofs {
         kani::cover!(real && unbooked > 0 && released > 0 && v1 > v0 + released,
             "pre-existing unbooked surplus is booked on top of the release");
     }
+
+    /// REVIEW twin (Sentinel 2026-09-30, D-ST-03t): the same whole-vault booking on a
+    /// TRANCHE-ENABLED pool with a live junior, so `book_fee_delta`'s junior split and its M-2
+    /// guard (junior_balance > pool value => Err) are on the path. Claim: terminal recovery never
+    /// reverts on a valid tranche pool (junior <= pool value) and still books the whole surplus.
+    /// Nonlinear (distribute_fees divides by symbolic balances): kissat, 1 h cap; on NO VERDICT
+    /// the F-9 claim is stated for tranche-disabled pools only.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    #[kani::solver(kissat)]
+    fn kani_review_f9_books_whole_vault_surplus_tranche_pool() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B);
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        kani::assume(percolator_stake::math::has_real_lp_holders(p.total_lp_supply));
+        p.set_tranche_enabled(true);
+        let jlp: u64 = kani::any();
+        let jbal: u64 = kani::any();
+        let mult: u16 = kani::any();
+        kani::assume(jlp > 0 && jlp < p.total_lp_supply);
+        p.set_junior_total_lp(jlp);
+        p.set_junior_fee_mult_bps(mult);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        kani::assume(jbal <= v0); // pool invariant: the junior sub-balance is within pool value
+        p.set_junior_balance(jbal);
+        let released: u64 = kani::any();
+        let unbooked: u64 = kani::any();
+        kani::assume(released <= B && unbooked <= B);
+        let balance = v0 + unbooked + released;
+        let r = p.book_terminal_recovery(balance);
+        assert!(r.is_ok(), "terminal recovery never reverts on a valid tranche pool");
+        let v1 = p.total_pool_value().expect("representable");
+        assert_eq!(v1, balance, "the whole vault surplus is booked");
+        assert!(p.junior_balance() <= v1, "M-2 invariant kept");
+        kani::cover!(jbal > 0 && released > 0 && p.junior_balance() > jbal, "junior share of the recovered fees credited");
+    }
 }
