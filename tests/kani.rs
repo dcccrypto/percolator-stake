@@ -1003,4 +1003,53 @@ mod kani_proofs {
             "COVER: dead shares, principal only"
         );
     }
+
+    /// REVIEW (Sentinel 2026-09-30): `kani_f9_pool_receives_exactly_what_wrapper_releases`
+    /// assumes the vault was FULLY BOOKED before the release (balance == value + released).
+    /// This drops that assumption: any pre-existing unbooked surplus `u` (e.g. a dead-share
+    /// fee remainder `book_terminal_recovery` deliberately left unbooked, or a donation) is
+    /// also booked by the next terminal recovery. The exact statement is therefore
+    /// "with real holders, pool value becomes EXACTLY the vault balance", not "rises by
+    /// exactly what the wrapper released"; the two coincide only when u == 0.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_review_f9_books_whole_vault_surplus() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        let released: u64 = kani::any();
+        let unbooked: u64 = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B && released <= B && unbooked <= B);
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let recoverable0 = p.wrapper_recoverable();
+        let real = percolator_stake::math::has_real_lp_holders(p.total_lp_supply);
+        let balance = v0 + unbooked + released;
+        let (r, f) = p.book_terminal_recovery(balance).expect("bounded input");
+        let v1 = p.total_pool_value().expect("representable");
+        assert!(v1 <= balance);
+        if real {
+            assert_eq!(v1, balance, "real holders: the WHOLE vault surplus is booked");
+        } else {
+            assert_eq!(f, 0);
+            assert_eq!(r, (unbooked + released).min(recoverable0));
+        }
+        kani::cover!(real && unbooked > 0 && released > 0 && v1 > v0 + released,
+            "pre-existing unbooked surplus is booked on top of the release");
+    }
 }
