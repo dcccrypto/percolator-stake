@@ -20,7 +20,8 @@
 //! Pinned 2026-09-30:
 //!   deploy/v18.2-wrapper@6377376a  sha256 4472b3832fda102aae8d28b3c1efc642a4b919f3671d93076ca6f88cce51e98b (on-chain v18.2)
 //!   feat/p1-safety-release@c0ffaefa sha256 c4f63d15664a5b2fee77d20100e529c40398dabe36251b2840f7b06f624c0e28 (current P1)
-//!   feat/p3-vault-owned-lp@ee29b5ac sha256 608d3f8cd98a03259ef1413c5e22c31e33d3d4b6d3e54669503c0f079aa91e96 (P1+P3 FINAL relaunch, program = 267a9017, engine 35ddd692, `--features devnet`)
+//!   feat/p3-vault-owned-lp@ee29b5ac sha256 608d3f8cd98a03259ef1413c5e22c31e33d3d4b6d3e54669503c0f079aa91e96 (P1+P3 FINAL, program = 267a9017; superseded)
+//!   feat/p3-vault-owned-lp@07a1d0eb sha256 8410a5d7e85528bd8ac4a32c3ca5b0c6aa5c6a7ced3499855c252286005c71cc (P1+P3 FINAL relaunch, engine 35ddd692, `--features devnet`)
 
 #![allow(clippy::result_large_err)]
 
@@ -50,7 +51,11 @@ const PINNED_WRAPPERS: &[(&str, &str)] = &[
     ),
     (
         "608d3f8cd98a03259ef1413c5e22c31e33d3d4b6d3e54669503c0f079aa91e96",
-        "feat/p3-vault-owned-lp@ee29b5ac (P1+P3 FINAL relaunch, --features devnet)",
+        "feat/p3-vault-owned-lp@ee29b5ac (P1+P3 FINAL, superseded by 07a1d0eb)",
+    ),
+    (
+        "8410a5d7e85528bd8ac4a32c3ca5b0c6aa5c6a7ced3499855c252286005c71cc",
+        "feat/p3-vault-owned-lp@07a1d0eb (P1+P3 FINAL relaunch, --features devnet)",
     ),
 ];
 
