@@ -77,6 +77,8 @@ mod kani_proofs {
             deposit,
             back
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: First depositor gets exact 1:1 (no loss, no gain).
@@ -91,6 +93,8 @@ mod kani_proofs {
 
         let back = calc_collateral_for_withdraw(lp, amount, lp).unwrap();
         assert_eq!(back, amount, "First depositor full withdraw must be exact");
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Two depositors, both fully withdraw → total out ≤ total in.
@@ -137,6 +141,8 @@ mod kani_proofs {
             a_back,
             b_back
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -155,6 +161,8 @@ mod kani_proofs {
         kani::assume(pv <= 1_000_000_000);
         kani::assume(amount <= 1_000_000_000);
         let _ = calc_lp_for_deposit(supply, pv, amount);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: calc_collateral_for_withdraw never panics.
@@ -169,6 +177,8 @@ mod kani_proofs {
         kani::assume(pv <= 1_000_000_000);
         kani::assume(lp <= 1_000_000_000);
         let _ = calc_collateral_for_withdraw(supply, pv, lp);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: pool_value never panics.
@@ -201,6 +211,8 @@ mod kani_proofs {
         let lp1 = calc_lp_for_deposit(supply, pv, amount);
         let lp2 = calc_lp_for_deposit(supply, pv, amount);
         assert_eq!(lp1, lp2);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Larger deposit → ≥ LP tokens (monotonicity).
@@ -231,6 +243,8 @@ mod kani_proofs {
             lp_l >= lp_s,
             "Monotonicity violated: more deposit → less LP"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Larger LP burn → ≥ collateral (monotonicity).
@@ -261,6 +275,8 @@ mod kani_proofs {
             c_l >= c_s,
             "Monotonicity violated: more LP burn → less collateral"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -283,6 +299,8 @@ mod kani_proofs {
         };
 
         assert!(col <= pv, "Full burn {} exceeds pool value {}", col, pv);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Partial burn returns strictly less than full burn
@@ -308,6 +326,8 @@ mod kani_proofs {
         };
 
         assert!(part <= full, "Partial {} exceeds full {}", part, full);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -357,6 +377,8 @@ mod kani_proofs {
             (Some(o), Some(n)) => assert!(n >= o, "Deposit must not decrease value"),
             _ => {} // overflow cases
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -382,6 +404,8 @@ mod kani_proofs {
             let rhs = (deposit as u128) * (supply as u128);
             assert!(lhs <= rhs, "LP rounding not pool-favoring");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Collateral withdrawal rounds DOWN (pool-favoring).
@@ -402,6 +426,8 @@ mod kani_proofs {
             let rhs = (lp as u128) * (pv as u128);
             assert!(lhs <= rhs, "Withdrawal rounding not pool-favoring");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -426,6 +452,8 @@ mod kani_proofs {
 
         assert_eq!(senior_loss, 0, "Senior lost while junior was positive");
         assert_eq!(junior_loss, loss_amount, "Junior did not absorb full loss");
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -453,6 +481,8 @@ mod kani_proofs {
             senior_loss <= senior_balance,
             "Senior lost more than balance"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -480,6 +510,8 @@ mod kani_proofs {
             jf as u128 + sf as u128 <= total_fee as u128,
             "Fee distribution exceeds total"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -515,6 +547,8 @@ mod kani_proofs {
         } else {
             assert!(!allowed, "overflow floor must block");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -535,6 +569,8 @@ mod kani_proofs {
                 "higher TVL must produce higher or equal floor"
             );
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -550,6 +586,8 @@ mod kani_proofs {
         if let Some(floor) = hwm_floor(tvl, bps) {
             assert!(floor <= tvl, "floor must never exceed HWM TVL");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -687,6 +725,8 @@ mod kani_proofs {
             junior_total_lp,
             "junior_total_lp clobbered by HWM"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ── PR#83 HIGH: distribute_fees Overflow Safety ──
@@ -713,6 +753,8 @@ mod kani_proofs {
             total_fee,
         );
         // If we reach here without panic, the proof passes.
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: distribute_fees is conservative at full u64 range.
