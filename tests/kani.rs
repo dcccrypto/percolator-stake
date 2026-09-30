@@ -858,4 +858,149 @@ mod kani_proofs {
             "COVER: one real share is admitted"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // F-9: terminal insurance recovery (stake tag 29)
+    // ═══════════════════════════════════════════════════════════
+
+    /// PROOF (F-9 split): the terminal split never books more than the surplus,
+    /// never books more principal than stakers flushed and have not recovered, books
+    /// the WHOLE surplus when real holders exist, and books no fees to dead shares.
+    /// Full u64 range, no bounds.
+    #[kani::proof]
+    fn kani_f9_terminal_split_conserves_surplus() {
+        let surplus: u64 = kani::any();
+        let recoverable: u64 = kani::any();
+        let real: bool = kani::any();
+        let (r, f) = percolator_stake::math::terminal_recovery_split(surplus, recoverable, real);
+        assert!(r <= surplus);
+        assert!(r <= recoverable);
+        let booked = r.checked_add(f);
+        assert!(matches!(booked, Some(b) if b <= surplus));
+        if real {
+            assert_eq!(r + f, surplus, "real holders: the whole surplus is booked");
+        } else {
+            assert_eq!(f, 0, "F3: no fees to dead shares");
+        }
+        kani::cover!(
+            real && r > 0 && f > 0,
+            "COVER: principal and fee legs both booked"
+        );
+        kani::cover!(
+            real && recoverable == 0 && f == surplus && surplus > 0,
+            "COVER: all-fee terminal budget (F-9 repro shape)"
+        );
+        kani::cover!(
+            !real && surplus > recoverable && r == recoverable,
+            "COVER: dead shares, fee remainder left unbooked"
+        );
+        kani::cover!(
+            real && surplus <= recoverable && r == surplus && surplus > 0,
+            "COVER: all-principal recovery"
+        );
+    }
+
+    /// PROOF (F-9 CPI delta): the post-CPI check admits EXACTLY a vault that grew
+    /// by the requested amount — never a short, long or negative delivery.
+    #[kani::proof]
+    fn kani_f9_cpi_delta_is_exact() {
+        let before: u64 = kani::any();
+        let after: u64 = kani::any();
+        let requested: u64 = kani::any();
+        let ok = percolator_stake::math::terminal_cpi_delta_ok(before, after, requested);
+        let exact = (before as u128) + (requested as u128) == after as u128;
+        assert_eq!(ok, exact);
+        kani::cover!(ok && requested > 0, "COVER: exact delivery accepted");
+        kani::cover!(
+            !ok && after > before && after - before < requested,
+            "COVER: short delivery rejected"
+        );
+        kani::cover!(
+            !ok && after > before && after - before > requested,
+            "COVER: over delivery rejected"
+        );
+        kani::cover!(!ok && after < before, "COVER: balance decrease rejected");
+    }
+
+    /// PROOF (F-9 amount conservation, the headline property): starting from a
+    /// fully booked pool (vault balance == total_pool_value()), the wrapper releases
+    /// `released` atoms into pool.vault and `book_terminal_recovery` runs at the new
+    /// balance. Then:
+    ///   * with real LP holders, pool value rises by EXACTLY `released` — the pool
+    ///     (stakers) receives exactly what the wrapper released, not an atom more or less;
+    ///   * with dead shares only, it rises by exactly the principal leg, and the
+    ///     rest is left unbooked (never booked to dead shares);
+    ///   * in every case pool value never exceeds the vault balance, and the
+    ///     returned principal never exceeds what stakers flushed.
+    /// Runs on the REAL `StakePool::book_terminal_recovery` (tranches off; the tranche
+    /// split only divides the fee leg, and `test_f9_book_fee_delta_tranche_split_matches_accrue`
+    /// covers it). Bounded to 2^40 per field for solver time (> 10^12 atoms).
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_f9_pool_receives_exactly_what_wrapper_releases() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        let released: u64 = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B && released <= B);
+        // Pool invariants the program maintains: recovered <= returned <= flushed.
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let recoverable0 = p.wrapper_recoverable();
+        let returned0 = p.total_returned;
+        let real = percolator_stake::math::has_real_lp_holders(p.total_lp_supply);
+        let balance = v0 + released; // vault was fully booked; wrapper paid `released`
+        let (r, f) = match p.book_terminal_recovery(balance) {
+            Ok(x) => x,
+            Err(_) => {
+                // Only an arithmetic Overflow may refuse, and with these bounds none can.
+                panic!("book_terminal_recovery refused a bounded input");
+            }
+        };
+        let v1 = p.total_pool_value().expect("value stays representable");
+        assert!(v1 <= balance, "never books more than the vault holds");
+        assert_eq!(v1, v0 + r + f, "value moves by exactly what was booked");
+        assert!(
+            r <= recoverable0,
+            "principal leg bounded by the unrecovered flush"
+        );
+        assert_eq!(p.total_returned, returned0 + r);
+        if real {
+            assert_eq!(
+                v1,
+                v0 + released,
+                "CONSERVATION: pool receives exactly what the wrapper releases"
+            );
+        } else {
+            assert_eq!(f, 0);
+            assert_eq!(v1, v0 + released.min(recoverable0));
+        }
+        kani::cover!(
+            real && released > 0 && r > 0 && f > 0,
+            "COVER: split release, both legs"
+        );
+        kani::cover!(
+            real && released > 0 && recoverable0 == 0 && f == released,
+            "COVER: F-9 shape, nothing flushed, all fees"
+        );
+        kani::cover!(
+            !real && released > recoverable0 && recoverable0 > 0,
+            "COVER: dead shares, principal only"
+        );
+    }
 }

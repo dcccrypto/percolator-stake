@@ -273,6 +273,92 @@ pub enum StakeInstruction {
     ///   8. `[]` Percolator program
     RecoverFlushedInsurance { amount: u64 },
 
+    /// 29: RecoverTerminalInsurance — F-9. PERMISSIONLESS terminal insurance
+    /// recovery for a stake-BOUND market that has been RESOLVED by any path
+    /// (`AdminResolveMarket`, or `ResolveStalePermissionless`, which bypasses the
+    /// H-1 gate on tag 24). Returns the market's insurance budget to stakers.
+    ///
+    /// After `BindInsuranceAuthority` (tag 19) the asset-0 `insurance_authority`
+    /// is our `vault_auth` PDA, so the wrapper's terminal `WithdrawInsurance`
+    /// (tag 41) pays only to a token account owned by that PDA. Tag 23
+    /// (`RecoverFlushedInsurance` -> wrapper 57) is Live-only. Without this
+    /// instruction the budget is stranded after resolution and `CloseSlab` fails
+    /// with 21 forever.
+    ///
+    /// Steps:
+    /// 1. Prove the wrapper market TERMINAL from its bytes: engine mode Resolved,
+    ///    or a CloseSlab tombstone. Otherwise `MarketNotTerminal` (30).
+    /// 2. If `amount > 0` (Resolved only): CPI wrapper tag 41 for `amount`, with
+    ///    `vault_auth` as the authority and `pool.vault` as the ONLY destination.
+    ///    The pool vault must grow by exactly `amount`, or the call fails `CpiFailed` (15).
+    /// 3. If account 9 is passed: sweep it (any token account of the pool mint
+    ///    owned by `vault_auth`, other than `pool.vault`) into `pool.vault`.
+    ///    Wrapper tag 41 is itself permissionless, and anyone can point it at such
+    ///    an account, so this is the undo for a griefed payout.
+    /// 4. Book the vault surplus: first the wrapper-attributable tag-87 fees
+    ///    (the normal `AccrueFees` path, Resolved only), then the rest by
+    ///    `StakePool::book_terminal_recovery`. Up to `wrapper_recoverable()` is
+    ///    booked as returned principal (as tag 23 does), and the remainder as fees
+    ///    when real LP holders exist. Booking the surplus rather than this call's
+    ///    own delta means a direct wrapper tag-41 push into `pool.vault` by a third
+    ///    party is still credited to stakers.
+    /// 5. Set the pool's `market_resolved` flag (blocks deposits and flushes).
+    ///
+    /// Refused with `NothingToRecover` (31) if no tokens moved and nothing was
+    /// booked. Deposits into a pool whose wrapper market is Resolved are refused
+    /// with `MarketResolved` (8), so nobody can buy in just before step 4.
+    ///
+    /// `amount` = 0 is legal: it books a surplus someone else already pushed, or
+    /// sweeps account 9, and it also works after `CloseSlab`.
+    ///
+    /// Accounts:
+    ///   0. `[]` Caller (permissionless — no signer check)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Pool vault token account (the only destination; must equal pool.vault)
+    ///   3. `[]` Vault authority PDA (the insurance_authority; signs via invoke_signed)
+    ///   4. `[writable]` Wrapper market account (pool.slab)
+    ///   5. `[writable]` Wrapper vault token account (canonical ATA; source)
+    ///   6. `[]` Wrapper vault authority PDA (`[b"vault", market]` under the wrapper)
+    ///   7. `[]` Token program
+    ///   8. `[]` Percolator program (must equal pool.percolator_program)
+    ///   9. `[writable]` OPTIONAL stray token account to sweep (owner = vault_auth, mint = pool mint)
+    RecoverTerminalInsurance { amount: u64 },
+
+    /// 30: AdminCloseSlab — F-9. CPI proxy for the wrapper's CloseSlab (tag 13).
+    ///
+    /// `InitPool` rotates `cfg.marketauth` to the pool PDA. Wrapper CloseSlab
+    /// requires the marketauth as SIGNER and as the OWNER of its `dest_token`, so
+    /// without this proxy no key could ever retire a stake-owned market, even
+    /// once `RecoverTerminalInsurance` has emptied its insurance budget.
+    ///
+    /// The pool PDA signs via `invoke_signed` (`[b"stake_pool", slab, bump]`).
+    /// CloseSlab's primary sweep lands in account 5 (a token account owned by the
+    /// pool PDA). This instruction moves it into `pool.vault` and books it
+    /// (`StakePool::book_terminal_recovery`). The slab and vault-account rent
+    /// refunds that the wrapper pays to the pool PDA are forwarded to the admin
+    /// signer. It sets the pool's `market_resolved` flag.
+    ///
+    /// P1 wrapper note: CloseSlab may re-book orphaned fee legs, or advance its
+    /// windowed terminal scan, and return Ok WITHOUT closing. Call this again
+    /// (after claiming any re-booked protocol leg) until the market is a tombstone.
+    ///
+    /// AUTHORITY: `pool.admin` (irreversible action; mirrors `AdminResolveMarket`).
+    /// Requires the wrapper market to be Resolved (`MarketNotTerminal`, 30). A market
+    /// with a secondary collateral mint is not supported.
+    ///
+    /// Accounts:
+    ///   0. `[signer, writable]` Admin (must equal pool.admin; receives the rent refund)
+    ///   1. `[writable]` Pool PDA (the marketauth; signs the CPI)
+    ///   2. `[writable]` Wrapper market (pool.slab)
+    ///   3. `[writable]` Wrapper vault token account
+    ///   4. `[]` Wrapper vault authority PDA
+    ///   5. `[writable]` Token account of the pool mint OWNED BY THE POOL PDA (CloseSlab dest)
+    ///   6. `[]` Token program
+    ///   7. `[writable]` Collateral mint (read by CloseSlab only when it burns residue)
+    ///   8. `[writable]` Pool vault token account (the sweep destination)
+    ///   9. `[]` Percolator program (must equal pool.percolator_program)
+    AdminCloseSlab,
+
     /// 4: Admin updates pool configuration.
     ///
     /// Accounts:
@@ -455,6 +541,13 @@ pub enum StakeInstruction {
     /// new wrapper wire to byte-match, no new account shape to validate) and
     /// makes the stranding scenario structurally unreachable rather than merely
     /// recoverable.
+    ///
+    /// F-9 UPDATE: "structurally unreachable" held only for THIS resolution path.
+    /// `ResolveStalePermissionless` resolves a bound market without passing any
+    /// stake gate, and a bound market's liquidation-fee / top-up insurance budget
+    /// has no Live exit at all. `RecoverTerminalInsurance` (tag 29) is now that
+    /// terminal fallback CPI (wrapper tag 41). This gate is kept as the preferred
+    /// path, because recovering while Live keeps the tranche accounting simplest.
     ///
     /// The gate is deliberately measured against `total_recovered_from_wrapper`,
     /// a counter incremented ONLY inside `process_recover_flushed_insurance`
@@ -742,6 +835,23 @@ impl StakeInstruction {
                 );
                 Ok(Self::RecoverFlushedInsurance { amount })
             }
+            30 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::AdminCloseSlab)
+            }
+            29 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::RecoverTerminalInsurance { amount })
+            }
             10 => {
                 if rest.len() != 8 {
                     return Err(ProgramError::InvalidInstructionData);
@@ -918,6 +1028,35 @@ impl StakeInstruction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unpack_admin_close_slab_f9() {
+        assert!(matches!(
+            StakeInstruction::unpack(&[30u8]).unwrap(),
+            StakeInstruction::AdminCloseSlab
+        ));
+        assert!(StakeInstruction::unpack(&[30u8, 0]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_recover_terminal_insurance_f9() {
+        let mut data = vec![29u8];
+        data.extend_from_slice(&5_000_000u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::RecoverTerminalInsurance { amount } => assert_eq!(amount, 5_000_000),
+            _ => panic!("wrong variant"),
+        }
+        // amount = 0 is legal (book / sweep only).
+        let mut zero = vec![29u8];
+        zero.extend_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(
+            StakeInstruction::unpack(&zero).unwrap(),
+            StakeInstruction::RecoverTerminalInsurance { amount: 0 }
+        ));
+        // Exact length only.
+        assert!(StakeInstruction::unpack(&[29u8]).is_err());
+        assert!(StakeInstruction::unpack(&[29u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
 
     #[test]
     fn test_unpack_init_pool() {

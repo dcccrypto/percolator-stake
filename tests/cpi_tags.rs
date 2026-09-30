@@ -814,3 +814,26 @@ fn test_all_nine_cpi_wire_lengths_are_pinned() {
     }
     assert_eq!(lengths.len(), 9, "must cover the full nine-tag enumeration");
 }
+
+/// F-9: wrapper tag 41 `WithdrawInsurance` wire, as sent by
+/// `RecoverTerminalInsurance`. Decode arm in BOTH the deployed wrapper
+/// (deploy/v18.2-wrapper@6377376a) and P1 (feat/p1-safety-release@c0ffaefa):
+/// `41 => Self::WithdrawInsurance { amount: read_u128(&mut rest)? }`, then the
+/// decoder rejects any trailing byte. So: tag(1) + amount(16, u128 LE) = 17 bytes.
+#[test]
+fn test_cpi_tag41_withdraw_insurance_terminal_wire_17_bytes() {
+    let amount: u64 = 5_000_000;
+    let data = percolator_stake::cpi::build_withdraw_insurance_data(amount);
+    assert_eq!(data.len(), 17);
+    assert_eq!(data[0], 41);
+    assert_eq!(
+        u128::from_le_bytes(data[1..17].try_into().unwrap()),
+        amount as u128
+    );
+    // u64::MAX widens losslessly into the u128 field.
+    let max = percolator_stake::cpi::build_withdraw_insurance_data(u64::MAX);
+    assert_eq!(
+        u128::from_le_bytes(max[1..17].try_into().unwrap()),
+        u64::MAX as u128
+    );
+}

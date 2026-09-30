@@ -508,9 +508,67 @@ pub fn has_real_lp_holders(total_lp_supply: u64) -> bool {
     total_lp_supply > crate::state::MINIMUM_LIQUIDITY
 }
 
+/// F-9 — split a terminal vault surplus into `(to_returned, to_fees)`.
+///
+/// - `to_returned = min(surplus, wrapper_recoverable)`: stakers' own flushed
+///   principal, booked like a tag-23 recovery.
+/// - `to_fees = surplus - to_returned` when real LP holders exist, else 0 (F3: it
+///   stays in the vault unbooked rather than going to the dead shares).
+///
+/// Always `to_returned + to_fees <= surplus` and `to_returned <= wrapper_recoverable`,
+/// with equality to `surplus` whenever `real_holders`. Kani:
+/// `kani_f9_terminal_split_conserves_surplus`.
+pub fn terminal_recovery_split(
+    surplus: u64,
+    wrapper_recoverable: u64,
+    real_holders: bool,
+) -> (u64, u64) {
+    let to_returned = surplus.min(wrapper_recoverable);
+    // Cannot underflow: to_returned <= surplus by construction.
+    let rest = surplus.saturating_sub(to_returned);
+    let to_fees = if real_holders { rest } else { 0 };
+    (to_returned, to_fees)
+}
+
+/// F-9 — CPI conservation check for the terminal `WithdrawInsurance` (tag 41)
+/// CPI. The pool vault must have grown by EXACTLY the requested amount: the wrapper
+/// released `requested` atoms, and all of them landed in `pool.vault`. Any other
+/// delta (short, long, or a balance that went down) fails closed.
+pub fn terminal_cpi_delta_ok(before: u64, after: u64, requested: u64) -> bool {
+    after.checked_sub(before) == Some(requested)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── F-9: terminal insurance recovery split / CPI delta ──
+
+    #[test]
+    fn test_f9_terminal_split() {
+        // All principal: surplus fits inside what stakers flushed.
+        assert_eq!(terminal_recovery_split(300, 500, true), (300, 0));
+        // Principal first, remainder is fees.
+        assert_eq!(terminal_recovery_split(800, 500, true), (500, 300));
+        // Nothing flushed: all fees.
+        assert_eq!(terminal_recovery_split(5_000_000, 0, true), (0, 5_000_000));
+        // Dead shares only: principal still booked, fee remainder left unbooked.
+        assert_eq!(terminal_recovery_split(800, 500, false), (500, 0));
+        assert_eq!(terminal_recovery_split(0, 500, true), (0, 0));
+        assert_eq!(
+            terminal_recovery_split(u64::MAX, u64::MAX, true),
+            (u64::MAX, 0)
+        );
+    }
+
+    #[test]
+    fn test_f9_terminal_cpi_delta() {
+        assert!(terminal_cpi_delta_ok(10, 15, 5));
+        assert!(!terminal_cpi_delta_ok(10, 14, 5), "short delivery");
+        assert!(!terminal_cpi_delta_ok(10, 16, 5), "over delivery");
+        assert!(!terminal_cpi_delta_ok(10, 9, 0), "balance went down");
+        assert!(terminal_cpi_delta_ok(0, u64::MAX, u64::MAX));
+    }
 
     // ── F3: dead-share-only accrual guard ──
 
