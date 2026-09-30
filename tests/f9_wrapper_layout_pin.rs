@@ -11,7 +11,9 @@
 //!
 //! Which .so files: `F9_WRAPPER_SOS` (colon-separated paths). If it is unset, the
 //! sibling `../percolator-prog/target/deploy/percolator_prog.so` is used (the CI
-//! checkout). With `F9_REQUIRE_PINNED_SHA=1`, each .so must also be one of
+//! checkout). A build with a VERSION other than 18 (e.g. the v17 CI sibling
+//! 15eb8b0c) is not pinned; for it the test asserts only that the guard fails
+//! closed (UnknownLayout). With `F9_REQUIRE_PINNED_SHA=1`, each .so must also be one of
 //! `PINNED_WRAPPERS` below: that is the "every build we ship against" gate. A new
 //! wrapper build must be added there only after this test passes on it.
 //!
@@ -201,12 +203,29 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
         .unwrap_or_else(|e| panic!("{}: InitMarket: {e}", so.display()));
 
         let live = svm.get_account(&market).unwrap().data;
-        assert_eq!(
-            u16::from_le_bytes([live[8], live[9]]),
-            WRAPPER_SUPPORTED_VERSION,
-            "{}: VERSION",
-            so.display()
-        );
+        let version = u16::from_le_bytes([live[8], live[9]]);
+        if version != WRAPPER_SUPPORTED_VERSION {
+            // Not the pinned layout (e.g. the v17 CI sibling 15eb8b0c, VERSION 17).
+            // The pin below does not apply; what MUST hold is that the guard fails
+            // closed on it, so no stake instruction trusts byte 1218 there.
+            assert!(
+                !require_pinned,
+                "{}: VERSION {version} under F9_REQUIRE_PINNED_SHA=1",
+                so.display()
+            );
+            assert_eq!(
+                read_wrapper_terminal(&live),
+                WrapperTerminal::UnknownLayout,
+                "{}: VERSION {version} must be refused, not classified",
+                so.display()
+            );
+            eprintln!(
+                "NOTE {}: VERSION {version} != {WRAPPER_SUPPORTED_VERSION}; guard fails closed (UnknownLayout); offset pin not applicable",
+                so.display()
+            );
+            ran += 1;
+            continue;
+        }
         assert!(
             live.len() >= WRAPPER_MIN_MARKET_LEN,
             "{}: market len {}",
