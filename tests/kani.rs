@@ -1147,4 +1147,29 @@ mod kani_proofs {
         assert!(p.junior_balance() <= v1, "M-2 invariant kept");
         kani::cover!(jbal > 0 && released > 0 && p.junior_balance() > jbal, "junior share of the recovered fees credited");
     }
+
+    /// D-ST-04s (Sentinel 2026-09-30): small-width twin of `proof_deposit_withdraw_no_inflation`
+    /// (whose recorded "FAIL" was a CBMC SIGTERM kill, not a counterexample). Same property on the
+    /// REAL `calc_lp_for_deposit` / `calc_collateral_for_withdraw` (N7 virtual offsets included),
+    /// u8 inputs, no silent returns on the minted path (covers name every branch). Full width is
+    /// L-DIL-VIRT (paper: m(P+V_A) <= d(S+V_S) by the floor, hence the round trip never gains).
+    #[kani::proof]
+    #[kani::solver(kissat)]
+    fn kani_design_st04s_deposit_withdraw_no_inflation_u8() {
+        let lp_supply: u8 = kani::any();
+        let pv: u8 = kani::any();
+        let deposit: u8 = kani::any();
+        kani::assume(deposit > 0 && lp_supply > 0 && pv > 0);
+        let (s, p, d) = (lp_supply as u64, pv as u64, deposit as u64);
+        let minted = calc_lp_for_deposit(s, p, d);
+        kani::cover!(matches!(minted, Some(0)), "dust deposit mints nothing");
+        let Some(m) = minted else { panic!("u8 inputs cannot overflow or hit a blocked branch") };
+        if m == 0 {
+            return;
+        }
+        let back = calc_collateral_for_withdraw(s + m, p + d, m).expect("u8 inputs cannot overflow");
+        assert!(back <= d, "round trip never returns more than deposited");
+        kani::cover!(back < d, "round trip loses dust to the pool");
+        kani::cover!(back == d, "exact round trip");
+    }
 }
