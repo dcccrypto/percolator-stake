@@ -22,7 +22,8 @@
 //!   feat/p1-safety-release@c0ffaefa sha256 c4f63d15664a5b2fee77d20100e529c40398dabe36251b2840f7b06f624c0e28 (current P1)
 //!   feat/p3-vault-owned-lp@ee29b5ac sha256 608d3f8cd98a03259ef1413c5e22c31e33d3d4b6d3e54669503c0f079aa91e96 (P1+P3 FINAL, program = 267a9017; superseded)
 //!   feat/p3-vault-owned-lp@07a1d0eb sha256 8410a5d7e85528bd8ac4a32c3ca5b0c6aa5c6a7ced3499855c252286005c71cc (P1+P3 FINAL; superseded)
-//!   feat/p3-vault-owned-lp@58e379f1 sha256 f1a1dfc3ff7e86ffea53394295c8e587f3309e9bda6dd3d9ce6bfcc68e07b21e (P1+P3 FINAL relaunch, engine 35ddd692, `--features devnet`)
+//!   feat/p3-vault-owned-lp@58e379f1 sha256 f1a1dfc3ff7e86ffea53394295c8e587f3309e9bda6dd3d9ce6bfcc68e07b21e (P1+P3 FINAL; superseded)
+//!   feat/p3-vault-owned-lp@39b138c8 sha256 e92e204b419dbe477961baefd1cdb037592fab9402cb9389bb0d96ef1e12bc92 (P1+P3 FINAL relaunch, `--features devnet`)
 
 #![allow(clippy::result_large_err)]
 
@@ -60,7 +61,11 @@ const PINNED_WRAPPERS: &[(&str, &str)] = &[
     ),
     (
         "f1a1dfc3ff7e86ffea53394295c8e587f3309e9bda6dd3d9ce6bfcc68e07b21e",
-        "feat/p3-vault-owned-lp@58e379f1 (P1+P3 FINAL relaunch, --features devnet)",
+        "feat/p3-vault-owned-lp@58e379f1 (P1+P3 FINAL, superseded by 39b138c8)",
+    ),
+    (
+        "e92e204b419dbe477961baefd1cdb037592fab9402cb9389bb0d96ef1e12bc92",
+        "feat/p3-vault-owned-lp@39b138c8 (P1+P3 FINAL relaunch, --features devnet)",
     ),
 ];
 
