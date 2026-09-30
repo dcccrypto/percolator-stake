@@ -61,6 +61,7 @@ const E_UNAUTHORIZED: u32 = 2;
 const E_INVALID_ACCOUNT: u32 = 16;
 const E_MARKET_NOT_TERMINAL: u32 = 30;
 const E_NOTHING_TO_RECOVER: u32 = 31;
+const E_UNSUPPORTED_WRAPPER_LAYOUT: u32 = 32;
 // Wrapper EngineLockActive.
 const W_ENGINE_LOCK_ACTIVE: u32 = 21;
 
@@ -1009,4 +1010,65 @@ fn f9_dead_shares_only_budget_leaves_wrapper_but_is_not_booked() {
     let r = admin_close_slab(&mut w, &admin);
     assert!(r.is_ok(), "{}", logs(&r));
     assert_eq!(terminal(&w.svm, &w.market), WrapperTerminal::Closed);
+}
+
+/// Security INFO (layout guard): on a Resolved market whose header VERSION reads
+/// 17 instead of the pinned 18, the mode byte at 1218 proves nothing. Tag 29, tag 30
+/// and Deposit must all refuse with UnsupportedWrapperLayout (32), and nothing may
+/// move. Restoring VERSION 18 makes tag 29 work again (the refusal came from the
+/// guard, not from the market). The VERSION flip is the only forged byte.
+/// NEGATIVE CONTROL: drop the version check in `read_wrapper_terminal` and this
+/// test fails (tag 29 succeeds on the version-17 header).
+#[test]
+fn f9_unpinned_wrapper_layout_is_refused() {
+    let Some(mut w) = world("f9_unpinned_wrapper_layout_is_refused") else {
+        return;
+    };
+    admin_resolve(&mut w);
+    let set_version = |w: &mut World, v: u16| {
+        let mut a = w.svm.get_account(&w.market).unwrap();
+        a.data[8..10].copy_from_slice(&v.to_le_bytes());
+        w.svm.set_account(w.market, a).unwrap();
+    };
+    set_version(&mut w, 17);
+    assert_eq!(terminal(&w.svm, &w.market), WrapperTerminal::UnknownLayout);
+    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
+    assert_eq!(
+        custom(&r),
+        Some(E_UNSUPPORTED_WRAPPER_LAYOUT),
+        "tag 29: {}",
+        logs(&r)
+    );
+    let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
+    assert_eq!(
+        custom(&r),
+        Some(E_UNSUPPORTED_WRAPPER_LAYOUT),
+        "tag 29 (0): {}",
+        logs(&r)
+    );
+    let admin = w.admin.insecure_clone();
+    let r = admin_close_slab(&mut w, &admin);
+    assert_eq!(
+        custom(&r),
+        Some(E_UNSUPPORTED_WRAPPER_LAYOUT),
+        "tag 30: {}",
+        logs(&r)
+    );
+    let s = new_staker(&mut w, STAKE);
+    let r = deposit_as(&mut w, &s, STAKE);
+    assert_eq!(
+        custom(&r),
+        Some(E_UNSUPPORTED_WRAPPER_LAYOUT),
+        "deposit: {}",
+        logs(&r)
+    );
+    assert_eq!(
+        token_amount(&w.svm, &w.wrapper_vault),
+        BUDGET,
+        "nothing moved"
+    );
+    assert_eq!(token_amount(&w.svm, &w.vault), STAKE, "nothing moved");
+    set_version(&mut w, 18);
+    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
+    assert!(r.is_ok(), "control: pinned layout works: {}", logs(&r));
 }

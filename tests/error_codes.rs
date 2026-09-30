@@ -121,3 +121,14 @@ fn test_f9_terminal_recovery_codes_are_30_and_31() {
     assert!(percolator_stake::error::error_hint(30).starts_with("Market not terminal"));
     assert!(percolator_stake::error::error_hint(31).starts_with("Nothing to recover"));
 }
+
+/// F-9 security INFO: UnsupportedWrapperLayout is appended as 32.
+#[test]
+fn test_f9_unsupported_wrapper_layout_code_is_32() {
+    assert_eq!(StakeError::UnsupportedWrapperLayout as u32, 32);
+    assert_eq!(
+        ProgramError::from(StakeError::UnsupportedWrapperLayout),
+        ProgramError::Custom(32)
+    );
+    assert!(percolator_stake::error::error_hint(32).starts_with("Unsupported wrapper layout"));
+}

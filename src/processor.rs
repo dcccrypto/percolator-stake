@@ -3777,6 +3777,10 @@ fn process_recover_terminal_insurance(
     // TERMINAL GATE. Booking a raw vault surplus is only safe once the market can
     // no longer take deposits or flushes (see `StakePool::book_terminal_recovery`).
     let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
+    if terminal == state::WrapperTerminal::UnknownLayout {
+        msg!("RecoverTerminalInsurance: wrapper market is not the pinned layout (VERSION 18)");
+        return Err(StakeError::UnsupportedWrapperLayout.into());
+    }
     if terminal == state::WrapperTerminal::NotTerminal {
         msg!("RecoverTerminalInsurance: wrapper market is not Resolved or closed");
         return Err(StakeError::MarketNotTerminal.into());
@@ -3986,8 +3990,12 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
             return Err(StakeError::InvalidAccount.into());
         }
     }
-    if state::read_wrapper_terminal(&market.try_borrow_data()?) != state::WrapperTerminal::Resolved
-    {
+    let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
+    if terminal == state::WrapperTerminal::UnknownLayout {
+        msg!("AdminCloseSlab: wrapper market is not the pinned layout (VERSION 18)");
+        return Err(StakeError::UnsupportedWrapperLayout.into());
+    }
+    if terminal != state::WrapperTerminal::Resolved {
         msg!("AdminCloseSlab: the wrapper market must be Resolved");
         return Err(StakeError::MarketNotTerminal.into());
     }
@@ -4091,6 +4099,10 @@ fn reject_deposit_into_terminal_market(
     if let Some(slab) = fee_slab {
         if slab.key.to_bytes() == pool.slab && slab.owner.to_bytes() == pool.percolator_program {
             let terminal = state::read_wrapper_terminal(&slab.try_borrow_data()?);
+            if terminal == state::WrapperTerminal::UnknownLayout {
+                msg!("Deposit refused: the bound wrapper market is not the pinned layout (F-9)");
+                return Err(StakeError::UnsupportedWrapperLayout.into());
+            }
             if terminal != state::WrapperTerminal::NotTerminal {
                 msg!("Deposit refused: the bound wrapper market is resolved (F-9)");
                 return Err(StakeError::MarketResolved.into());

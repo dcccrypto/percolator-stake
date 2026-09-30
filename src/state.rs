@@ -1033,41 +1033,61 @@ pub fn read_wrapper_insurance_reserve_withdrawn(data: &[u8]) -> Option<u128> {
 // ════════════════════════════════════════════════════════════════════════════
 pub const WRAPPER_KIND_CLOSED_MARKET: u8 = 8;
 pub const WRAPPER_HEADER_LEN: usize = 16;
+pub const WRAPPER_OFF_VERSION: usize = 8;
+/// The only wrapper account VERSION whose engine header this program has pinned
+/// (`constants::VERSION` in deploy/v18.2-wrapper@6377376a AND P1 c0ffaefa).
+pub const WRAPPER_SUPPORTED_VERSION: u16 = 18;
+/// `MIN_MARKET_ACCOUNT_LEN = MARKET_GROUP_OFF (592) + MARKET_GROUP_LEN (758)` on
+/// the pinned layout. A market account shorter than this cannot hold the engine
+/// header, so the mode byte at [`WRAPPER_OFF_MODE`] is not trusted.
+pub const WRAPPER_MIN_MARKET_LEN: usize = 592 + 758;
 pub const WRAPPER_OFF_MODE: usize = 592 + 626;
+pub const WRAPPER_MODE_LIVE: u8 = 0;
 pub const WRAPPER_MODE_RESOLVED: u8 = 1;
+pub const WRAPPER_MODE_RECOVERY: u8 = 2;
 
 /// Terminal state of a wrapper market account, read from raw bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrapperTerminal {
-    /// A live market account (any mode other than Resolved), or not a wrapper
-    /// market at all.
+    /// A pinned-layout market in Live or Recovery mode.
     NotTerminal,
-    /// A market account whose engine mode is Resolved.
+    /// A pinned-layout market whose engine mode is Resolved.
     Resolved,
-    /// A CloseSlab tombstone.
+    /// A pinned-layout CloseSlab tombstone (exactly `WRAPPER_HEADER_LEN` bytes).
     Closed,
+    /// Anything this program has NOT pinned: wrong magic, a VERSION other than
+    /// [`WRAPPER_SUPPORTED_VERSION`], an unknown kind, a market shorter than
+    /// [`WRAPPER_MIN_MARKET_LEN`], a tombstone of the wrong length, or a mode byte
+    /// outside {0, 1, 2}. Callers REFUSE (`UnsupportedWrapperLayout`, 32): on an
+    /// unpinned layout, byte 1218 is not known to be the mode, so it proves nothing.
+    UnknownLayout,
 }
 
 /// F-9: classify a wrapper market account. The caller must already have checked
 /// the account's key (== `pool.slab`) and owner (== `pool.percolator_program`).
+/// Fails closed: only the exact pinned layout (magic, VERSION 18, kind, length)
+/// is ever classified; everything else is `UnknownLayout`.
 pub fn read_wrapper_terminal(data: &[u8]) -> WrapperTerminal {
     if data.len() < WRAPPER_HEADER_LEN {
-        return WrapperTerminal::NotTerminal;
+        return WrapperTerminal::UnknownLayout;
     }
-    let magic = match data[0..8].try_into() {
-        Ok(b) => u64::from_le_bytes(b),
-        Err(_) => return WrapperTerminal::NotTerminal,
-    };
-    if magic != WRAPPER_MAGIC {
-        return WrapperTerminal::NotTerminal;
+    let magic = u64::from_le_bytes([
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ]);
+    let version = u16::from_le_bytes([data[WRAPPER_OFF_VERSION], data[WRAPPER_OFF_VERSION + 1]]);
+    if magic != WRAPPER_MAGIC || version != WRAPPER_SUPPORTED_VERSION {
+        return WrapperTerminal::UnknownLayout;
     }
     match data[WRAPPER_OFF_KIND] {
-        WRAPPER_KIND_CLOSED_MARKET => WrapperTerminal::Closed,
-        WRAPPER_KIND_MARKET => match data.get(WRAPPER_OFF_MODE) {
-            Some(&WRAPPER_MODE_RESOLVED) => WrapperTerminal::Resolved,
-            _ => WrapperTerminal::NotTerminal,
-        },
-        _ => WrapperTerminal::NotTerminal,
+        WRAPPER_KIND_CLOSED_MARKET if data.len() == WRAPPER_HEADER_LEN => WrapperTerminal::Closed,
+        WRAPPER_KIND_MARKET if data.len() >= WRAPPER_MIN_MARKET_LEN => {
+            match data[WRAPPER_OFF_MODE] {
+                WRAPPER_MODE_RESOLVED => WrapperTerminal::Resolved,
+                WRAPPER_MODE_LIVE | WRAPPER_MODE_RECOVERY => WrapperTerminal::NotTerminal,
+                _ => WrapperTerminal::UnknownLayout,
+            }
+        }
+        _ => WrapperTerminal::UnknownLayout,
     }
 }
 
@@ -1108,43 +1128,104 @@ mod tests {
     fn wrapper_market_with_mode(mode: u8) -> Vec<u8> {
         let mut d = vec![0u8; 3675];
         d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
+        d[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
         d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
         d[WRAPPER_OFF_MODE] = mode;
         d
     }
 
+    fn tombstone() -> Vec<u8> {
+        let mut t = vec![0u8; WRAPPER_HEADER_LEN];
+        t[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
+        t[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
+        t[WRAPPER_OFF_KIND] = WRAPPER_KIND_CLOSED_MARKET;
+        t
+    }
+
     #[test]
     fn test_f9_read_wrapper_terminal() {
+        use WrapperTerminal::*;
         assert_eq!(WRAPPER_OFF_MODE, 1218);
+        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1350);
         assert_eq!(
             read_wrapper_terminal(&wrapper_market_with_mode(0)),
-            WrapperTerminal::NotTerminal
+            NotTerminal
         );
         assert_eq!(
             read_wrapper_terminal(&wrapper_market_with_mode(1)),
-            WrapperTerminal::Resolved
+            Resolved
         );
-        // Recovery (2) is not terminal.
         assert_eq!(
             read_wrapper_terminal(&wrapper_market_with_mode(2)),
-            WrapperTerminal::NotTerminal
+            NotTerminal
         );
-        // Tombstone: 16-byte header, kind 8.
-        let mut t = vec![0u8; WRAPPER_HEADER_LEN];
-        t[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
-        t[WRAPPER_OFF_KIND] = WRAPPER_KIND_CLOSED_MARKET;
-        assert_eq!(read_wrapper_terminal(&t), WrapperTerminal::Closed);
-        // Wrong magic is never terminal, whatever the bytes say.
-        let mut bad = wrapper_market_with_mode(1);
-        bad[0] ^= 0xff;
-        assert_eq!(read_wrapper_terminal(&bad), WrapperTerminal::NotTerminal);
-        let mut badt = t.clone();
-        badt[0] ^= 0xff;
-        assert_eq!(read_wrapper_terminal(&badt), WrapperTerminal::NotTerminal);
-        // Truncated market (mode byte absent) is not terminal.
-        let short = wrapper_market_with_mode(1)[..WRAPPER_OFF_MODE].to_vec();
-        assert_eq!(read_wrapper_terminal(&short), WrapperTerminal::NotTerminal);
-        assert_eq!(read_wrapper_terminal(&[]), WrapperTerminal::NotTerminal);
+        assert_eq!(read_wrapper_terminal(&tombstone()), Closed);
+        // Exactly the minimum market length is accepted.
+        let min = wrapper_market_with_mode(1)[..WRAPPER_MIN_MARKET_LEN].to_vec();
+        assert_eq!(read_wrapper_terminal(&min), Resolved);
+    }
+
+    /// Security INFO: every unpinned shape fails CLOSED (UnknownLayout), never
+    /// NotTerminal (which would let a deposit through) and never Resolved.
+    #[test]
+    fn test_f9_read_wrapper_terminal_fails_closed_on_unpinned_layout() {
+        use WrapperTerminal::*;
+        // Wrong magic (market and tombstone).
+        let mut m = wrapper_market_with_mode(1);
+        m[0] ^= 0xff;
+        assert_eq!(read_wrapper_terminal(&m), UnknownLayout);
+        let mut t = tombstone();
+        t[0] ^= 0xff;
+        assert_eq!(read_wrapper_terminal(&t), UnknownLayout);
+        // Any other VERSION: 17 (v17 layout, mode elsewhere), 19 (future), 0.
+        for v in [0u16, 17, 19, u16::MAX] {
+            let mut m = wrapper_market_with_mode(1);
+            m[8..10].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(
+                read_wrapper_terminal(&m),
+                UnknownLayout,
+                "market version {v}"
+            );
+            let mut m0 = wrapper_market_with_mode(0);
+            m0[8..10].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(
+                read_wrapper_terminal(&m0),
+                UnknownLayout,
+                "live market version {v}"
+            );
+            let mut t = tombstone();
+            t[8..10].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(
+                read_wrapper_terminal(&t),
+                UnknownLayout,
+                "tombstone version {v}"
+            );
+        }
+        // Market too short to hold the engine header (mode byte present or not).
+        let short = wrapper_market_with_mode(1)[..WRAPPER_MIN_MARKET_LEN - 1].to_vec();
+        assert_eq!(read_wrapper_terminal(&short), UnknownLayout);
+        let shorter = wrapper_market_with_mode(1)[..WRAPPER_OFF_MODE].to_vec();
+        assert_eq!(read_wrapper_terminal(&shorter), UnknownLayout);
+        // Tombstone of the wrong length.
+        let mut long_t = tombstone();
+        long_t.push(0);
+        assert_eq!(read_wrapper_terminal(&long_t), UnknownLayout);
+        // Unknown mode value.
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(3)),
+            UnknownLayout
+        );
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(0xff)),
+            UnknownLayout
+        );
+        // Unknown kind.
+        let mut k = wrapper_market_with_mode(1);
+        k[WRAPPER_OFF_KIND] = 5; // upstream's KIND_CLOSED_MARKET, not ours
+        assert_eq!(read_wrapper_terminal(&k), UnknownLayout);
+        // Empty / sub-header.
+        assert_eq!(read_wrapper_terminal(&[]), UnknownLayout);
+        assert_eq!(read_wrapper_terminal(&[0u8; 15]), UnknownLayout);
     }
 
     fn f9_pool(deposited: u64, flushed: u64, lp: u64) -> StakePool {
