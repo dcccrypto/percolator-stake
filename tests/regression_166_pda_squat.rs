@@ -230,8 +230,14 @@ fn inject_pool(
     // #290: a mode-0 Deposit reads the wrapper's tag-87 counter from `pool.slab`,
     // which must be owned by `pool.percolator_program` (zeroed here => the System
     // program id) and carry the wrapper market header. Counter = 0.
-    let mut slab_data = vec![0u8; 592];
+    // F-9 layout guard: Deposit now also classifies this account's header, and
+    // refuses anything but the pinned wrapper layout (VERSION 18, at least
+    // WRAPPER_MIN_MARKET_LEN bytes). So the synthetic market carries VERSION 18 and the
+    // minimum length, with mode byte 0 (Live). The #290 counter is unaffected.
+    let mut slab_data = vec![0u8; percolator_stake::state::WRAPPER_MIN_MARKET_LEN];
     slab_data[0..8].copy_from_slice(&percolator_stake::state::WRAPPER_MAGIC.to_le_bytes());
+    slab_data[8..10]
+        .copy_from_slice(&percolator_stake::state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
     slab_data[percolator_stake::state::WRAPPER_OFF_KIND] =
         percolator_stake::state::WRAPPER_KIND_MARKET;
     svm.set_account(

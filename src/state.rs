@@ -591,6 +591,119 @@ impl StakePool {
         self.wrapper_recoverable() == 0
     }
 
+    /// Book `fee_delta` atoms into pool value as earned fees, split between the
+    /// junior and senior tranches exactly as `AccrueFees` does (PERC-303).
+    ///
+    /// Moved here from `processor::accrue_fees_inner` unchanged, so that the
+    /// F-9 terminal recovery (`book_terminal_recovery`) and fee accrual share one
+    /// booking path. The caller decides WHETHER to book; this only books. It writes
+    /// nothing when `fee_delta == 0`.
+    pub fn book_fee_delta(&mut self, fee_delta: u64) -> Result<(), crate::error::StakeError> {
+        use crate::error::StakeError;
+        if fee_delta == 0 {
+            return Ok(());
+        }
+        // Snapshot pre-fee tranche balances BEFORE incrementing total_fees_earned.
+        // senior_balance() derives from total_pool_value() which includes
+        // total_fees_earned, so reading it post-increment would inflate the senior
+        // weight in distribute_fees and systematically shortchange the junior tranche.
+        let distribute_to_junior = self.tranche_enabled() && self.junior_total_lp() > 0;
+        let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
+            (
+                self.junior_balance(),
+                self.senior_balance().ok_or(StakeError::Overflow)?,
+            )
+        } else {
+            (0, 0)
+        };
+
+        self.total_fees_earned = self
+            .total_fees_earned
+            .checked_add(fee_delta)
+            .ok_or(StakeError::Overflow)?;
+
+        // PERC-303: distribute the fee delta between junior/senior sub-pools using the
+        // junior fee multiplier. Senior implicitly receives the remainder since
+        // senior_balance = total_pool_value() - junior_balance and total_fees_earned
+        // was already incremented by the full fee_delta above.
+        if distribute_to_junior {
+            let (junior_fee, _) = crate::math::distribute_fees(
+                snapshot_junior_bal,
+                snapshot_senior_bal,
+                self.junior_fee_mult_bps(),
+                fee_delta,
+            );
+            self.set_junior_balance(
+                self.junior_balance()
+                    .checked_add(junior_fee)
+                    .ok_or(StakeError::Overflow)?,
+            );
+            // M-2: guard — reject accrual if it would push junior_balance above pool value.
+            let pv = self.total_pool_value().ok_or(StakeError::Overflow)?;
+            if self.junior_balance() > pv {
+                return Err(StakeError::Overflow);
+            }
+        }
+        Ok(())
+    }
+
+    /// F-9: book the vault surplus of a pool whose wrapper market is TERMINAL
+    /// (Resolved, or closed to a tombstone), after the wrapper's terminal
+    /// `WithdrawInsurance` (tag 41) has paid the market's insurance budget into
+    /// `pool.vault`.
+    ///
+    /// `surplus = vault_balance - total_pool_value()` is split by
+    /// [`crate::math::terminal_recovery_split`]:
+    ///
+    /// - `to_returned = min(surplus, wrapper_recoverable())` is booked exactly as
+    ///   `RecoverFlushedInsurance` (tag 23) books a recovery: `total_returned` and
+    ///   `total_recovered_from_wrapper` both advance. This is stakers' own flushed
+    ///   principal coming back, so the loss/tranche accounting that tag 23 feeds
+    ///   is reused unchanged.
+    /// - `to_fees` is the rest: insurance budget that stakers never flushed
+    ///   (a creator top-up, liquidation fees, pushes from other sources). It is
+    ///   booked as fees through [`StakePool::book_fee_delta`], and only when real
+    ///   LP holders exist (F3). With only the N7 dead shares it stays in the vault
+    ///   unbooked, exactly as `AccrueFees` would leave it.
+    ///
+    /// WHY THE WHOLE SURPLUS, NOT THE CPI DELTA. Wrapper tag 41 is permissionless
+    /// (W4-PAYOUT): anyone can pay a bound market's terminal budget into
+    /// `pool.vault` directly, without this program. If only this program's own CPI
+    /// delta were booked, a front-runner could push the budget in first and leave
+    /// it unbooked forever. Booking the surplus makes the result independent of who
+    /// moved the tokens. It is safe only because the market is terminal: deposits
+    /// into a resolved market are refused (`process_deposit` / `process_deposit_junior`),
+    /// so a donation can no longer be used to reprice shares against a new depositor.
+    /// The caller must have proved the market terminal before calling this.
+    ///
+    /// Returns `(to_returned, to_fees)`. Afterwards
+    /// `total_pool_value() == old_value + to_returned + to_fees <= vault_balance`.
+    pub fn book_terminal_recovery(
+        &mut self,
+        vault_balance: u64,
+    ) -> Result<(u64, u64), crate::error::StakeError> {
+        use crate::error::StakeError;
+        let pool_value = self.total_pool_value().ok_or(StakeError::Overflow)?;
+        let surplus = vault_balance.saturating_sub(pool_value);
+        let (to_returned, to_fees) = crate::math::terminal_recovery_split(
+            surplus,
+            self.wrapper_recoverable(),
+            crate::math::has_real_lp_holders(self.total_lp_supply),
+        );
+        if to_returned > 0 {
+            self.total_returned = self
+                .total_returned
+                .checked_add(to_returned)
+                .ok_or(StakeError::Overflow)?;
+            self.total_recovered_from_wrapper = self
+                .total_recovered_from_wrapper
+                .checked_add(to_returned)
+                .ok_or(StakeError::Overflow)?;
+        }
+        self.book_fee_delta(to_fees)?;
+        Ok((to_returned, to_fees))
+    }
+
     /// Tranche pools: the largest amount by which a permissionless
     /// `RecoverFlushedInsurance` (tag 23) could raise [`StakePool::senior_balance`]
     /// from the current state. Zero means `senior_balance()` is invariant under every
@@ -898,6 +1011,86 @@ pub fn read_wrapper_insurance_reserve_withdrawn(data: &[u8]) -> Option<u128> {
     ))
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// F-9: WRAPPER MARKET TERMINAL STATE (raw read, same coupling model as #290 above)
+//
+// Terminal insurance recovery (stake tag 29) and the resolved-market deposit gate
+// need to know whether the bound wrapper market is TERMINAL. Two raw shapes are:
+//
+//   * Resolved: kind == KIND_MARKET (1) and the engine header `mode` byte == 1.
+//     `mode` sits at MARKET_GROUP_OFF (592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN
+//     576) + offset_of!(MarketGroupV16HeaderAccount, mode) (626, engine c141d47f)
+//     = 1218. Values: 0 Live, 1 Resolved, 2 Recovery (`decode_market_mode`).
+//     Recovery (2) is NOT terminal and is treated as not-resolved here.
+//   * Closed: kind == KIND_CLOSED_MARKET (8), the tombstone CloseSlab leaves
+//     (`state::write_closed_market_tombstone`). Our fork's value is 8, not the
+//     upstream 5.
+//
+// `tests/f9_terminal_insurance_recovery_e2e.rs` pins the mode offset against the
+// REAL deployed v18.2 wrapper .so (6377376a) and the P1 wrapper .so: byte 1218 is 0
+// while Live and 1 after ResolveMarket. If the engine header moves, that test fails;
+// update the constant here and redeploy together.
+// ════════════════════════════════════════════════════════════════════════════
+pub const WRAPPER_KIND_CLOSED_MARKET: u8 = 8;
+pub const WRAPPER_HEADER_LEN: usize = 16;
+pub const WRAPPER_OFF_VERSION: usize = 8;
+/// The only wrapper account VERSION whose engine header this program has pinned
+/// (`constants::VERSION` in deploy/v18.2-wrapper@6377376a AND P1 c0ffaefa).
+pub const WRAPPER_SUPPORTED_VERSION: u16 = 18;
+/// `MIN_MARKET_ACCOUNT_LEN = MARKET_GROUP_OFF (592) + MARKET_GROUP_LEN (758)` on
+/// the pinned layout. A market account shorter than this cannot hold the engine
+/// header, so the mode byte at [`WRAPPER_OFF_MODE`] is not trusted.
+pub const WRAPPER_MIN_MARKET_LEN: usize = 592 + 758;
+pub const WRAPPER_OFF_MODE: usize = 592 + 626;
+pub const WRAPPER_MODE_LIVE: u8 = 0;
+pub const WRAPPER_MODE_RESOLVED: u8 = 1;
+pub const WRAPPER_MODE_RECOVERY: u8 = 2;
+
+/// Terminal state of a wrapper market account, read from raw bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapperTerminal {
+    /// A pinned-layout market in Live or Recovery mode.
+    NotTerminal,
+    /// A pinned-layout market whose engine mode is Resolved.
+    Resolved,
+    /// A pinned-layout CloseSlab tombstone (exactly `WRAPPER_HEADER_LEN` bytes).
+    Closed,
+    /// Anything this program has NOT pinned: wrong magic, a VERSION other than
+    /// [`WRAPPER_SUPPORTED_VERSION`], an unknown kind, a market shorter than
+    /// [`WRAPPER_MIN_MARKET_LEN`], a tombstone of the wrong length, or a mode byte
+    /// outside {0, 1, 2}. Callers REFUSE (`UnsupportedWrapperLayout`, 32): on an
+    /// unpinned layout, byte 1218 is not known to be the mode, so it proves nothing.
+    UnknownLayout,
+}
+
+/// F-9: classify a wrapper market account. The caller must already have checked
+/// the account's key (== `pool.slab`) and owner (== `pool.percolator_program`).
+/// Fails closed: only the exact pinned layout (magic, VERSION 18, kind, length)
+/// is ever classified; everything else is `UnknownLayout`.
+pub fn read_wrapper_terminal(data: &[u8]) -> WrapperTerminal {
+    if data.len() < WRAPPER_HEADER_LEN {
+        return WrapperTerminal::UnknownLayout;
+    }
+    let magic = u64::from_le_bytes([
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ]);
+    let version = u16::from_le_bytes([data[WRAPPER_OFF_VERSION], data[WRAPPER_OFF_VERSION + 1]]);
+    if magic != WRAPPER_MAGIC || version != WRAPPER_SUPPORTED_VERSION {
+        return WrapperTerminal::UnknownLayout;
+    }
+    match data[WRAPPER_OFF_KIND] {
+        WRAPPER_KIND_CLOSED_MARKET if data.len() == WRAPPER_HEADER_LEN => WrapperTerminal::Closed,
+        WRAPPER_KIND_MARKET if data.len() >= WRAPPER_MIN_MARKET_LEN => {
+            match data[WRAPPER_OFF_MODE] {
+                WRAPPER_MODE_RESOLVED => WrapperTerminal::Resolved,
+                WRAPPER_MODE_LIVE | WRAPPER_MODE_RECOVERY => WrapperTerminal::NotTerminal,
+                _ => WrapperTerminal::UnknownLayout,
+            }
+        }
+        _ => WrapperTerminal::UnknownLayout,
+    }
+}
+
 pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"stake_pool", slab.as_ref()], program_id)
 }
@@ -928,6 +1121,174 @@ mod tests {
         d[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN + 16]
             .copy_from_slice(&counter.to_le_bytes());
         d
+    }
+
+    // ── F-9: wrapper terminal-state reader + terminal booking ──
+
+    fn wrapper_market_with_mode(mode: u8) -> Vec<u8> {
+        let mut d = vec![0u8; 3675];
+        d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
+        d[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
+        d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
+        d[WRAPPER_OFF_MODE] = mode;
+        d
+    }
+
+    fn tombstone() -> Vec<u8> {
+        let mut t = vec![0u8; WRAPPER_HEADER_LEN];
+        t[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
+        t[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
+        t[WRAPPER_OFF_KIND] = WRAPPER_KIND_CLOSED_MARKET;
+        t
+    }
+
+    #[test]
+    fn test_f9_read_wrapper_terminal() {
+        use WrapperTerminal::*;
+        assert_eq!(WRAPPER_OFF_MODE, 1218);
+        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1350);
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(0)),
+            NotTerminal
+        );
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(1)),
+            Resolved
+        );
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(2)),
+            NotTerminal
+        );
+        assert_eq!(read_wrapper_terminal(&tombstone()), Closed);
+        // Exactly the minimum market length is accepted.
+        let min = wrapper_market_with_mode(1)[..WRAPPER_MIN_MARKET_LEN].to_vec();
+        assert_eq!(read_wrapper_terminal(&min), Resolved);
+    }
+
+    /// Security INFO: every unpinned shape fails CLOSED (UnknownLayout), never
+    /// NotTerminal (which would let a deposit through) and never Resolved.
+    #[test]
+    fn test_f9_read_wrapper_terminal_fails_closed_on_unpinned_layout() {
+        use WrapperTerminal::*;
+        // Wrong magic (market and tombstone).
+        let mut m = wrapper_market_with_mode(1);
+        m[0] ^= 0xff;
+        assert_eq!(read_wrapper_terminal(&m), UnknownLayout);
+        let mut t = tombstone();
+        t[0] ^= 0xff;
+        assert_eq!(read_wrapper_terminal(&t), UnknownLayout);
+        // Any other VERSION: 17 (v17 layout, mode elsewhere), 19 (future), 0.
+        for v in [0u16, 17, 19, u16::MAX] {
+            let mut m = wrapper_market_with_mode(1);
+            m[8..10].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(
+                read_wrapper_terminal(&m),
+                UnknownLayout,
+                "market version {v}"
+            );
+            let mut m0 = wrapper_market_with_mode(0);
+            m0[8..10].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(
+                read_wrapper_terminal(&m0),
+                UnknownLayout,
+                "live market version {v}"
+            );
+            let mut t = tombstone();
+            t[8..10].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(
+                read_wrapper_terminal(&t),
+                UnknownLayout,
+                "tombstone version {v}"
+            );
+        }
+        // Market too short to hold the engine header (mode byte present or not).
+        let short = wrapper_market_with_mode(1)[..WRAPPER_MIN_MARKET_LEN - 1].to_vec();
+        assert_eq!(read_wrapper_terminal(&short), UnknownLayout);
+        let shorter = wrapper_market_with_mode(1)[..WRAPPER_OFF_MODE].to_vec();
+        assert_eq!(read_wrapper_terminal(&shorter), UnknownLayout);
+        // Tombstone of the wrong length.
+        let mut long_t = tombstone();
+        long_t.push(0);
+        assert_eq!(read_wrapper_terminal(&long_t), UnknownLayout);
+        // Unknown mode value.
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(3)),
+            UnknownLayout
+        );
+        assert_eq!(
+            read_wrapper_terminal(&wrapper_market_with_mode(0xff)),
+            UnknownLayout
+        );
+        // Unknown kind.
+        let mut k = wrapper_market_with_mode(1);
+        k[WRAPPER_OFF_KIND] = 5; // upstream's KIND_CLOSED_MARKET, not ours
+        assert_eq!(read_wrapper_terminal(&k), UnknownLayout);
+        // Empty / sub-header.
+        assert_eq!(read_wrapper_terminal(&[]), UnknownLayout);
+        assert_eq!(read_wrapper_terminal(&[0u8; 15]), UnknownLayout);
+    }
+
+    fn f9_pool(deposited: u64, flushed: u64, lp: u64) -> StakePool {
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = deposited;
+        p.total_flushed = flushed;
+        p.total_lp_supply = lp;
+        p
+    }
+
+    #[test]
+    fn test_f9_book_terminal_recovery_principal_then_fees() {
+        // 10M deposited, 4M flushed: pool value 6M. Wrapper returns 5M.
+        let mut p = f9_pool(10_000_000, 4_000_000, 10_001_000);
+        assert_eq!(p.total_pool_value(), Some(6_000_000));
+        let (r, f) = p.book_terminal_recovery(11_000_000).unwrap();
+        assert_eq!((r, f), (4_000_000, 1_000_000));
+        assert_eq!(
+            p.total_pool_value(),
+            Some(11_000_000),
+            "value == vault balance"
+        );
+        assert_eq!(p.total_recovered_from_wrapper, 4_000_000);
+        assert_eq!(p.total_returned, 4_000_000);
+        assert_eq!(p.total_fees_earned, 1_000_000);
+        assert!(p.wrapper_fully_recovered());
+        // Idempotent: a second booking at the same balance books nothing.
+        assert_eq!(p.book_terminal_recovery(11_000_000).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn test_f9_book_terminal_recovery_dead_shares_leave_fees_unbooked() {
+        let mut p = f9_pool(1_000, 0, MINIMUM_LIQUIDITY);
+        let (r, f) = p.book_terminal_recovery(1_000 + 5_000_000).unwrap();
+        assert_eq!((r, f), (0, 0), "F3: nothing booked to the dead shares");
+        assert_eq!(p.total_fees_earned, 0);
+    }
+
+    #[test]
+    fn test_f9_book_terminal_recovery_balance_below_value_books_nothing() {
+        let mut p = f9_pool(10_000_000, 0, 10_001_000);
+        assert_eq!(p.book_terminal_recovery(9_000_000).unwrap(), (0, 0));
+        assert_eq!(p.total_pool_value(), Some(10_000_000));
+    }
+
+    #[test]
+    fn test_f9_book_fee_delta_tranche_split_matches_accrue() {
+        // Tranche pool: the fee split must go through distribute_fees exactly as
+        // AccrueFees does (book_fee_delta is the moved AccrueFees body).
+        let mut p = f9_pool(10_000_000, 0, 10_001_000);
+        p.set_tranche_enabled(true);
+        p.set_junior_balance(2_000_000);
+        p.set_junior_total_lp(2_000_000);
+        p.set_junior_fee_mult_bps(20_000);
+        let jb0 = p.junior_balance();
+        let sb0 = p.senior_balance().unwrap();
+        let (jf, _) = crate::math::distribute_fees(jb0, sb0, 20_000, 1_000_000);
+        p.book_fee_delta(1_000_000).unwrap();
+        assert_eq!(p.junior_balance(), jb0 + jf);
+        assert_eq!(p.total_fees_earned, 1_000_000);
+        assert!(jf > 0 && jf < 1_000_000);
     }
 
     #[test]

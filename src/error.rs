@@ -91,6 +91,22 @@ pub enum StakeError {
     /// shares nobody can redeem. Nothing is booked; the fee tokens stay in the vault
     /// and are booked by the first accrual after a real staker deposits.
     NoRealLpHolders = 29,
+    /// F-9: `RecoverTerminalInsurance` (tag 29) requires the bound wrapper market to
+    /// be TERMINAL: Resolved (engine mode 1) or closed to a CloseSlab tombstone. A
+    /// Live or Recovery market is refused; while Live, use `RecoverFlushedInsurance`
+    /// (tag 23). A non-zero `amount` additionally requires Resolved, not Closed,
+    /// because a closed market has nothing left to withdraw.
+    MarketNotTerminal = 30,
+    /// F-9: `RecoverTerminalInsurance` moved no tokens and booked nothing: `amount`
+    /// was 0, no stray account was swept, and the pool vault holds no unbooked
+    /// surplus. The call is refused so a keeper can tell a no-op from a recovery.
+    NothingToRecover = 31,
+    /// F-9 (security INFO): the bound wrapper market account is not the wrapper
+    /// layout this program has pinned (magic, VERSION 18, kind, minimum length,
+    /// known mode value). Its engine `mode` byte cannot be trusted, so the terminal
+    /// recovery, the CloseSlab proxy, and the mode-0 deposit path all refuse rather
+    /// than guess. A wrapper layout bump needs a coordinated stake upgrade.
+    UnsupportedWrapperLayout = 32,
 }
 
 impl From<StakeError> for ProgramError {
@@ -133,6 +149,9 @@ pub fn error_hint(code: u32) -> &'static str {
         27 => "No pending cooldown proposal — there is no proposed cooldown increase to apply; propose one first, or it was cancelled (#242)",
         28 => "Deposit below minimum liquidity — the pool's first-ever deposit must exceed MINIMUM_LIQUIDITY so a permanent dead-share floor can be locked (N7 anti-inflation hardening); deposit a larger amount",
         29 => "No real LP holders — the pool's only LP supply is the MINIMUM_LIQUIDITY dead-share floor, so AccrueFees refuses to book fees nobody could redeem; the fees stay in the vault and are booked once a real staker deposits (F3)",
+        30 => "Market not terminal — RecoverTerminalInsurance needs the bound wrapper market to be Resolved (or closed); while the market is Live use RecoverFlushedInsurance, and a non-zero amount needs a Resolved (not closed) market (F-9)",
+        31 => "Nothing to recover — no terminal insurance was withdrawn, no stray vault_auth token account was swept, and the pool vault has no unbooked surplus (F-9)",
+        32 => "Unsupported wrapper layout — the bound market account is not the pinned wrapper layout (magic, VERSION 18, kind, minimum length), so its resolved/live state cannot be read; the stake program must be upgraded together with the wrapper (F-9)",
         _ => "Unknown error — check the error code and pool state",
     }
 }

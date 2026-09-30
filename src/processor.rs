@@ -415,6 +415,10 @@ pub fn process(
         StakeInstruction::RecoverFlushedInsurance { amount } => {
             process_recover_flushed_insurance(program_id, accounts, amount)
         }
+        StakeInstruction::RecoverTerminalInsurance { amount } => {
+            process_recover_terminal_insurance(program_id, accounts, amount)
+        }
+        StakeInstruction::AdminCloseSlab => process_admin_close_slab(program_id, accounts),
         StakeInstruction::AccrueFees => process_accrue_fees(program_id, accounts),
         StakeInstruction::InitTradingPool {
             cooldown_slots,
@@ -771,6 +775,9 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
+    // F-9: ...and after the WRAPPER resolved, which a permissionless stale resolve
+    // does without ever setting the local flag.
+    reject_deposit_into_terminal_market(pool, fee_slab)?;
 
     // I5: Validate vault_auth PDA derivation
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
@@ -2683,47 +2690,10 @@ fn accrue_fees_inner(
                 .ok_or(StakeError::Overflow)?;
         }
 
-        // Snapshot pre-fee tranche balances BEFORE incrementing total_fees_earned.
-        // senior_balance() derives from total_pool_value() which includes
-        // total_fees_earned, so reading it post-increment would inflate the senior
-        // weight in distribute_fees and systematically shortchange the junior tranche.
-        let distribute_to_junior = pool.tranche_enabled() && pool.junior_total_lp() > 0;
-        let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
-            (
-                pool.junior_balance(),
-                pool.senior_balance().ok_or(StakeError::Overflow)?,
-            )
-        } else {
-            (0, 0)
-        };
-
-        pool.total_fees_earned = pool
-            .total_fees_earned
-            .checked_add(fee_delta)
-            .ok_or(StakeError::Overflow)?;
-
-        // PERC-303: distribute the fee delta between junior/senior sub-pools using the
-        // junior fee multiplier. Senior implicitly receives the remainder since
-        // senior_balance = total_pool_value() - junior_balance and total_fees_earned
-        // was already incremented by the full fee_delta above.
-        if distribute_to_junior {
-            let (junior_fee, _) = crate::math::distribute_fees(
-                snapshot_junior_bal,
-                snapshot_senior_bal,
-                pool.junior_fee_mult_bps(),
-                fee_delta,
-            );
-            pool.set_junior_balance(
-                pool.junior_balance()
-                    .checked_add(junior_fee)
-                    .ok_or(StakeError::Overflow)?,
-            );
-            // M-2: guard — reject accrual if it would push junior_balance above pool value.
-            let pv = pool.total_pool_value().ok_or(StakeError::Overflow)?;
-            if pool.junior_balance() > pv {
-                return Err(StakeError::Overflow.into());
-            }
-        }
+        // Tranche split + total_fees_earned increment (PERC-303 / M-2). Moved verbatim
+        // to `StakePool::book_fee_delta` so the F-9 terminal recovery books fees the
+        // same way.
+        pool.book_fee_delta(fee_delta)?;
 
         msg!(
             "AccrueFees: accrued {} fees, total_fees_earned={}",
@@ -3123,6 +3093,8 @@ fn process_deposit_junior(
     if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
+    // F-9: also refuse once the wrapper market itself is resolved.
+    reject_deposit_into_terminal_market(pool, fee_slab)?;
 
     let (expected_vault_auth, _) = derive_vault_authority(program_id, pool_pda.key);
     if *vault_auth.key != expected_vault_auth {
@@ -3710,6 +3682,433 @@ fn process_recover_flushed_insurance(
         pool.total_returned,
         pool.total_recovered_from_wrapper
     );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 29: RecoverTerminalInsurance — F-9 terminal insurance recovery
+// ═══════════════════════════════════════════════════════════════
+//
+// See the `StakeInstruction::RecoverTerminalInsurance` doc for the full contract.
+//
+// PERMISSIONLESS, SAFELY. The caller chooses only `amount` (bounded by the
+// wrapper's own terminal-capacity gate) and whether to pass a stray account to
+// sweep. Every token movement this instruction causes ends in `pool.vault`:
+//   * the tag-41 CPI names `pool.vault` as `dest_token` (key-checked below);
+//   * the sweep transfers INTO `pool.vault` only, from an account vault_auth owns.
+// Booking only ever credits the pool, and only while the wrapper market is
+// terminal, so no caller can move value between stakers or out of the pool.
+fn process_recover_terminal_insurance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+
+    let _caller = next_account_info(accounts_iter)?; // 0: permissionless caller
+    let pool_pda = next_account_info(accounts_iter)?; // 1: pool PDA (writable)
+    let vault = next_account_info(accounts_iter)?; // 2: pool vault (dest; writable)
+    let vault_auth = next_account_info(accounts_iter)?; // 3: vault_auth PDA
+    let market = next_account_info(accounts_iter)?; // 4: wrapper market (writable)
+    let wrapper_vault = next_account_info(accounts_iter)?; // 5: wrapper vault (source)
+    let wrapper_vault_auth = next_account_info(accounts_iter)?; // 6: wrapper vault auth
+    let token_program = next_account_info(accounts_iter)?; // 7: token program
+    let percolator_program = next_account_info(accounts_iter)?; // 8: wrapper program
+    let stray = accounts_iter.next(); // 9: OPTIONAL stray vault_auth-owned token account
+
+    verify_token_program(token_program)?;
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+    validate_account_writable(vault)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+
+    // The pool account must be THE pool PDA for its stored slab.
+    {
+        let (expected_pool, _) = state::derive_pool_pda(program_id, &pool.slab_pubkey());
+        if *pool_pda.key != expected_pool {
+            return Err(StakeError::InvalidPda.into());
+        }
+    }
+
+    // Insurance LP pools only, like tags 3 / 10 / 23.
+    if pool.pool_mode != 0 {
+        msg!("RecoverTerminalInsurance: not valid for trading LP pools (mode 1)");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+
+    // Wrapper program and market must be THIS pool's.
+    if pool.percolator_program != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+    if pool.slab != market.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if market.owner.to_bytes() != pool.percolator_program {
+        msg!("RecoverTerminalInsurance: market is not owned by pool.percolator_program");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    // DRAIN CHECK: the only destination is pool.vault, an SPL Token account.
+    if pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if *vault.owner != crate::spl_token::id() {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+
+    // TERMINAL GATE. Booking a raw vault surplus is only safe once the market can
+    // no longer take deposits or flushes (see `StakePool::book_terminal_recovery`).
+    let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
+    if terminal == state::WrapperTerminal::UnknownLayout {
+        msg!("RecoverTerminalInsurance: wrapper market is not the pinned layout (VERSION 18)");
+        return Err(StakeError::UnsupportedWrapperLayout.into());
+    }
+    if terminal == state::WrapperTerminal::NotTerminal {
+        msg!("RecoverTerminalInsurance: wrapper market is not Resolved or closed");
+        return Err(StakeError::MarketNotTerminal.into());
+    }
+
+    let read_vault_balance = |ai: &AccountInfo| -> Result<u64, ProgramError> {
+        let data = ai.try_borrow_data()?;
+        let acct = crate::spl_token::state::Account::unpack(&data)?;
+        if acct.state != crate::spl_token::state::AccountState::Initialized {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(acct.amount)
+    };
+
+    let mut moved: u64 = 0;
+
+    // (2) Wrapper tag 41. The wrapper enforces its own gates (Resolved, zero
+    // portfolios, zero c_tot, amount <= this authority's terminal capacity).
+    if amount > 0 {
+        if terminal != state::WrapperTerminal::Resolved {
+            msg!("RecoverTerminalInsurance: a closed market has nothing to withdraw; pass amount = 0");
+            return Err(StakeError::MarketNotTerminal.into());
+        }
+        let before = read_vault_balance(vault)?;
+        cpi::cpi_withdraw_insurance_terminal(
+            percolator_program,
+            vault_auth,
+            market,
+            vault, // dest_token = pool.vault (drain-checked above)
+            wrapper_vault,
+            wrapper_vault_auth,
+            token_program,
+            amount,
+            vault_auth_seeds,
+        )?;
+        let after = read_vault_balance(vault)?;
+        // CONSERVATION: the pool receives exactly what the wrapper released.
+        if !crate::math::terminal_cpi_delta_ok(before, after, amount) {
+            msg!(
+                "RecoverTerminalInsurance: pool vault moved {} -> {}, expected +{}",
+                before,
+                after,
+                amount
+            );
+            return Err(StakeError::CpiFailed.into());
+        }
+        moved = moved.checked_add(amount).ok_or(StakeError::Overflow)?;
+    }
+
+    // (3) Optional sweep of a stray vault_auth-owned token account into pool.vault.
+    if let Some(stray) = stray {
+        if stray.key == vault.key {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        validate_account_writable(stray)?;
+        if *stray.owner != crate::spl_token::id() {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let stray_amount = {
+            let data = stray.try_borrow_data()?;
+            if data.len() < crate::spl_token::state::ACCOUNT_LEN {
+                return Err(StakeError::InvalidAccount.into());
+            }
+            if data[0..32] != pool.collateral_mint {
+                return Err(StakeError::InvalidMint.into());
+            }
+            if data[32..64] != vault_auth.key.to_bytes() {
+                msg!("RecoverTerminalInsurance: stray account is not owned by vault_auth");
+                return Err(StakeError::InvalidAccount.into());
+            }
+            let acct = crate::spl_token::state::Account::unpack(&data)?;
+            if acct.state != crate::spl_token::state::AccountState::Initialized {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            acct.amount
+        };
+        if stray_amount > 0 {
+            let before = read_vault_balance(vault)?;
+            invoke_signed(
+                &crate::spl_token::transfer(
+                    token_program.key,
+                    stray.key,
+                    vault.key,
+                    vault_auth.key,
+                    &[],
+                    stray_amount,
+                )?,
+                &[
+                    stray.clone(),
+                    vault.clone(),
+                    vault_auth.clone(),
+                    token_program.clone(),
+                ],
+                &[vault_auth_seeds],
+            )?;
+            let after = read_vault_balance(vault)?;
+            if !crate::math::terminal_cpi_delta_ok(before, after, stray_amount) {
+                return Err(StakeError::CpiFailed.into());
+            }
+            moved = moved
+                .checked_add(stray_amount)
+                .ok_or(StakeError::Overflow)?;
+        }
+    }
+
+    // (4) Book. First the wrapper-attributable tag-87 fees through the normal
+    // AccrueFees path (so the #290 cursor stays consistent), then the rest.
+    let balance = read_vault_balance(vault)?;
+    let fees_before = pool.total_fees_earned;
+    if terminal == state::WrapperTerminal::Resolved {
+        let paid = wrapper_fee_payouts(pool, market)?;
+        accrue_fees_inner(pool, balance, Some(paid))?;
+    }
+    let attributed = pool
+        .total_fees_earned
+        .checked_sub(fees_before)
+        .ok_or(StakeError::Overflow)?;
+    let (to_returned, to_fees) = pool.book_terminal_recovery(balance)?;
+
+    // (5) The market is over for this pool: no more deposits or flushes.
+    pool.set_market_resolved(true);
+
+    if moved == 0 && attributed == 0 && to_returned == 0 && to_fees == 0 {
+        msg!("RecoverTerminalInsurance: nothing withdrawn, swept or booked");
+        return Err(StakeError::NothingToRecover.into());
+    }
+
+    msg!(
+        "RecoverTerminalInsurance: moved {} into pool vault; booked returned {} + fees {} (+{} tag-87 attributed); total_returned {}, total_fees_earned {}",
+        moved,
+        to_returned,
+        to_fees,
+        attributed,
+        pool.total_returned,
+        pool.total_fees_earned
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 30: AdminCloseSlab — F-9: CloseSlab proxy (marketauth = pool PDA)
+// ═══════════════════════════════════════════════════════════════
+//
+// `InitPool` rotates `cfg.marketauth` to the pool PDA, and wrapper CloseSlab
+// (tag 13) requires the marketauth as signer AND as the owner of `dest_token`. So
+// no key could ever retire a stake-owned market; this proxy is the only path.
+//
+// AUTHORITY: `pool.admin`, like AdminResolveMarket (tag 24). CloseSlab is
+// irreversible and burns unbudgeted residue, so its timing stays the admin's call.
+// Token safety does not depend on the admin: the sweep lands in a pool-PDA-owned
+// account and this instruction moves it into `pool.vault` and books it for stakers.
+// The rent refund that the wrapper pays to the pool PDA is forwarded to the admin
+// signer (who funded the slab), so the pool PDA's lamports end where they started.
+fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?; // 0: [signer, writable] pool.admin
+    let pool_pda = next_account_info(accounts_iter)?; // 1: [writable] pool PDA (marketauth)
+    let market = next_account_info(accounts_iter)?; // 2: [writable] wrapper market
+    let wrapper_vault = next_account_info(accounts_iter)?; // 3: [writable] wrapper vault
+    let wrapper_vault_auth = next_account_info(accounts_iter)?; // 4: wrapper vault authority
+    let pool_dest = next_account_info(accounts_iter)?; // 5: [writable] pool-PDA-owned token acct
+    let token_program = next_account_info(accounts_iter)?; // 6: token program
+    let mint = next_account_info(accounts_iter)?; // 7: [writable] collateral mint
+    let vault = next_account_info(accounts_iter)?; // 8: [writable] pool vault
+    let percolator_program = next_account_info(accounts_iter)?; // 9: wrapper program
+
+    verify_token_program(token_program)?;
+    let pool_bump =
+        validate_group_a_proxy(program_id, admin, pool_pda, market, percolator_program)?;
+    validate_account_writable(admin)?;
+    validate_account_writable(pool_pda)?;
+    validate_account_writable(vault)?;
+    validate_account_writable(pool_dest)?;
+
+    let (pool_vault, collateral_mint) = {
+        let data = pool_pda.try_borrow_data()?;
+        let pool = pool_from_data(&data[..])?;
+        let (expected_pool, _) = state::derive_pool_pda(program_id, &pool.slab_pubkey());
+        if *pool_pda.key != expected_pool {
+            return Err(StakeError::InvalidPda.into());
+        }
+        (pool.vault, pool.collateral_mint)
+    };
+    if market.owner.to_bytes() != percolator_program.key.to_bytes() {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if pool_vault != vault.key.to_bytes() || *vault.owner != crate::spl_token::id() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if collateral_mint != mint.key.to_bytes() {
+        return Err(StakeError::InvalidMint.into());
+    }
+    // The CloseSlab destination: an initialized token account of the pool mint,
+    // owned by the POOL PDA (the marketauth), and never pool.vault itself.
+    if pool_dest.key == vault.key || *pool_dest.owner != crate::spl_token::id() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    {
+        let data = pool_dest.try_borrow_data()?;
+        if data.len() < crate::spl_token::state::ACCOUNT_LEN
+            || data[0..32] != collateral_mint
+            || data[32..64] != pool_pda.key.to_bytes()
+        {
+            msg!(
+                "AdminCloseSlab: account 5 must be a pool-mint token account owned by the pool PDA"
+            );
+            return Err(StakeError::InvalidAccount.into());
+        }
+    }
+    let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
+    if terminal == state::WrapperTerminal::UnknownLayout {
+        msg!("AdminCloseSlab: wrapper market is not the pinned layout (VERSION 18)");
+        return Err(StakeError::UnsupportedWrapperLayout.into());
+    }
+    if terminal != state::WrapperTerminal::Resolved {
+        msg!("AdminCloseSlab: the wrapper market must be Resolved");
+        return Err(StakeError::MarketNotTerminal.into());
+    }
+
+    // CPI. No borrow of the pool account is held: the pool PDA is a CPI account
+    // (the signer and the rent-refund destination).
+    let lamports_before = pool_pda.lamports();
+    let pool_seeds: &[&[u8]] = &[b"stake_pool", market.key.as_ref(), &[pool_bump]];
+    cpi::cpi_close_slab(
+        percolator_program,
+        pool_pda,
+        market,
+        wrapper_vault,
+        wrapper_vault_auth,
+        pool_dest,
+        token_program,
+        mint,
+        pool_seeds,
+    )?;
+
+    // Forward the rent refund to the admin (the pool PDA is ours, so we may debit it).
+    let refund = pool_pda
+        .lamports()
+        .checked_sub(lamports_before)
+        .ok_or(StakeError::Overflow)?;
+    if refund > 0 {
+        **pool_pda.try_borrow_mut_lamports()? -= refund;
+        **admin.try_borrow_mut_lamports()? = admin
+            .lamports()
+            .checked_add(refund)
+            .ok_or(StakeError::Overflow)?;
+    }
+
+    // Sweep whatever CloseSlab paid into pool_dest into pool.vault.
+    let swept = {
+        let data = pool_dest.try_borrow_data()?;
+        crate::spl_token::state::Account::unpack(&data)?.amount
+    };
+    if swept > 0 {
+        invoke_signed(
+            &crate::spl_token::transfer(
+                token_program.key,
+                pool_dest.key,
+                vault.key,
+                pool_pda.key,
+                &[],
+                swept,
+            )?,
+            &[
+                pool_dest.clone(),
+                vault.clone(),
+                pool_pda.clone(),
+                token_program.clone(),
+            ],
+            &[pool_seeds],
+        )?;
+    }
+
+    let closed =
+        state::read_wrapper_terminal(&market.try_borrow_data()?) == state::WrapperTerminal::Closed;
+    let balance = {
+        let data = vault.try_borrow_data()?;
+        crate::spl_token::state::Account::unpack(&data)?.amount
+    };
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+    // The market is Resolved (checked above) or now Closed: both terminal, so a
+    // surplus in pool.vault may be booked (see `book_terminal_recovery`).
+    let (to_returned, to_fees) = pool.book_terminal_recovery(balance)?;
+    pool.set_market_resolved(true);
+    msg!(
+        "AdminCloseSlab: closed={} swept {} into pool vault; booked returned {} + fees {}; refunded {} lamports to admin",
+        closed,
+        swept,
+        to_returned,
+        to_fees,
+        refund
+    );
+    Ok(())
+}
+
+/// F-9: refuse a mode-0 deposit when the bound wrapper market is TERMINAL.
+///
+/// `RecoverTerminalInsurance` books a resolved market's insurance budget into the
+/// pool as a windfall. Without this gate anyone could deposit after the wrapper
+/// resolved and before that recovery ran, and take a pro-rata cut of stakers' budget
+/// at no risk (the market can no longer flush). The pool-local `market_resolved`
+/// flag cannot close this, because a permissionless stale resolve never sets it.
+/// So the wrapper's own mode is read.
+///
+/// Only checks a slab that IS this pool's market (key and owner). A missing or
+/// mismatched slab is left to `pre_accrue_fee_modes`, which already rejects it
+/// on a mode-0 pool.
+fn reject_deposit_into_terminal_market(
+    pool: &state::StakePool,
+    fee_slab: Option<&AccountInfo>,
+) -> ProgramResult {
+    if pool.pool_mode != 0 {
+        return Ok(());
+    }
+    if let Some(slab) = fee_slab {
+        if slab.key.to_bytes() == pool.slab && slab.owner.to_bytes() == pool.percolator_program {
+            let terminal = state::read_wrapper_terminal(&slab.try_borrow_data()?);
+            if terminal == state::WrapperTerminal::UnknownLayout {
+                msg!("Deposit refused: the bound wrapper market is not the pinned layout (F-9)");
+                return Err(StakeError::UnsupportedWrapperLayout.into());
+            }
+            if terminal != state::WrapperTerminal::NotTerminal {
+                msg!("Deposit refused: the bound wrapper market is resolved (F-9)");
+                return Err(StakeError::MarketResolved.into());
+            }
+        }
+    }
     Ok(())
 }
 

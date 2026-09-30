@@ -103,3 +103,32 @@ fn test_f3_no_real_lp_holders_code_is_29() {
     assert_eq!(pe, ProgramError::Custom(29));
     assert!(percolator_stake::error::error_hint(29).starts_with("No real LP holders"));
 }
+
+/// F-9: the two RecoverTerminalInsurance errors are appended after 29, so no
+/// existing code shifts. SDK error tables map 30 and 31 to them.
+#[test]
+fn test_f9_terminal_recovery_codes_are_30_and_31() {
+    assert_eq!(StakeError::MarketNotTerminal as u32, 30);
+    assert_eq!(StakeError::NothingToRecover as u32, 31);
+    assert_eq!(
+        ProgramError::from(StakeError::MarketNotTerminal),
+        ProgramError::Custom(30)
+    );
+    assert_eq!(
+        ProgramError::from(StakeError::NothingToRecover),
+        ProgramError::Custom(31)
+    );
+    assert!(percolator_stake::error::error_hint(30).starts_with("Market not terminal"));
+    assert!(percolator_stake::error::error_hint(31).starts_with("Nothing to recover"));
+}
+
+/// F-9 security INFO: UnsupportedWrapperLayout is appended as 32.
+#[test]
+fn test_f9_unsupported_wrapper_layout_code_is_32() {
+    assert_eq!(StakeError::UnsupportedWrapperLayout as u32, 32);
+    assert_eq!(
+        ProgramError::from(StakeError::UnsupportedWrapperLayout),
+        ProgramError::Custom(32)
+    );
+    assert!(percolator_stake::error::error_hint(32).starts_with("Unsupported wrapper layout"));
+}

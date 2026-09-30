@@ -854,6 +854,166 @@ pub fn cpi_withdraw_insurance_asset<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// WithdrawInsurance (Tag 41) — F-9: terminal insurance withdrawal
+// ═══════════════════════════════════════════════════════════════
+//
+// The wrapper's RESOLVED-market insurance exit. Verified against BOTH the deployed
+// wrapper (`deploy/v18.2-wrapper@6377376a`, `handle_withdraw_insurance`,
+// src/v16_program.rs:15968) and P1 (`feat/p1-safety-release@c0ffaefa`,
+// :16741). The handler bodies are byte-identical in the two builds.
+//
+// WIRE (17 bytes): `[tag=41][amount: u128 LE]` (decode arm
+// `41 => Self::WithdrawInsurance { amount: read_u128 }`, trailing bytes rejected).
+//
+// ACCOUNTS (the wrapper's order):
+//   [0] authority      — the asset-0 `insurance_authority`. After
+//                        BindInsuranceAuthority (tag 19) that is OUR vault_auth PDA.
+//                        NOT signer-checked by the wrapper (W4-PAYOUT, upstream
+//                        d64cdeeb: terminal payout is permissionless). We still pass
+//                        it as a signer via invoke_signed, so a future wrapper that
+//                        re-adds the signer check keeps working.
+//   [1] market         — writable, wrapper-owned.
+//   [2] dest_token     — writable; SPL `owner` MUST equal `authority`
+//                        (`verify_withdrawable_token_accounts`), plus no delegate /
+//                        close authority. We always pass `pool.vault`, which is
+//                        owned by vault_auth.
+//   [3] vault_token    — writable; the canonical wrapper vault ATA.
+//   [4] vault_authority — the wrapper's `[b"vault", market]` PDA.
+//   [5] token_program
+//   [6] (optional) insurance ledger — NOT passed.
+//
+// WRAPPER GATES: `mode == Resolved`, `materialized_portfolio_count == 0`,
+// `c_tot == 0`, `amount <= terminal capacity for this authority` (the per-domain
+// budgets whose `insurance_authority == authority`, clamped to the unreserved
+// insurance and to the vault), plus the insurance-withdraw cooldown and
+// deposits-only ceiling. A failing gate returns `EngineLockActive` (Custom 21).
+const TAG_WITHDRAW_INSURANCE: u8 = 41;
+
+/// Pure tag-41 payload builder. Wire (17 bytes): `[41][amount: u128 LE]`.
+pub fn build_withdraw_insurance_data(amount: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(17);
+    data.push(TAG_WITHDRAW_INSURANCE);
+    data.extend_from_slice(&(amount as u128).to_le_bytes());
+    debug_assert_eq!(data.len(), 17);
+    data
+}
+
+pub fn cpi_withdraw_insurance_terminal<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>, // insurance_authority = our PDA
+    market: &AccountInfo<'a>,     // wrapper market / slab (writable)
+    dest_token: &AccountInfo<'a>, // MUST be pool.vault (checked by the caller)
+    wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true), // authority (PDA)
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+        ],
+        data: build_withdraw_insurance_data(amount),
+    };
+    invoke_signed(
+        &ix,
+        &[
+            vault_auth.clone(),
+            market.clone(),
+            dest_token.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            token_program.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CloseSlab (Tag 13) — F-9: retire a stake-owned (marketauth = pool PDA) market
+// ═══════════════════════════════════════════════════════════════
+//
+// Verified against deploy/v18.2-wrapper@6377376a `handle_close_slab`
+// (src/v16_program.rs:17239) and P1 feat/p1-safety-release@c0ffaefa (same account
+// shape; P1 adds an F4 step that may re-book orphaned fee legs and return Ok
+// WITHOUT closing, so the proxy is simply called again).
+//
+// WIRE (9 bytes): `[tag=13][authority_epoch: u64 LE]`, the asset-0 authority epoch
+// (CHECK-only, `require_authority_epoch_view(&group, 0, ..)`).
+//
+// ACCOUNTS (primary collateral only; a secondary-collateral market is not supported
+// by this proxy — stake pools are single-mint):
+//   [0] admin_dest   — signer + writable; MUST be `cfg.marketauth`
+//                      (`expect_live_authority`). After InitPool that is the POOL
+//                      PDA, which signs via invoke_signed and receives the slab and
+//                      vault-account rent refunds.
+//   [1] market       — writable
+//   [2] vault_token  — writable; canonical wrapper vault
+//   [3] vault_authority
+//   [4] dest_token   — writable; `verify_user_token_account(dest, admin_dest, mint)`:
+//                      an initialized token account OWNED BY THE POOL PDA. Receives
+//                      the primary sweep (vault balance minus retired residue).
+//   [5] token_program
+//   [6] primary mint — writable; read only when unbudgeted residue is burned.
+const TAG_CLOSE_SLAB: u8 = 13;
+
+/// Pure tag-13 payload builder. Wire (9 bytes): `[13][authority_epoch: u64 LE]`.
+fn build_close_slab_data(market: &AccountInfo) -> Result<Vec<u8>, ProgramError> {
+    let authority_epoch = read_asset0_authority_epoch(market)?;
+    let mut data = Vec::with_capacity(9);
+    data.push(TAG_CLOSE_SLAB);
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    debug_assert_eq!(data.len(), 9);
+    Ok(data)
+}
+
+pub fn cpi_close_slab<'a>(
+    percolator_program: &AccountInfo<'a>,
+    pool_pda: &AccountInfo<'a>, // marketauth; signs via invoke_signed
+    market: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_auth: &AccountInfo<'a>,
+    dest_token: &AccountInfo<'a>, // owned by pool_pda
+    token_program: &AccountInfo<'a>,
+    mint: &AccountInfo<'a>,
+    pool_seeds: &[&[u8]],
+) -> ProgramResult {
+    let data = build_close_slab_data(market)?;
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new(*pool_pda.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*mint.key, false),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            pool_pda.clone(),
+            market.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            dest_token.clone(),
+            token_program.clone(),
+            mint.clone(),
+        ],
+        &[pool_seeds],
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════
 // ResolveMarket (Tag 19) — C-1 fix: CPI proxy for the wrapper's terminal
 // resolution instruction, now that marketauth is the pool PDA
 // ═══════════════════════════════════════════════════════════════

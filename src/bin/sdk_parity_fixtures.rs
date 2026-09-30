@@ -89,6 +89,8 @@ fn variant_name(ix: &StakeInstruction) -> &'static str {
         StakeInstruction::BurnAssetAdmin => "BurnAssetAdmin",
         StakeInstruction::RotateInsuranceOperator => "RotateInsuranceOperator",
         StakeInstruction::RecoverFlushedInsurance { .. } => "RecoverFlushedInsurance",
+        StakeInstruction::RecoverTerminalInsurance { .. } => "RecoverTerminalInsurance",
+        StakeInstruction::AdminCloseSlab => "AdminCloseSlab",
         StakeInstruction::AdminResolveMarket => "AdminResolveMarket",
         StakeInstruction::AdminUpdateFeeSplit { .. } => "AdminUpdateFeeSplit",
         StakeInstruction::AdminUpdateMaintenanceFeePerSlot { .. } => {
