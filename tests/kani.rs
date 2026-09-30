@@ -399,9 +399,12 @@ mod kani_proofs {
         kani::assume(deposit <= 1_000_000_000);
 
         if let Some(lp) = calc_lp_for_deposit(supply, pv, deposit) {
-            // floor(deposit * supply / pv) * pv ≤ deposit * supply
-            let lhs = (lp as u128) * (pv as u128);
-            let rhs = (deposit as u128) * (supply as u128);
+            // RESTATED 2026-09-30 (Sentinel, L-DIL-VIRT): since N7 the price carries the virtual
+            // offsets VIRTUAL_SHARES = VIRTUAL_ASSETS = 1 (src/math.rs:39-40), so the pool-favoring
+            // floor is lp*(pv+1) <= deposit*(supply+1). The pre-N7 form lp*pv <= deposit*supply is
+            // FALSE for the correct code (e.g. supply=1, pv=2, deposit=5: lp=3, 6 > 5).
+            let lhs = (lp as u128) * (pv as u128 + 1);
+            let rhs = (deposit as u128) * (supply as u128 + 1);
             assert!(lhs <= rhs, "LP rounding not pool-favoring");
         }
             // Sentinel 2026-09-30: vacuity detector for the assume set.
@@ -422,8 +425,10 @@ mod kani_proofs {
         kani::assume(lp <= supply);
 
         if let Some(col) = calc_collateral_for_withdraw(supply, pv, lp) {
-            let lhs = (col as u128) * (supply as u128);
-            let rhs = (lp as u128) * (pv as u128);
+            // RESTATED 2026-09-30 (Sentinel, L-DIL-VIRT): offsets as in calc_collateral_for_withdraw
+            // (src/math.rs:119-121): col*(supply+1) <= lp*(pv+1).
+            let lhs = (col as u128) * (supply as u128 + 1);
+            let rhs = (lp as u128) * (pv as u128 + 1);
             assert!(lhs <= rhs, "Withdrawal rounding not pool-favoring");
         }
             // Sentinel 2026-09-30: vacuity detector for the assume set.
