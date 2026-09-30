@@ -98,7 +98,7 @@
 // add the mainnet arm here and in the wrapper's `STAKE_PROGRAM_ID` together.
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(feature = "devnet")]
-solana_program::declare_id!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
+solana_program::declare_id!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w"); // relaunch fresh ID (2026-09-30); was GCHhcgw… (live GnwdeQr world)
 
 pub mod cpi;
 pub mod error;

@@ -59,7 +59,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 // The stake program's canonical declared id (`solana_program::declare_id!` in
 // src/lib.rs). Loading the .so at its real id keeps every PDA derivation in this
 // file identical to production.
-const STAKE_ID: &str = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3";
+const STAKE_ID: &str = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 const MARKET_LEN_V17_CAP1: usize = 3147;
