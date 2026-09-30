@@ -5484,6 +5484,13 @@ mod kani_f3_dead_share_guard {
     use super::*;
     use crate::state::{StakePool, MINIMUM_LIQUIDITY};
 
+    // Logging has no effect on pool state; `msg!` formatting (alloc::fmt) is what makes CBMC
+    // time out, so it is stubbed out (run with `-Z stubbing`).
+    fn stub_format(_args: core::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+    fn stub_log(_m: &str) {}
+
     fn any_pool() -> StakePool {
         let bytes: [u8; core::mem::size_of::<StakePool>()] = kani::any();
         bytemuck::pod_read_unaligned(&bytes[..])
@@ -5495,6 +5502,8 @@ mod kani_f3_dead_share_guard {
     /// (with real holders) can attribute is exactly what this one would have booked.
     #[kani::proof]
     #[kani::solver(kissat)]
+    #[kani::stub(std::fmt::format, stub_format)]
+    #[kani::stub(solana_program::log::sol_log, stub_log)]
     #[kani::unwind(2)]
     fn kani_f3_dead_share_only_pool_books_nothing_and_loses_nothing() {
         let mut pool = any_pool();
@@ -5544,6 +5553,8 @@ mod kani_f3_dead_share_guard {
     /// (the guard is not an always-refuse).
     #[kani::proof]
     #[kani::solver(kissat)]
+    #[kani::stub(std::fmt::format, stub_format)]
+    #[kani::stub(solana_program::log::sol_log, stub_log)]
     #[kani::unwind(2)]
     fn kani_f3_real_holder_pool_still_books() {
         let mut pool = any_pool();
