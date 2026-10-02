@@ -5473,3 +5473,58 @@ mod tests {
         );
     }
 }
+
+/// Kani design 2026-09-30 (Sentinel), D-ST-01b: the F3 "payout stays bookable" claim stated
+/// INDEPENDENTLY of `mode0_attributable_fees` (the lane harness recomputed both sides with that
+/// function, so mutant M2 — the unarmed branch consuming the payout — survived it). Spec, from the
+/// #290 design (`math.rs:470-495` doc): the amount already attributed is the cursor when armed, and
+/// otherwise `paid − min(surplus, paid)` (arming treats the current surplus as the payout still
+/// pending). A skipped (dead-share) accrual must ARM the cursor at exactly that value, so the
+/// payout still pending afterwards is `min(surplus, paid − attributed)`, and book nothing.
+/// Calls the production `accrue_fees_inner` on a fully symbolic pool (mode 0), fmt/log stubbed.
+/// Planned mutant M2 (unarmed cursor = wrapper_paid) must red.
+#[cfg(kani)]
+mod kani_design_f3_bookable {
+    use super::*;
+    use crate::state::{StakePool, MINIMUM_LIQUIDITY};
+
+    fn stub_format(_args: core::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+    fn stub_log(_m: &str) {}
+
+    #[kani::proof]
+    #[kani::solver(kissat)]
+    #[kani::stub(std::fmt::format, stub_format)]
+    #[kani::stub(solana_program::log::sol_log, stub_log)]
+    #[kani::unwind(2)]
+    fn kani_design_f3_skipped_accrual_keeps_payout_pending() {
+        let bytes: [u8; core::mem::size_of::<StakePool>()] = kani::any();
+        let mut pool: StakePool = bytemuck::pod_read_unaligned(&bytes[..]);
+        kani::assume(pool.pool_mode == 0);
+        kani::assume(pool.total_lp_supply <= MINIMUM_LIQUIDITY);
+        let before = pool;
+        let balance: u64 = kani::any();
+        let paid: u128 = kani::any();
+        let Some(pv) = before.total_pool_value() else { return };
+        let surplus = balance.saturating_sub(pv) as u128;
+        let attributed_before: u128 = if before.fee_attribution_armed() {
+            before.mode0_fees_attributed as u128
+        } else {
+            paid - surplus.min(paid)
+        };
+        let r = accrue_fees_inner(&mut pool, balance, Some(paid));
+        kani::cover!(r.is_ok() && !before.fee_attribution_armed() && surplus > 0 && paid > 0, "first (arming) accrual on a dead-share pool with a payout pending");
+        kani::cover!(r.is_ok() && before.fee_attribution_armed() && surplus > 0, "armed dead-share pool with a surplus");
+        if r.is_err() {
+            return;
+        }
+        assert_eq!(pool.total_fees_earned, before.total_fees_earned, "nothing booked to dead shares");
+        assert!(pool.fee_attribution_armed(), "the cursor is armed");
+        assert_eq!(pool.mode0_fees_attributed as u128, attributed_before, "the cursor records exactly what was attributed before; the pending payout is not consumed");
+        let pending_after = surplus.min(paid.saturating_sub(pool.mode0_fees_attributed as u128));
+        let pending_before = surplus.min(paid.saturating_sub(attributed_before));
+        assert_eq!(pending_after, pending_before);
+        kani::cover!(pending_after > 0, "a real payout stays pending for the first real holder");
+    }
+}
