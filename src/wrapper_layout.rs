@@ -107,3 +107,16 @@ const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1382);
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);
+
+/// True iff `data` carries the wrapper magic and EXACTLY the pinned header VERSION. Every raw
+/// slab reader must call this before touching an offset in this module.
+pub fn header_is_pinned(data: &[u8]) -> bool {
+    const MAGIC: u64 = 0x5045_5243_5631_3600;
+    match (data.get(0..8), data.get(8..10)) {
+        (Some(m), Some(v)) => {
+            u64::from_le_bytes(m.try_into().unwrap()) == MAGIC
+                && u16::from_le_bytes(v.try_into().unwrap()) == WRAPPER_VERSION
+        }
+        _ => false,
+    }
+}

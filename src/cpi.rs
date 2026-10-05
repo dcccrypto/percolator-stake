@@ -187,6 +187,12 @@ const ASSET_AUTH_ADMIN: u8 = 0;
 #[inline]
 fn read_market_u64(market: &AccountInfo, off: usize) -> Result<u64, ProgramError> {
     let data = market.try_borrow_data()?;
+    // v2.2 (W-M3): refuse any slab that is not the pinned layout BEFORE reading a single
+    // offset. A v2.1 (VERSION 18) slab read at v2.2 offsets lands 32 B off: a CAS on coincident
+    // zeros and a monotone watermark can both silently succeed.
+    if !crate::wrapper_layout::header_is_pinned(&data) {
+        return Err(crate::error::StakeError::UnsupportedWrapperLayout.into());
+    }
     let bytes = data
         .get(off..off + 8)
         .ok_or(ProgramError::InvalidAccountData)?;
@@ -1606,6 +1612,8 @@ mod tag_tests {
     fn synthetic_market_data(market_id: u64, authority_epoch: u64, insurance_top_up: u64) -> Vec<u8> {
         let len = ASSET0_MARKET_ID_OFF + 8;
         let mut data = vec![0u8; len];
+        data[0..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+        data[8..10].copy_from_slice(&crate::wrapper_layout::WRAPPER_VERSION.to_le_bytes());
         data[ASSET0_MARKET_ID_OFF..ASSET0_MARKET_ID_OFF + 8]
             .copy_from_slice(&market_id.to_le_bytes());
         data[ASSET0_AUTHORITY_EPOCH_OFF..ASSET0_AUTHORITY_EPOCH_OFF + 8]
@@ -1686,6 +1694,42 @@ mod tag_tests {
         assert_eq!(read_asset0_authority_epoch(&market).unwrap(), 77);
         // intent_id must be the watermark PLUS ONE (strictly greater, not CAS).
         assert_eq!(next_asset0_intent_id(&market).unwrap(), 101);
+    }
+
+    /// W-M3: a v2.1 (VERSION 18) or unstamped slab is refused BEFORE any offset read, for every
+    /// raw reader. On a fresh v2.1 slab the v2.2 offsets would read coincident zeros (CAS) or an
+    /// unrelated lane (watermark), i.e. silently succeed. Control: the same bytes stamped 19 read.
+    #[test]
+    fn test_v21_stamped_slab_is_refused_by_every_reader() {
+        use crate::error::StakeError;
+        let refused: ProgramError = StakeError::UnsupportedWrapperLayout.into();
+        for bad in [18u16, 17, 20, 0] {
+            let mut data = synthetic_market_data_full(7, 5, 9, 11, 1, 2, 3);
+            data[8..10].copy_from_slice(&bad.to_le_bytes());
+            let key = Pubkey::new_from_array([3u8; 32]);
+            let owner = Pubkey::new_from_array([4u8; 32]);
+            let mut lamports = 0u64;
+            let m = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+            assert_eq!(read_asset0_market_id(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(read_asset0_authority_epoch(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(next_asset0_intent_id(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(read_market_asset_generation_frontier(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(next_asset0_trade_fee_policy_sequence(&m).unwrap_err(), refused, "v{bad}");
+        }
+        // wrong magic
+        let mut data = synthetic_market_data_full(7, 5, 9, 11, 1, 2, 3);
+        data[0] ^= 0xff;
+        let key = Pubkey::new_from_array([3u8; 32]);
+        let owner = Pubkey::new_from_array([4u8; 32]);
+        let mut lamports = 0u64;
+        let m = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+        assert_eq!(read_asset0_market_id(&m).unwrap_err(), refused);
+        // control
+        let mut data = synthetic_market_data_full(7, 5, 9, 11, 1, 2, 3);
+        let mut lamports = 0u64;
+        let m = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+        assert_eq!(read_asset0_market_id(&m).unwrap(), 7);
+        assert_eq!(read_market_asset_generation_frontier(&m).unwrap(), 11);
     }
 
     #[test]
