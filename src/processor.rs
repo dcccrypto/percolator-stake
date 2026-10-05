@@ -517,11 +517,11 @@ fn process_init_pool(
         // it. This allowlist must trust that fresh id; the prior devnet wrapper (DhSkE7u…, v17)
         // is abandoned, not trusted. Mirrors percolator-nft cpi_v16.rs PERCOLATOR_DEVNET and the
         // wrapper's compiled-in devnet pin — all three move together.
-        // v18.3 fresh-ID redeploy (2026-09-29): moves again to ETDLAdi… so the damaged
+        // v18.3 fresh-ID redeploy (2026-09-29): moved to ETDLAdi… (v2.1 2026-10-05: 5NGgnU2j…) so the damaged
         // GnwdeQr… markets are abandoned; GnwdeQr… is no longer trusted.
         #[cfg(feature = "devnet")]
         const PERCOLATOR_DEVNET: Pubkey =
-            solana_program::pubkey!("ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB");
+            solana_program::pubkey!("5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe");
         let is_valid = *percolator_program.key == PERCOLATOR_MAINNET;
         #[cfg(feature = "devnet")]
         let is_valid = is_valid || *percolator_program.key == PERCOLATOR_DEVNET;
