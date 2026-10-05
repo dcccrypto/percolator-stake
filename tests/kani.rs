@@ -77,6 +77,8 @@ mod kani_proofs {
             deposit,
             back
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: First depositor gets exact 1:1 (no loss, no gain).
@@ -91,6 +93,8 @@ mod kani_proofs {
 
         let back = calc_collateral_for_withdraw(lp, amount, lp).unwrap();
         assert_eq!(back, amount, "First depositor full withdraw must be exact");
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Two depositors, both fully withdraw → total out ≤ total in.
@@ -137,6 +141,8 @@ mod kani_proofs {
             a_back,
             b_back
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -155,6 +161,8 @@ mod kani_proofs {
         kani::assume(pv <= 1_000_000_000);
         kani::assume(amount <= 1_000_000_000);
         let _ = calc_lp_for_deposit(supply, pv, amount);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: calc_collateral_for_withdraw never panics.
@@ -169,6 +177,8 @@ mod kani_proofs {
         kani::assume(pv <= 1_000_000_000);
         kani::assume(lp <= 1_000_000_000);
         let _ = calc_collateral_for_withdraw(supply, pv, lp);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: pool_value never panics.
@@ -201,6 +211,8 @@ mod kani_proofs {
         let lp1 = calc_lp_for_deposit(supply, pv, amount);
         let lp2 = calc_lp_for_deposit(supply, pv, amount);
         assert_eq!(lp1, lp2);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Larger deposit → ≥ LP tokens (monotonicity).
@@ -231,6 +243,8 @@ mod kani_proofs {
             lp_l >= lp_s,
             "Monotonicity violated: more deposit → less LP"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Larger LP burn → ≥ collateral (monotonicity).
@@ -261,6 +275,8 @@ mod kani_proofs {
             c_l >= c_s,
             "Monotonicity violated: more LP burn → less collateral"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -283,6 +299,8 @@ mod kani_proofs {
         };
 
         assert!(col <= pv, "Full burn {} exceeds pool value {}", col, pv);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Partial burn returns strictly less than full burn
@@ -308,6 +326,8 @@ mod kani_proofs {
         };
 
         assert!(part <= full, "Partial {} exceeds full {}", part, full);
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -357,6 +377,8 @@ mod kani_proofs {
             (Some(o), Some(n)) => assert!(n >= o, "Deposit must not decrease value"),
             _ => {} // overflow cases
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -377,11 +399,16 @@ mod kani_proofs {
         kani::assume(deposit <= 1_000_000_000);
 
         if let Some(lp) = calc_lp_for_deposit(supply, pv, deposit) {
-            // floor(deposit * supply / pv) * pv ≤ deposit * supply
-            let lhs = (lp as u128) * (pv as u128);
-            let rhs = (deposit as u128) * (supply as u128);
+            // RESTATED 2026-09-30 (Sentinel, L-DIL-VIRT): since N7 the price carries the virtual
+            // offsets VIRTUAL_SHARES = VIRTUAL_ASSETS = 1 (src/math.rs:39-40), so the pool-favoring
+            // floor is lp*(pv+1) <= deposit*(supply+1). The pre-N7 form lp*pv <= deposit*supply is
+            // FALSE for the correct code (e.g. supply=1, pv=2, deposit=5: lp=3, 6 > 5).
+            let lhs = (lp as u128) * (pv as u128 + 1);
+            let rhs = (deposit as u128) * (supply as u128 + 1);
             assert!(lhs <= rhs, "LP rounding not pool-favoring");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: Collateral withdrawal rounds DOWN (pool-favoring).
@@ -398,10 +425,14 @@ mod kani_proofs {
         kani::assume(lp <= supply);
 
         if let Some(col) = calc_collateral_for_withdraw(supply, pv, lp) {
-            let lhs = (col as u128) * (supply as u128);
-            let rhs = (lp as u128) * (pv as u128);
+            // RESTATED 2026-09-30 (Sentinel, L-DIL-VIRT): offsets as in calc_collateral_for_withdraw
+            // (src/math.rs:119-121): col*(supply+1) <= lp*(pv+1).
+            let lhs = (col as u128) * (supply as u128 + 1);
+            let rhs = (lp as u128) * (pv as u128 + 1);
             assert!(lhs <= rhs, "Withdrawal rounding not pool-favoring");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -426,6 +457,8 @@ mod kani_proofs {
 
         assert_eq!(senior_loss, 0, "Senior lost while junior was positive");
         assert_eq!(junior_loss, loss_amount, "Junior did not absorb full loss");
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -453,6 +486,8 @@ mod kani_proofs {
             senior_loss <= senior_balance,
             "Senior lost more than balance"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -480,6 +515,8 @@ mod kani_proofs {
             jf as u128 + sf as u128 <= total_fee as u128,
             "Fee distribution exceeds total"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -515,6 +552,8 @@ mod kani_proofs {
         } else {
             assert!(!allowed, "overflow floor must block");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -535,6 +574,8 @@ mod kani_proofs {
                 "higher TVL must produce higher or equal floor"
             );
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     #[kani::proof]
@@ -550,6 +591,8 @@ mod kani_proofs {
         if let Some(floor) = hwm_floor(tvl, bps) {
             assert!(floor <= tvl, "floor must never exceed HWM TVL");
         }
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -687,6 +730,8 @@ mod kani_proofs {
             junior_total_lp,
             "junior_total_lp clobbered by HWM"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // ── PR#83 HIGH: distribute_fees Overflow Safety ──
@@ -713,6 +758,8 @@ mod kani_proofs {
             total_fee,
         );
         // If we reach here without panic, the proof passes.
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// PROOF: distribute_fees is conservative at full u64 range.
@@ -1002,5 +1049,132 @@ mod kani_proofs {
             !real && released > recoverable0 && recoverable0 > 0,
             "COVER: dead shares, principal only"
         );
+    }
+
+    /// REVIEW (Sentinel 2026-09-30): `kani_f9_pool_receives_exactly_what_wrapper_releases`
+    /// assumes the vault was FULLY BOOKED before the release (balance == value + released).
+    /// This drops that assumption: any pre-existing unbooked surplus `u` (e.g. a dead-share
+    /// fee remainder `book_terminal_recovery` deliberately left unbooked, or a donation) is
+    /// also booked by the next terminal recovery. The exact statement is therefore
+    /// "with real holders, pool value becomes EXACTLY the vault balance", not "rises by
+    /// exactly what the wrapper released"; the two coincide only when u == 0.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_review_f9_books_whole_vault_surplus() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        let released: u64 = kani::any();
+        let unbooked: u64 = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B && released <= B && unbooked <= B);
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let recoverable0 = p.wrapper_recoverable();
+        let real = percolator_stake::math::has_real_lp_holders(p.total_lp_supply);
+        let balance = v0 + unbooked + released;
+        let (r, f) = p.book_terminal_recovery(balance).expect("bounded input");
+        let v1 = p.total_pool_value().expect("representable");
+        assert!(v1 <= balance);
+        if real {
+            assert_eq!(v1, balance, "real holders: the WHOLE vault surplus is booked");
+        } else {
+            assert_eq!(f, 0);
+            assert_eq!(r, (unbooked + released).min(recoverable0));
+        }
+        kani::cover!(real && unbooked > 0 && released > 0 && v1 > v0 + released,
+            "pre-existing unbooked surplus is booked on top of the release");
+    }
+
+    /// REVIEW twin (Sentinel 2026-09-30, D-ST-03t): the same whole-vault booking on a
+    /// TRANCHE-ENABLED pool with a live junior, so `book_fee_delta`'s junior split and its M-2
+    /// guard (junior_balance > pool value => Err) are on the path. Claim: terminal recovery never
+    /// reverts on a valid tranche pool (junior <= pool value) and still books the whole surplus.
+    /// Nonlinear (distribute_fees divides by symbolic balances): kissat, 1 h cap; on NO VERDICT
+    /// the F-9 claim is stated for tranche-disabled pools only.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    #[kani::solver(kissat)]
+    fn kani_review_f9_books_whole_vault_surplus_tranche_pool() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B);
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        kani::assume(percolator_stake::math::has_real_lp_holders(p.total_lp_supply));
+        p.set_tranche_enabled(true);
+        let jlp: u64 = kani::any();
+        let jbal: u64 = kani::any();
+        let mult: u16 = kani::any();
+        kani::assume(jlp > 0 && jlp < p.total_lp_supply);
+        p.set_junior_total_lp(jlp);
+        p.set_junior_fee_mult_bps(mult);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        kani::assume(jbal <= v0); // pool invariant: the junior sub-balance is within pool value
+        p.set_junior_balance(jbal);
+        let released: u64 = kani::any();
+        let unbooked: u64 = kani::any();
+        kani::assume(released <= B && unbooked <= B);
+        let balance = v0 + unbooked + released;
+        let r = p.book_terminal_recovery(balance);
+        assert!(r.is_ok(), "terminal recovery never reverts on a valid tranche pool");
+        let v1 = p.total_pool_value().expect("representable");
+        assert_eq!(v1, balance, "the whole vault surplus is booked");
+        assert!(p.junior_balance() <= v1, "M-2 invariant kept");
+        kani::cover!(jbal > 0 && released > 0 && p.junior_balance() > jbal, "junior share of the recovered fees credited");
+    }
+
+    /// D-ST-04s (Sentinel 2026-09-30): small-width twin of `proof_deposit_withdraw_no_inflation`
+    /// (whose recorded "FAIL" was a CBMC SIGTERM kill, not a counterexample). Same property on the
+    /// REAL `calc_lp_for_deposit` / `calc_collateral_for_withdraw` (N7 virtual offsets included),
+    /// u8 inputs, no silent returns on the minted path (covers name every branch). Full width is
+    /// L-DIL-VIRT (paper: m(P+V_A) <= d(S+V_S) by the floor, hence the round trip never gains).
+    #[kani::proof]
+    #[kani::solver(kissat)]
+    fn kani_design_st04s_deposit_withdraw_no_inflation_u8() {
+        let lp_supply: u8 = kani::any();
+        let pv: u8 = kani::any();
+        let deposit: u8 = kani::any();
+        kani::assume(deposit > 0 && lp_supply > 0 && pv > 0);
+        let (s, p, d) = (lp_supply as u64, pv as u64, deposit as u64);
+        let minted = calc_lp_for_deposit(s, p, d);
+        kani::cover!(matches!(minted, Some(0)), "dust deposit mints nothing");
+        let Some(m) = minted else { panic!("u8 inputs cannot overflow or hit a blocked branch") };
+        if m == 0 {
+            return;
+        }
+        let back = calc_collateral_for_withdraw(s + m, p + d, m).expect("u8 inputs cannot overflow");
+        assert!(back <= d, "round trip never returns more than deposited");
+        kani::cover!(back < d, "round trip loses dust to the pool");
+        kani::cover!(back == d, "exact round trip");
     }
 }
