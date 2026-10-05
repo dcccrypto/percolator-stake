@@ -43,6 +43,11 @@ use solana_sdk::{
 use std::path::PathBuf;
 use std::str::FromStr;
 
+/// Builds whose header VERSION is 19 (v2.2 layout). For THESE the supported-version gate may not
+/// route them to the fail-closed branch below: a stale `WRAPPER_SUPPORTED_VERSION` would
+/// otherwise make this whole test pass vacuously (it only NOTEs and skips the offset pin).
+const V19_PINNED_SHAS: &[&str] = &["d2b14df9388dbfe9e536d27322aef3403b12007b025e7cc953b19642d15e3475"];
+
 const PINNED_WRAPPERS: &[(&str, &str)] = &[
     (
         "d2b14df9388dbfe9e536d27322aef3403b12007b025e7cc953b19642d15e3475",
@@ -219,6 +224,13 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
 
         let live = svm.get_account(&market).unwrap().data;
         let version = u16::from_le_bytes([live[8], live[9]]);
+        if V19_PINNED_SHAS.contains(&sha.as_str()) {
+            assert_eq!(
+                version, WRAPPER_SUPPORTED_VERSION,
+                "{}: a pinned VERSION-19 wrapper must be the SUPPORTED layout, not fail-closed (stale WRAPPER_SUPPORTED_VERSION?)",
+                so.display()
+            );
+        }
         if version != WRAPPER_SUPPORTED_VERSION {
             // Not the pinned layout (e.g. the v17 CI sibling 15eb8b0c, VERSION 17).
             // The pin below does not apply; what MUST hold is that the guard fails
