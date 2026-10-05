@@ -1398,8 +1398,10 @@ mod tests {
             (
                 1,
                 {
+                    // v5: a 9th byte is the first-loss consent version; a 10th is trailing.
                     let mut payload = Vec::new();
                     payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(1);
                     payload.push(99);
                     payload
                 },

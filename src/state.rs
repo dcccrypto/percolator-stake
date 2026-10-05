@@ -1482,9 +1482,9 @@ mod tests {
         // Ensure struct is packed correctly (no surprise padding)
         assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
         // v4 size: v3's 392 + pending_cooldown_slots[8] + cooldown_proposed_at_slot[8]
-        //   = 408. Both APPENDED after total_recovered_from_wrapper (384), so no
-        //   existing offset moves.
-        assert_eq!(STAKE_POOL_SIZE, 408);
+        //   = 408. v5 (Phase 4 item 6) APPENDS 72 bytes of first-loss fields at 408
+        //   = 480; no existing offset moves.
+        assert_eq!(STAKE_POOL_SIZE, 480);
     }
 
     #[test]

@@ -2523,41 +2523,6 @@ fn apply_minimum_liquidity_lock(
 // PERC-272: LP Vault — Fee Accrual & Trading Pool Init
 // ============================================================================
 
-/// #136 pre-accrue guard — shared by EVERY path that prices against pool balances
-/// (`process_deposit`, `process_withdraw`, `process_deposit_junior`). Crystallizes any
-/// pending fee-accruing-mode surplus into share price BEFORE pricing, so LP cannot be
-/// minted/redeemed at the stale pre-accrual price and capture fees earned before joining.
-///
-/// MUST be called AFTER the caller has verified `pool.vault == vault.key` and BEFORE the
-/// caller's user<->vault transfer, so the balance read reflects only the fee surplus and
-/// NOT the operation's own collateral. Idempotent (a second call folds zero surplus).
-/// Centralized so the pricing paths cannot drift — this guard was previously
-/// inline-duplicated and the junior path was the one that was missed (see #146).
-///
-/// 2026-07-19 (plan amendment, THIRD EDIT): widened from `pool_mode == 1` to
-/// `pool_mode <= 1` and renamed from `pre_accrue_mode1` — the old name became a
-/// lie the moment mode-0 pools started accruing fees (Task 11's first two
-/// edits: `total_pool_value()` now folds in `total_fees_earned` for mode 0
-/// too, and the permissionless `AccrueFees` instruction accepts
-/// `pool_mode <= 1`). Leaving THIS guard mode-1-only armed a front-running/
-/// dilution vector: with a pending, un-accrued vault surplus sitting in a
-/// mode-0 pool, a depositor could mint LP priced against the STALE
-/// `total_pool_value()` (this guard was a no-op for them), then
-/// permissionlessly self-call `AccrueFees` in the same transaction — the
-/// surplus then distributes pro-rata over the POST-deposit LP supply,
-/// handing the depositor a slice of fees that accrued before they staked
-/// and diluting every pre-existing LP holder. Widening the predicate closes
-/// it: deposit/withdraw pricing for mode 0 now crystallizes the surplus
-/// FIRST, exactly as it always has for mode 1. The body's logic below is
-/// UNCHANGED — only the predicate and this function's name differ.
-///
-/// #290: a mode-0 pool books only surplus the wrapper can account for (see
-/// `accrue_fees_inner`), which needs the pool's wrapper market account (`slab`).
-/// `require_slab` is true on the paths that MINT LP (Deposit, DepositJunior): minting
-/// at a price that has not yet absorbed pending wrapper-paid fees is exactly the #136
-/// JIT capture, so those paths refuse to run without it. Withdraw passes false and
-/// skips the accrual when the slab is absent. Redeeming at the not-yet-accrued price
-/// can only under-pay the withdrawer, never over-pay them, so it is not an attack.
 // ═══════════════════════════════════════════════════════════════
 // v5 helpers (Phase 4 item 6): the wrapper's insurance-unit ledger
 // ═══════════════════════════════════════════════════════════════
@@ -2613,6 +2578,41 @@ fn token_balance(ai: &AccountInfo) -> Result<u64, ProgramError> {
     Ok(acct.amount)
 }
 
+/// #136 pre-accrue guard — shared by EVERY path that prices against pool balances
+/// (`process_deposit`, `process_withdraw`, `process_deposit_junior`). Crystallizes any
+/// pending fee-accruing-mode surplus into share price BEFORE pricing, so LP cannot be
+/// minted/redeemed at the stale pre-accrual price and capture fees earned before joining.
+///
+/// MUST be called AFTER the caller has verified `pool.vault == vault.key` and BEFORE the
+/// caller's user<->vault transfer, so the balance read reflects only the fee surplus and
+/// NOT the operation's own collateral. Idempotent (a second call folds zero surplus).
+/// Centralized so the pricing paths cannot drift — this guard was previously
+/// inline-duplicated and the junior path was the one that was missed (see #146).
+///
+/// 2026-07-19 (plan amendment, THIRD EDIT): widened from `pool_mode == 1` to
+/// `pool_mode <= 1` and renamed from `pre_accrue_mode1` — the old name became a
+/// lie the moment mode-0 pools started accruing fees (Task 11's first two
+/// edits: `total_pool_value()` now folds in `total_fees_earned` for mode 0
+/// too, and the permissionless `AccrueFees` instruction accepts
+/// `pool_mode <= 1`). Leaving THIS guard mode-1-only armed a front-running/
+/// dilution vector: with a pending, un-accrued vault surplus sitting in a
+/// mode-0 pool, a depositor could mint LP priced against the STALE
+/// `total_pool_value()` (this guard was a no-op for them), then
+/// permissionlessly self-call `AccrueFees` in the same transaction — the
+/// surplus then distributes pro-rata over the POST-deposit LP supply,
+/// handing the depositor a slice of fees that accrued before they staked
+/// and diluting every pre-existing LP holder. Widening the predicate closes
+/// it: deposit/withdraw pricing for mode 0 now crystallizes the surplus
+/// FIRST, exactly as it always has for mode 1. The body's logic below is
+/// UNCHANGED — only the predicate and this function's name differ.
+///
+/// #290: a mode-0 pool books only surplus the wrapper can account for (see
+/// `accrue_fees_inner`), which needs the pool's wrapper market account (`slab`).
+/// `require_slab` is true on the paths that MINT LP (Deposit, DepositJunior): minting
+/// at a price that has not yet absorbed pending wrapper-paid fees is exactly the #136
+/// JIT capture, so those paths refuse to run without it. Withdraw passes false and
+/// skips the accrual when the slab is absent. Redeeming at the not-yet-accrued price
+/// can only under-pay the withdrawer, never over-pay them, so it is not an attack.
 fn pre_accrue_fee_modes(
     pool: &mut state::StakePool,
     vault: &AccountInfo,
