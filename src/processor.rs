@@ -3797,7 +3797,7 @@ fn process_recover_terminal_insurance(
     // no longer take deposits or flushes (see `StakePool::book_terminal_recovery`).
     let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
     if terminal == state::WrapperTerminal::UnknownLayout {
-        msg!("RecoverTerminalInsurance: wrapper market is not the pinned layout (VERSION 18)");
+        msg!("RecoverTerminalInsurance: wrapper market is not the pinned layout (VERSION 19)");
         return Err(StakeError::UnsupportedWrapperLayout.into());
     }
     if terminal == state::WrapperTerminal::NotTerminal {
@@ -4080,7 +4080,7 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     }
     let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
     if terminal == state::WrapperTerminal::UnknownLayout {
-        msg!("AdminCloseSlab: wrapper market is not the pinned layout (VERSION 18)");
+        msg!("AdminCloseSlab: wrapper market is not the pinned layout (VERSION 19)");
         return Err(StakeError::UnsupportedWrapperLayout.into());
     }
     if terminal != state::WrapperTerminal::Resolved {

@@ -102,7 +102,7 @@ pub enum StakeError {
     /// surplus. The call is refused so a keeper can tell a no-op from a recovery.
     NothingToRecover = 31,
     /// F-9 (security INFO): the bound wrapper market account is not the wrapper
-    /// layout this program has pinned (magic, VERSION 18, kind, minimum length,
+    /// layout this program has pinned (magic, VERSION 19, kind, minimum length,
     /// known mode value). Its engine `mode` byte cannot be trusted, so the terminal
     /// recovery, the CloseSlab proxy, and the mode-0 deposit path all refuse rather
     /// than guess. A wrapper layout bump needs a coordinated stake upgrade.
@@ -191,7 +191,7 @@ pub fn error_hint(code: u32) -> &'static str {
         29 => "No real LP holders — the pool's only LP supply is the MINIMUM_LIQUIDITY dead-share floor, so AccrueFees refuses to book fees nobody could redeem; the fees stay in the vault and are booked once a real staker deposits (F3)",
         30 => "Market not terminal — RecoverTerminalInsurance needs the bound wrapper market to be Resolved (or closed); while the market is Live use RecoverFlushedInsurance, and a non-zero amount needs a Resolved (not closed) market (F-9)",
         31 => "Nothing to recover — no terminal insurance was withdrawn, no stray vault_auth token account was swept, and the pool vault has no unbooked surplus (F-9)",
-        32 => "Unsupported wrapper layout — the bound market account is not the pinned wrapper layout (magic, VERSION 18, kind, minimum length), so its resolved/live state cannot be read; the stake program must be upgraded together with the wrapper (F-9)",
+        32 => "Unsupported wrapper layout — the bound market account is not the pinned wrapper layout (magic, VERSION 19, kind, minimum length), so its resolved/live state cannot be read; the stake program must be upgraded together with the wrapper (F-9)",
         33 => "Consent required — a first-loss stake deposit must carry the current risk-consent version; review and accept the risk text in the app",
         34 => "Deprecated on v5 — FlushToInsurance / RecoverFlushedInsurance were removed; deployment is the permissionless SyncInsuranceDeployment",
         35 => "Insurance units invalid — pass the wrapper's InsuranceUnitsV20 account for this market (it is refreshed in the same instruction)",

@@ -231,8 +231,8 @@ fn inject_pool(
     // which must be owned by `pool.percolator_program` (zeroed here => the System
     // program id) and carry the wrapper market header. Counter = 0.
     // F-9 layout guard: Deposit now also classifies this account's header, and
-    // refuses anything but the pinned wrapper layout (VERSION 18, at least
-    // WRAPPER_MIN_MARKET_LEN bytes). So the synthetic market carries VERSION 18 and the
+    // refuses anything but the pinned wrapper layout (VERSION 19, at least
+    // WRAPPER_MIN_MARKET_LEN bytes). So the synthetic market carries VERSION 19 and the
     // minimum length, with mode byte 0 (Live). The #290 counter is unaffected.
     let mut slab_data = vec![0u8; percolator_stake::state::WRAPPER_MIN_MARKET_LEN];
     slab_data[0..8].copy_from_slice(&percolator_stake::state::WRAPPER_MAGIC.to_le_bytes());

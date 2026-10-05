@@ -1205,15 +1205,15 @@ pub fn read_wrapper_insurance_reserve_withdrawn(data: &[u8]) -> Option<u128> {
 //
 //   * Resolved: kind == KIND_MARKET (1) and the engine header `mode` byte == 1.
 //     `mode` sits at MARKET_GROUP_OFF (592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN
-//     576) + offset_of!(MarketGroupV16HeaderAccount, mode) (626, engine c141d47f)
-//     = 1218. Values: 0 Live, 1 Resolved, 2 Recovery (`decode_market_mode`).
+//     576) + offset_of!(MarketGroupV16HeaderAccount, mode) (658, engine 4ceac24a;
+//     626 at layout 18) = 1250. Derived in `wrapper_layout.rs`. Values: 0 Live, 1 Resolved, 2 Recovery (`decode_market_mode`).
 //     Recovery (2) is NOT terminal and is treated as not-resolved here.
 //   * Closed: kind == KIND_CLOSED_MARKET (8), the tombstone CloseSlab leaves
 //     (`state::write_closed_market_tombstone`). Our fork's value is 8, not the
 //     upstream 5.
 //
 // `tests/f9_terminal_insurance_recovery_e2e.rs` pins the mode offset against the
-// REAL deployed v18.2 wrapper .so (6377376a) and the P1 wrapper .so: byte 1218 is 0
+// REAL deployed v18.2 wrapper .so (6377376a) and the P1 wrapper .so: byte 1250 (1218 on v2.1) is 0
 // while Live and 1 after ResolveMarket. If the engine header moves, that test fails;
 // update the constant here and redeploy together.
 // ════════════════════════════════════════════════════════════════════════════
@@ -1221,13 +1221,14 @@ pub const WRAPPER_KIND_CLOSED_MARKET: u8 = 8;
 pub const WRAPPER_HEADER_LEN: usize = 16;
 pub const WRAPPER_OFF_VERSION: usize = 8;
 /// The only wrapper account VERSION whose engine header this program has pinned
-/// (`constants::VERSION` in deploy/v18.2-wrapper@6377376a AND P1 c0ffaefa).
-pub const WRAPPER_SUPPORTED_VERSION: u16 = 18;
-/// `MIN_MARKET_ACCOUNT_LEN = MARKET_GROUP_OFF (592) + MARKET_GROUP_LEN (758)` on
+/// (`constants::VERSION` = 19 in wrapper f576bffc / feat/v22-wave-b; 18 in the v2.1
+/// wrappers deploy/v18.2-wrapper@6377376a and P1 c0ffaefa, which stake v2.2 refuses).
+pub const WRAPPER_SUPPORTED_VERSION: u16 = crate::wrapper_layout::WRAPPER_VERSION;
+/// `MIN_MARKET_ACCOUNT_LEN = MARKET_GROUP_OFF (592) + MARKET_GROUP_LEN (790)` on
 /// the pinned layout. A market account shorter than this cannot hold the engine
 /// header, so the mode byte at [`WRAPPER_OFF_MODE`] is not trusted.
-pub const WRAPPER_MIN_MARKET_LEN: usize = 592 + 758;
-pub const WRAPPER_OFF_MODE: usize = 592 + 626;
+pub const WRAPPER_MIN_MARKET_LEN: usize = crate::wrapper_layout::MIN_MARKET_ACCOUNT_LEN;
+pub const WRAPPER_OFF_MODE: usize = crate::wrapper_layout::MARKET_MODE_OFF;
 pub const WRAPPER_MODE_LIVE: u8 = 0;
 pub const WRAPPER_MODE_RESOLVED: u8 = 1;
 pub const WRAPPER_MODE_RECOVERY: u8 = 2;
@@ -1245,13 +1246,13 @@ pub enum WrapperTerminal {
     /// [`WRAPPER_SUPPORTED_VERSION`], an unknown kind, a market shorter than
     /// [`WRAPPER_MIN_MARKET_LEN`], a tombstone of the wrong length, or a mode byte
     /// outside {0, 1, 2}. Callers REFUSE (`UnsupportedWrapperLayout`, 32): on an
-    /// unpinned layout, byte 1218 is not known to be the mode, so it proves nothing.
+    /// unpinned layout, byte 1250 is not known to be the mode, so it proves nothing.
     UnknownLayout,
 }
 
 /// F-9: classify a wrapper market account. The caller must already have checked
 /// the account's key (== `pool.slab`) and owner (== `pool.percolator_program`).
-/// Fails closed: only the exact pinned layout (magic, VERSION 18, kind, length)
+/// Fails closed: only the exact pinned layout (magic, VERSION 19, kind, length)
 /// is ever classified; everything else is `UnknownLayout`.
 pub fn read_wrapper_terminal(data: &[u8]) -> WrapperTerminal {
     if data.len() < WRAPPER_HEADER_LEN {
@@ -1302,7 +1303,7 @@ mod tests {
     fn wrapper_market_bytes(counter: u128) -> Vec<u8> {
         let mut d = vec![0u8; 592];
         d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
-        d[8..10].copy_from_slice(&18u16.to_le_bytes());
+        d[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
         d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
         d[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN + 16]
             .copy_from_slice(&counter.to_le_bytes());
@@ -1312,7 +1313,7 @@ mod tests {
     // ── F-9: wrapper terminal-state reader + terminal booking ──
 
     fn wrapper_market_with_mode(mode: u8) -> Vec<u8> {
-        let mut d = vec![0u8; 3675];
+        let mut d = vec![0u8; 3819]; // v2.2 cap-1 market: 592 + 790 + 2437
         d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
         d[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
         d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
@@ -1331,8 +1332,8 @@ mod tests {
     #[test]
     fn test_f9_read_wrapper_terminal() {
         use WrapperTerminal::*;
-        assert_eq!(WRAPPER_OFF_MODE, 1218);
-        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1350);
+        assert_eq!(WRAPPER_OFF_MODE, 1250); // v2.1: 1218
+        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1382);
         assert_eq!(
             read_wrapper_terminal(&wrapper_market_with_mode(0)),
             NotTerminal
@@ -1363,8 +1364,9 @@ mod tests {
         let mut t = tombstone();
         t[0] ^= 0xff;
         assert_eq!(read_wrapper_terminal(&t), UnknownLayout);
-        // Any other VERSION: 17 (v17 layout, mode elsewhere), 19 (future), 0.
-        for v in [0u16, 17, 19, u16::MAX] {
+        // Any other VERSION: 17 (v17 layout, mode elsewhere), 18 (v2.1: the mode byte is
+        // 32 B EARLIER, so trusting 1250 there would be a silent misread), 20 (future), 0.
+        for v in [0u16, 17, 18, 20, u16::MAX] {
             let mut m = wrapper_market_with_mode(1);
             m[8..10].copy_from_slice(&v.to_le_bytes());
             assert_eq!(

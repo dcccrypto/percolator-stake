@@ -69,6 +69,12 @@
 //! `require_newer_control_sequence`).
 #![allow(clippy::too_many_arguments)]
 
+// v2.2: every wrapper-slab offset is derived in ONE module (see its header).
+pub use crate::wrapper_layout::{
+    ASSET0_AUTHORITY_EPOCH_OFF, ASSET0_BACKING_FEE_LONG_OFF, ASSET0_BACKING_FEE_SHORT_OFF,
+    ASSET0_INSURANCE_TOP_UP_OFF, ASSET0_MARKET_ID_OFF, ASSET0_TRADE_FEE_OFF,
+    ASSET0_WRAPPER_START, MARKET_ASSET_GENERATION_FRONTIER_OFF,
+};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
@@ -145,7 +151,7 @@ const ASSET_AUTH_ADMIN: u8 = 0;
 // wrapper's header size. This is the post-F-01-migration layout this HELD
 // branch targets; re-verify against the probe above if the header changes
 // again before the coordinated migration deploy.
-const ASSET0_WRAPPER_START: usize = 1350;
+
 
 /// `AssetStateV16.market_id` (engine, asset 0's per-asset generation
 /// counter) — the value BOTH tag 9's and tag 65's `market_id` wire field is
@@ -155,7 +161,7 @@ const ASSET0_WRAPPER_START: usize = 1350;
 /// `EngineAssetSlotV16Account` (`Market<T>.engine`), which sits immediately
 /// after `Market<T>.wrapper: [u8; ASSET_ORACLE_WRAPPER_LEN(1024)]`. Offset:
 /// `wrapper_start + 1024 + 0`.
-const ASSET0_MARKET_ID_OFF: usize = ASSET0_WRAPPER_START + 1024; // 2374
+
 
 /// `AssetControlSequencesV16.authority_epoch` for asset 0 — the strict CAS
 /// lane `UpdateAssetAuthority` advances (`advance_authority_epoch_view`,
@@ -166,7 +172,7 @@ const ASSET0_MARKET_ID_OFF: usize = ASSET0_WRAPPER_START + 1024; // 2374
 /// `AssetControlSequencesV16`: oracle_observation, backing_fee_long,
 /// backing_fee_short, trade_fee, liquidation_fee, maintenance_fee,
 /// fee_redirect, market_init_fee, permissionless_resolve).
-const ASSET0_AUTHORITY_EPOCH_OFF: usize = ASSET0_WRAPPER_START + 512 + 72; // 1934
+
 
 /// `AssetOracleProfileV16.insurance_top_up` — the one-shot strictly-
 /// increasing `intent_id` watermark tag 9 validates with
@@ -176,7 +182,7 @@ const ASSET0_AUTHORITY_EPOCH_OFF: usize = ASSET0_WRAPPER_START + 512 + 72; // 19
 /// 496 within the 512-byte profile (TB-3 tail field, immediately after
 /// TB-1a's `next_portfolio_id`/`_padding2`, immediately before
 /// `backing_top_up` at 504 — this program never touches `backing_top_up`).
-const ASSET0_INSURANCE_TOP_UP_OFF: usize = ASSET0_WRAPPER_START + 496; // 1846
+
 
 #[inline]
 fn read_market_u64(market: &AccountInfo, off: usize) -> Result<u64, ProgramError> {
@@ -234,7 +240,7 @@ fn next_asset0_intent_id(market: &AccountInfo) -> Result<u64, ProgramError> {
 /// a9318945` (a throwaway probe test appended to a scratch wrapper worktree,
 /// run once, reverted — never committed): `MARKET_GROUP_OFF(592) +
 /// offset_of!(MarketGroupV16HeaderAccount, next_market_id)(581) = 1173`.
-const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = 1173;
+
 
 /// `AssetControlSequencesV16.backing_fee_long` for asset 0 — the strictly-
 /// increasing `policy_sequence` watermark `UpdateBackingFeePolicy` (tag 51)
@@ -247,18 +253,18 @@ const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = 1173;
 /// `AssetControlSequencesV16` struct at `ASSET_CONTROL_SEQUENCES_OFF(512)`
 /// (both values reconfirmed by the SAME probe that reconfirmed the
 /// already-shipped `authority_epoch @ +72`, cross-validating the method).
-const ASSET0_BACKING_FEE_LONG_OFF: usize = ASSET0_WRAPPER_START + 512 + 8; // 1870
+
 /// `AssetControlSequencesV16.backing_fee_short` for asset 0 — same as
 /// `ASSET0_BACKING_FEE_LONG_OFF` but for the SHORT domain (`domain` odd,
 /// `ControlSequenceLane::BackingFeeShort`). `offset_of!(..., backing_fee_short)
 /// == 16`.
-const ASSET0_BACKING_FEE_SHORT_OFF: usize = ASSET0_WRAPPER_START + 512 + 16; // 1878
+
 /// `AssetControlSequencesV16.trade_fee` for asset 0 — the strictly-increasing
 /// `policy_sequence` watermark `UpdateTradeFeePolicy` (tag 55) advances
 /// (`ControlSequenceLane::TradeFee`; the wrapper hardcodes asset 0 for this
 /// tag, matching every other asset-0-scoped read in this file).
 /// `offset_of!(..., trade_fee) == 24`.
-const ASSET0_TRADE_FEE_OFF: usize = ASSET0_WRAPPER_START + 512 + 24; // 1886
+
 
 /// Live market-wide asset-generation frontier — the `asset_generation_frontier`
 /// field `ResolveMarket` (tag 19) sends on the wire. See
@@ -1644,17 +1650,19 @@ mod tag_tests {
     /// when it happens to also break a wire-shape test.
     #[test]
     fn test_asset0_offset_constants_are_pinned() {
-        assert_eq!(ASSET0_WRAPPER_START, 1350);
-        assert_eq!(ASSET0_MARKET_ID_OFF, 2374);
-        assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1934);
-        assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1846);
+        // v2.2 (wrapper f576bffc / engine 4ceac24a): every asset slot sits +32 B later
+        // (engine config grew). v2.1 values were 1350 / 2374 / 1934 / 1846.
+        assert_eq!(ASSET0_WRAPPER_START, 1382);
+        assert_eq!(ASSET0_MARKET_ID_OFF, 2406);
+        assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1966);
+        assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1878);
         // Systematic-sweep additions (tags 19/51/55) — ground-truthed via
         // core::mem::offset_of! against the real wrapper Pod types at
         // sync/integration-v16 @ a9318945 (throwaway probe, reverted).
-        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1173);
-        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1870);
-        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1878);
-        assert_eq!(ASSET0_TRADE_FEE_OFF, 1886);
+        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1205); // v2.1: 1173
+        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1902);
+        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1910);
+        assert_eq!(ASSET0_TRADE_FEE_OFF, 1918);
     }
 
     #[test]
