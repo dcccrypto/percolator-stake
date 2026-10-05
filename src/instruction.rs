@@ -90,6 +90,20 @@ pub enum StakeInstruction {
         deposit_cap: u64,
     },
 
+    /// 0 (v5, 23-byte data): InitPool with explicit risk settings:
+    /// `[0][cooldown_slots u64][deposit_cap u64][risk_mode u8][deploy_target_bps u16]
+    /// [liquid_buffer_bps u16][hysteresis_bps u16]`. Same accounts as `InitPool`.
+    /// `risk_mode` 1 = FIRST_LOSS (`deploy_target_bps <= 8,000`), 2 = FEE_ONLY (target 0).
+    /// The 16-byte `InitPool` creates a FIRST_LOSS pool with the defaults (50% / 30% / 5%).
+    InitPoolV5 {
+        cooldown_slots: u64,
+        deposit_cap: u64,
+        risk_mode: u8,
+        deploy_target_bps: u16,
+        liquid_buffer_bps: u16,
+        hysteresis_bps: u16,
+    },
+
     /// 1: Deposit collateral into the stake vault. Mints LP tokens pro-rata.
     ///
     /// Accounts:
@@ -107,8 +121,20 @@ pub enum StakeInstruction {
     ///  11. `[]` Wrapper market (`pool.slab`). #290: REQUIRED when the pool is
     ///      mode 0 (every `InitPool` pool), because it supplies the tag-87 fee-payout
     ///      counter that pending fees are attributed against before pricing. Ignored
-    ///      for mode 1.
+    ///      for mode 1. v5 FIRST_LOSS: REQUIRED and `[writable]` (the units refresh CPI).
+    ///  12. `[writable]` v5 FIRST_LOSS only: the wrapper's `InsuranceUnitsV20`
+    ///      (`["ins_units", slab]` under `pool.percolator_program`).
+    ///  13. `[]` v5 FIRST_LOSS only: the wrapper program (`pool.percolator_program`).
+    ///
+    /// Data: `[1][amount u64]` (8 B), or v5 `[1][amount u64][accept_first_loss_version u8]`
+    /// (9 B, decoded as `DepositWithConsent`). A FIRST_LOSS pool REQUIRES the 9-byte form with
+    /// `accept_first_loss_version == pool.consent_version` (else `ConsentRequired`); the
+    /// deployed units are priced at the wrapper's ENTRY (mint) reading.
     Deposit { amount: u64 },
+
+    /// 1 (v5, 9-byte data): `Deposit` carrying the staker's signed first-loss consent.
+    /// Same accounts as `Deposit`.
+    DepositWithConsent { amount: u64, accept_first_loss_version: u8 },
 
     /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown.
     ///
@@ -127,6 +153,13 @@ pub enum StakeInstruction {
     ///      pool, pending wrapper-paid fees are accrued before pricing the redemption.
     ///      When absent, that accrual is skipped, so the withdrawer redeems at the
     ///      not-yet-accrued (lower or equal) price. Clients should always pass it.
+    ///      v5 FIRST_LOSS: REQUIRED and `[writable]` (the units refresh CPI).
+    ///  11. `[writable]` v5 FIRST_LOSS only: the wrapper's `InsuranceUnitsV20`.
+    ///  12. `[]` v5 FIRST_LOSS only: the wrapper program.
+    ///  13. `[]` v5 FIRST_LOSS only: System program (the refresh CPI's account list).
+    ///
+    /// v5 FIRST_LOSS: the deployed units are priced at the wrapper's EXIT (free) reading and
+    /// the payout must fit the pool's LIQUID value (`LiquidityBufferExhausted` otherwise).
     Withdraw { lp_amount: u64 },
 
     /// 3: CPI into percolator wrapper's TopUpInsurance to move collateral from
@@ -676,6 +709,45 @@ pub enum StakeInstruction {
     ///   3. `[writable]` Slab / market account (wrapper-owned)
     ///   4. `[]` Percolator program
     AdminUpdateTradeFeePolicy { trade_fee_base_bps: u64 },
+
+    /// 31 (v5): SyncInsuranceDeployment. PERMISSIONLESS, rate-limited. Replaces the removed
+    /// creator-admin `FlushToInsurance`. Keeps `deployed ~= pool_value * deploy_target_bps`:
+    /// tops up (PDA-signed wrapper tag 9) while keeping `liquid_buffer_bps` liquid, or
+    /// recovers the excess (PDA-signed wrapper tag 57; the wrapper's live health gate applies).
+    ///
+    /// Accounts:
+    ///   0. `[signer, writable]` Caller (pays the units-ledger creation on first use)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Pool vault token account
+    ///   3. `[]` Vault authority PDA (signs the wrapper CPIs)
+    ///   4. `[writable]` Wrapper market (`pool.slab`)
+    ///   5. `[writable]` Wrapper vault token account
+    ///   6. `[]` Wrapper vault authority PDA (`["vault", slab]`)
+    ///   7. `[writable]` Wrapper `InsuranceUnitsV20` (`["ins_units", slab]`)
+    ///   8. `[]` Token program
+    ///   9. `[]` Wrapper program (`pool.percolator_program`)
+    ///  10. `[]` System program
+    SyncInsuranceDeployment,
+
+    /// 32 (v5): ProposeDeployTarget `[32][target_bps u16]`. `pool.admin` may only LOWER the
+    /// target; raising needs the stake program's upgrade authority (Squads on mainnet). Takes
+    /// effect via `CommitDeployTarget` after the pool's withdrawal cooldown, so stakers can
+    /// exit before a raise lands.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` pool.admin, or the stake program's upgrade authority
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` OPTIONAL stake program-data account (required to RAISE)
+    ProposeDeployTarget { target_bps: u16 },
+
+    /// 33 (v5): CommitDeployTarget. PERMISSIONLESS once `pending_target_slot + cooldown_slots`
+    /// has passed.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Anyone
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Clock sysvar
+    CommitDeployTarget,
 }
 
 impl StakeInstruction {
@@ -686,6 +758,25 @@ impl StakeInstruction {
 
         match tag {
             0 => {
+                if rest.len() == 23 {
+                    let rd16 = |a: usize| u16::from_le_bytes([rest[a], rest[a + 1]]);
+                    return Ok(Self::InitPoolV5 {
+                        cooldown_slots: u64::from_le_bytes(
+                            rest[0..8]
+                                .try_into()
+                                .map_err(|_| ProgramError::InvalidInstructionData)?,
+                        ),
+                        deposit_cap: u64::from_le_bytes(
+                            rest[8..16]
+                                .try_into()
+                                .map_err(|_| ProgramError::InvalidInstructionData)?,
+                        ),
+                        risk_mode: rest[16],
+                        deploy_target_bps: rd16(17),
+                        liquid_buffer_bps: rd16(19),
+                        hysteresis_bps: rd16(21),
+                    });
+                }
                 if rest.len() != 16 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
@@ -705,7 +796,7 @@ impl StakeInstruction {
                 })
             }
             1 => {
-                if rest.len() != 8 {
+                if rest.len() != 8 && rest.len() != 9 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 let amount = u64::from_le_bytes(
@@ -713,7 +804,33 @@ impl StakeInstruction {
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
+                if rest.len() == 9 {
+                    return Ok(Self::DepositWithConsent {
+                        amount,
+                        accept_first_loss_version: rest[8],
+                    });
+                }
                 Ok(Self::Deposit { amount })
+            }
+            31 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::SyncInsuranceDeployment)
+            }
+            32 => {
+                if rest.len() != 2 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::ProposeDeployTarget {
+                    target_bps: u16::from_le_bytes([rest[0], rest[1]]),
+                })
+            }
+            33 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::CommitDeployTarget)
             }
             2 => {
                 if rest.len() != 8 {

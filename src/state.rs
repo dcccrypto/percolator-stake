@@ -189,6 +189,44 @@ pub struct StakePool {
     /// Real struct field (offset 400) — see [`StakePool::pending_cooldown_slots`]
     /// for why these are no longer packed into `_reserved`.
     pub cooldown_proposed_at_slot: u64,
+
+    // ════════════════════════════════════════════════════════════════
+    // v5 (Phase 4 item 6, 2026-10-05): staking as real first-loss insurance.
+    //
+    // APPENDED real fields (408..480), NOT carved from `_reserved`: every byte of
+    // `_reserved[64]` is already owned (discriminator/version, PERC-303 tranche
+    // state, PERC-313 HWM, #290 attribution flag). The design note's v5 map put
+    // these in `_reserved[0..64]`, which would have repeated the #242/PERC-313
+    // aliasing bug (see `tests/poc_cooldown_timelock_hwm_overlap.rs`).
+    // ════════════════════════════════════════════════════════════════
+    /// 0 = legacy (pre-v5, never created by this build), 1 = FIRST_LOSS (stake is
+    /// deployed into the market's insurance and absorbs losses pro rata through the
+    /// wrapper's `InsuranceUnitsV20`; earns the 16% insurance fee leg), 2 = FEE_ONLY
+    /// (never deployed; earns nothing: the wrapper pays tag 87 to first-loss pools only).
+    pub risk_mode: u8, // 408
+    /// The consent version a first-loss deposit must carry (`RISK_TEXT_V*` in the
+    /// app: the version of the one-paragraph risk text the staker signs over).
+    pub consent_version: u8, // 409
+    /// Share of pool value kept deployed in the wrapper's insurance (bps, <= 8,000).
+    pub deploy_target_bps: u16, // 410..412
+    /// Share of pool value kept liquid in the vault by a sync top-up (bps).
+    pub liquid_buffer_bps: u16, // 412..414
+    /// No sync while |deployed - target| <= hysteresis (bps of pool value).
+    pub hysteresis_bps: u16, // 414..416
+    /// Slot of the last `SyncInsuranceDeployment` (rate limit).
+    pub last_sync_slot: u64, // 416..424
+    /// Proposed `deploy_target_bps` awaiting commit (meaningful while
+    /// `pending_target_slot != 0`).
+    pub pending_target_bps: u64, // 424..432
+    /// Slot of the pending proposal; 0 = none.
+    pub pending_target_slot: u64, // 432..440
+    /// Minimum slots between two syncs.
+    pub sync_cooldown_slots: u64, // 440..448
+    /// S1: creator-class insurance value the wrapper paid into this vault at
+    /// terminal (`InsuranceUnitsV20::creator_paid_to_stake_atoms`) that has already
+    /// been forwarded to `admin`. Never decreases.
+    pub creator_forwarded_atoms: u64, // 448..456
+    pub _v5_reserved: [u8; 24], // 456..480
 }
 
 /// Size of StakePool in bytes
@@ -245,8 +283,114 @@ const _: () = {
     // Shipping v4 therefore REQUIRES a coordinated wrapper bump to
     // STAKE_POOL_VERSION = 4 / STAKE_POOL_LEN = 408 and a wrapper redeploy, or
     // tag-87 stops paying the insurance fee leg to every stake pool.
-    assert!(STAKE_POOL_SIZE == 408);
+    // v5 appends 72 bytes (408 -> 480). The wrapper reads `risk_mode` at 408 to pay the
+    // tag-87 insurance fee leg to FIRST_LOSS pools only, and checks VERSION == 5 and
+    // LEN >= 480 (`percolator-prog` `constants::STAKE_POOL_*`). Deploy together.
+    assert!(offset_of!(StakePool, risk_mode) == 408);
+    assert!(offset_of!(StakePool, deploy_target_bps) == 410);
+    assert!(offset_of!(StakePool, last_sync_slot) == 416);
+    assert!(offset_of!(StakePool, creator_forwarded_atoms) == 448);
+    assert!(STAKE_POOL_SIZE == 480);
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// v5 (Phase 4 item 6) risk modes, consent and deployment bounds.
+// ════════════════════════════════════════════════════════════════════════════
+pub const RISK_MODE_LEGACY: u8 = 0;
+pub const RISK_MODE_FIRST_LOSS: u8 = 1;
+pub const RISK_MODE_FEE_ONLY: u8 = 2;
+/// Version of the first-loss risk text a depositor signs over (the app shows it and
+/// passes this byte; a mismatch is refused with `ConsentRequired`). Bumping it is a
+/// program upgrade, so a staker always consents to the text the program enforces.
+pub const CONSENT_VERSION_FIRST_LOSS: u8 = 1;
+/// Protocol bounds and defaults (founder decision 5: target 50%, buffer 30%).
+pub const DEPLOY_TARGET_MAX_BPS: u16 = 8_000;
+pub const DEPLOY_TARGET_DEFAULT_BPS: u16 = 5_000;
+pub const LIQUID_BUFFER_DEFAULT_BPS: u16 = 3_000;
+pub const HYSTERESIS_DEFAULT_BPS: u16 = 500;
+pub const HYSTERESIS_MAX_BPS: u16 = 2_000;
+/// One sync per 150 slots (~1 minute) by default.
+pub const SYNC_COOLDOWN_DEFAULT_SLOTS: u64 = 150;
+
+// ════════════════════════════════════════════════════════════════════════════
+// v5 CROSS-PROGRAM LAYOUT CONTRACT: the wrapper's `InsuranceUnitsV20`
+// (`percolator-prog` `state::InsuranceUnitsV20`, PDA `["ins_units", market]`
+// under the wrapper, header kind 13, record version 1, 16 + 160 bytes).
+// Mirrored here byte for byte; `tests/v5_wrapper_ins_units_pin.rs` pins them
+// against the wrapper crate's own const asserts by value. Deploy together.
+// ════════════════════════════════════════════════════════════════════════════
+pub const WRAPPER_INS_UNITS_SEED: &[u8] = b"ins_units";
+pub const WRAPPER_KIND_INSURANCE_UNITS: u8 = 13;
+pub const WRAPPER_INS_UNITS_LEN: usize = WRAPPER_HEADER_LEN + 160;
+pub const WRAPPER_INS_UNITS_OFF_MARKET: usize = WRAPPER_HEADER_LEN;
+pub const WRAPPER_INS_UNITS_OFF_UNITS_TOTAL: usize = WRAPPER_HEADER_LEN + 32;
+pub const WRAPPER_INS_UNITS_OFF_UNITS_STAKE: usize = WRAPPER_HEADER_LEN + 48;
+pub const WRAPPER_INS_UNITS_OFF_UNITS_CREATOR: usize = WRAPPER_HEADER_LEN + 64;
+pub const WRAPPER_INS_UNITS_OFF_RECEIVABLE: usize = WRAPPER_HEADER_LEN + 80;
+pub const WRAPPER_INS_UNITS_OFF_SNAP_MINT: usize = WRAPPER_HEADER_LEN + 96;
+pub const WRAPPER_INS_UNITS_OFF_SNAP_FREE: usize = WRAPPER_HEADER_LEN + 112;
+pub const WRAPPER_INS_UNITS_OFF_SNAP_SLOT: usize = WRAPPER_HEADER_LEN + 128;
+pub const WRAPPER_INS_UNITS_OFF_VERSION: usize = WRAPPER_HEADER_LEN + 136;
+pub const WRAPPER_INS_UNITS_OFF_CREATOR_PAID: usize = WRAPPER_HEADER_LEN + 144;
+pub const WRAPPER_INS_UNITS_VERSION: u8 = 1;
+
+/// The wrapper's unit ledger as stake v5 reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapperInsUnits {
+    pub units_total: u128,
+    pub units_stake: u128,
+    pub units_creator: u128,
+    pub backstop_receivable: u128,
+    pub snap_mint: u128,
+    pub snap_free: u128,
+    pub snap_slot: u64,
+    pub creator_paid_to_stake: u128,
+}
+
+fn rd_u128(d: &[u8], off: usize) -> Option<u128> {
+    Some(u128::from_le_bytes(d.get(off..off + 16)?.try_into().ok()?))
+}
+
+/// Parse a wrapper `InsuranceUnitsV20` account's RAW bytes. The caller has already
+/// checked the account's OWNER (== pool.percolator_program) and ADDRESS (the PDA);
+/// this checks the header (magic, kind), the record version, the bound market and
+/// the class invariant `units_total == units_stake + units_creator`. `None` = fail
+/// closed (wrong layout, wrong market, or a corrupt record).
+pub fn read_wrapper_ins_units(data: &[u8], market: &[u8; 32]) -> Option<WrapperInsUnits> {
+    if data.len() < WRAPPER_INS_UNITS_LEN {
+        return None;
+    }
+    if u64::from_le_bytes(data.get(0..8)?.try_into().ok()?) != WRAPPER_MAGIC
+        || *data.get(WRAPPER_OFF_KIND)? != WRAPPER_KIND_INSURANCE_UNITS
+        || *data.get(WRAPPER_INS_UNITS_OFF_VERSION)? != WRAPPER_INS_UNITS_VERSION
+        || data.get(WRAPPER_INS_UNITS_OFF_MARKET..WRAPPER_INS_UNITS_OFF_MARKET + 32)? != market
+    {
+        return None;
+    }
+    let u = WrapperInsUnits {
+        units_total: rd_u128(data, WRAPPER_INS_UNITS_OFF_UNITS_TOTAL)?,
+        units_stake: rd_u128(data, WRAPPER_INS_UNITS_OFF_UNITS_STAKE)?,
+        units_creator: rd_u128(data, WRAPPER_INS_UNITS_OFF_UNITS_CREATOR)?,
+        backstop_receivable: rd_u128(data, WRAPPER_INS_UNITS_OFF_RECEIVABLE)?,
+        snap_mint: rd_u128(data, WRAPPER_INS_UNITS_OFF_SNAP_MINT)?,
+        snap_free: rd_u128(data, WRAPPER_INS_UNITS_OFF_SNAP_FREE)?,
+        snap_slot: u64::from_le_bytes(
+            data.get(WRAPPER_INS_UNITS_OFF_SNAP_SLOT..WRAPPER_INS_UNITS_OFF_SNAP_SLOT + 8)?
+                .try_into()
+                .ok()?,
+        ),
+        creator_paid_to_stake: rd_u128(data, WRAPPER_INS_UNITS_OFF_CREATOR_PAID)?,
+    };
+    if u.units_stake.checked_add(u.units_creator)? != u.units_total {
+        return None;
+    }
+    Some(u)
+}
+
+/// Derive the wrapper's `InsuranceUnitsV20` PDA for `slab` under `wrapper`.
+pub fn derive_wrapper_ins_units(wrapper: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[WRAPPER_INS_UNITS_SEED, slab.as_ref()], wrapper)
+}
 
 /// Per-depositor state — tracks cooldown and LP amount per user.
 /// PDA seeds: [b"stake_deposit", pool_pda, user_pubkey]
@@ -763,7 +907,16 @@ impl StakePool {
     /// 3 for a 408-byte layout would let a v3 account pass the version check and
     /// then fail the length check in `pool_from_data`. Fresh-start cutover: live
     /// v3 pools are re-seeded, so no on-chain migration path is provided.
-    pub const CURRENT_VERSION: u8 = 4;
+    ///
+    /// v5 (size 408 -> 480): Phase 4 item 6 first-loss insurance (risk mode, consent,
+    /// deployment target / buffer / hysteresis, sync clock, target timelock, S1
+    /// creator forward). Fresh-start cutover (v2.2 re-seed): no v4 pool migrates.
+    pub const CURRENT_VERSION: u8 = 5;
+
+    /// v5: this pool deploys into the market's insurance (first loss).
+    pub fn is_first_loss(&self) -> bool {
+        self.risk_mode == RISK_MODE_FIRST_LOSS
+    }
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
     /// Call on init.
