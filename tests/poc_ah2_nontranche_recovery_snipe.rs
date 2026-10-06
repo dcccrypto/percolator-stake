@@ -38,7 +38,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V17_CAP1: usize = 3835; // v2.2 cap-1 market (592 + 806 + 2437); was 3147 (v17), 3675 (v2.1)
+const MARKET_LEN_V17_CAP1: usize = 3995; // v2.2 combined cap-1 market (592 + 806 + 2597: slot = 2325 + 112 band/rent + 160 funding-scale drift tail); was 3147 (v17), 3675 (v2.1)
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 /// `StakeError::InsuranceLossOutstanding` (src/error.rs).

@@ -49,8 +49,8 @@ fn v22_absolute_values() {
     assert_eq!(w::ASSET0_INSURANCE_TOP_UP_OFF, 1894);
     assert_eq!(w::MARKET_ASSET_GENERATION_FRONTIER_OFF, 1221);
     assert_eq!(w::MARKET_MODE_OFF, 1266);
-    // A cap-1 market: header 592 + engine header 806 + one asset slot (1024 + 1413 engine slot).
-    assert_eq!(w::MARKET_GROUP_OFF + w::MARKET_GROUP_LEN + 2437, 3835);
+    // A cap-1 market: header 592 + engine header 806 + one asset slot (1024 wrapper blob + 1573 engine slot = 2597: + 112 band/rent + 160 funding-scale drift tail).
+    assert_eq!(w::MARKET_GROUP_OFF + w::MARKET_GROUP_LEN + 2597, 3995);
 }
 
 #[test]
