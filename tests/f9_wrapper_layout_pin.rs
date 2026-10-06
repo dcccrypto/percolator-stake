@@ -5,8 +5,8 @@
 //! For each wrapper .so it runs a REAL InitMarket and a REAL ResolveMarket (tag 19,
 //! signed by the init signer = marketauth), then asserts that on the real bytes:
 //!   * the header is magic "PERCV16\0", VERSION == `WRAPPER_SUPPORTED_VERSION` (19),
-//!     kind == market, and len >= `WRAPPER_MIN_MARKET_LEN` (1382);
-//!   * byte `WRAPPER_OFF_MODE` (1250) is 0 while Live and 1 after ResolveMarket;
+//!     kind == market, and len >= `WRAPPER_MIN_MARKET_LEN` (1390);
+//!   * byte `WRAPPER_OFF_MODE` (1258) is 0 while Live and 1 after ResolveMarket;
 //!   * `read_wrapper_terminal` classifies them NotTerminal, then Resolved.
 //!
 //! Which .so files: `F9_WRAPPER_SOS` (colon-separated paths). If it is unset, the
@@ -19,7 +19,7 @@
 //!
 //! v2.2 (2026-10-05): stake pins layout 19 (wrapper VERSION 19, engine layout discriminator 19). The
 //! v2.1 wrappers below are VERSION 18, so under v2.2 stake they take the fail-closed branch.
-//!   feat/v22-wave-b@f576bffc (engine 4ceac24a, `--features devnet`) sha256 d2b14df9388dbfe9e536d27322aef3403b12007b025e7cc953b19642d15e3475 (Wave B, VERSION 19)
+//!   feat/v22-wave-b@92a09c23 (engine 30b2ec20, `--features devnet`) sha256 179c57342766187bc97267cdc4bf3a3aa769cfc6e0f3dfa538d82510f11dd5b5 (Wave B, VERSION 19)
 //!
 //! Pinned 2026-09-30 (v2.1, VERSION 18):
 //!   deploy/v18.2-wrapper@6377376a  sha256 4472b3832fda102aae8d28b3c1efc642a4b919f3671d93076ca6f88cce51e98b (on-chain v18.2)
@@ -46,12 +46,12 @@ use std::str::FromStr;
 /// Builds whose header VERSION is 19 (v2.2 layout). For THESE the supported-version gate may not
 /// route them to the fail-closed branch below: a stale `WRAPPER_SUPPORTED_VERSION` would
 /// otherwise make this whole test pass vacuously (it only NOTEs and skips the offset pin).
-const V19_PINNED_SHAS: &[&str] = &["d2b14df9388dbfe9e536d27322aef3403b12007b025e7cc953b19642d15e3475"];
+const V19_PINNED_SHAS: &[&str] = &["179c57342766187bc97267cdc4bf3a3aa769cfc6e0f3dfa538d82510f11dd5b5"];
 
 const PINNED_WRAPPERS: &[(&str, &str)] = &[
     (
-        "d2b14df9388dbfe9e536d27322aef3403b12007b025e7cc953b19642d15e3475",
-        "feat/v22-wave-b@f576bffc (Wave B, VERSION 19, engine 4ceac24a, --features devnet)",
+        "179c57342766187bc97267cdc4bf3a3aa769cfc6e0f3dfa538d82510f11dd5b5",
+        "feat/v22-wave-b@92a09c23 (Wave B, VERSION 19, engine 30b2ec20, --features devnet)",
     ),
     (
         "4472b3832fda102aae8d28b3c1efc642a4b919f3671d93076ca6f88cce51e98b",
@@ -69,10 +69,10 @@ const PINNED_WRAPPERS: &[(&str, &str)] = &[
 
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-// v2.2: cap-1 market = 592 + 790 + 2437 = 3819 (v2.1: 3675). The two offsets are the SAME
+// v2.2: cap-1 market = 592 + 798 + 2437 = 3827 (v2.1: 3675). The two offsets are the SAME
 // constants stake's CPI builders read at runtime, imported rather than copied, so this test
 // cannot drift from the program it pins.
-const MARKET_LEN_V19_CAP1: usize = 3819;
+const MARKET_LEN_V19_CAP1: usize = 3827;
 use percolator_stake::wrapper_layout::{ASSET0_AUTHORITY_EPOCH_OFF, MARKET_ASSET_GENERATION_FRONTIER_OFF};
 
 fn wrapper_sos() -> Vec<PathBuf> {
@@ -234,7 +234,7 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
         if version != WRAPPER_SUPPORTED_VERSION {
             // Not the pinned layout (e.g. the v17 CI sibling 15eb8b0c, VERSION 17).
             // The pin below does not apply; what MUST hold is that the guard fails
-            // closed on it, so no stake instruction trusts byte 1250 there.
+            // closed on it, so no stake instruction trusts byte 1258 there.
             assert!(
                 !require_pinned,
                 "{}: VERSION {version} under F9_REQUIRE_PINNED_SHA=1",

@@ -1658,19 +1658,19 @@ mod tag_tests {
     /// when it happens to also break a wire-shape test.
     #[test]
     fn test_asset0_offset_constants_are_pinned() {
-        // v2.2 (wrapper f576bffc / engine 4ceac24a): every asset slot sits +32 B later
+        // v2.2 (wrapper 92a09c23 / engine 30b2ec20): every asset slot sits +40 B later
         // (engine config grew). v2.1 values were 1350 / 2374 / 1934 / 1846.
-        assert_eq!(ASSET0_WRAPPER_START, 1382);
-        assert_eq!(ASSET0_MARKET_ID_OFF, 2406);
-        assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1966);
-        assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1878);
+        assert_eq!(ASSET0_WRAPPER_START, 1390);
+        assert_eq!(ASSET0_MARKET_ID_OFF, 2414);
+        assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1974);
+        assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1886);
         // Systematic-sweep additions (tags 19/51/55) — ground-truthed via
         // core::mem::offset_of! against the real wrapper Pod types at
         // sync/integration-v16 @ a9318945 (throwaway probe, reverted).
-        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1205); // v2.1: 1173
-        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1902);
-        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1910);
-        assert_eq!(ASSET0_TRADE_FEE_OFF, 1918);
+        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1213); // v2.1: 1173
+        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1910);
+        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1918);
+        assert_eq!(ASSET0_TRADE_FEE_OFF, 1926);
     }
 
     #[test]
