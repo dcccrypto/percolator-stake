@@ -40,7 +40,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
-const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
+// v5: the stake program is loaded at the id the wrapper's devnet build PINS (A6DVNubv, the v2.1 fresh id), so the
+// wrapper recognises the pool's vault_auth as the STAKE unit class (Phase 4 item 6). Every other
+// F-9 assertion is id-independent.
+const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v18 market account length for capacity 1 (see f3_dead_share_accrue_guard_e2e.rs).
@@ -241,6 +244,11 @@ struct Staker {
 /// `BUDGET` (the stand-in for liquidation fees / a creator seed) -> real InitPool
 /// (marketauth -> pool PDA) -> a real staker deposits `STAKE` -> real Bind (tag 19,
 /// insurance_authority -> vault_auth). Live, not yet resolved.
+thread_local! {
+    /// v5 risk mode of the pool `world` creates (2 = FEE_ONLY for the legacy F-9 suite).
+    static RISK_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
+}
+
 fn world(name: &str) -> Option<World> {
     let (so, wso) = (stake_so(), wrapper_so());
     if !so.exists() || !wso.exists() {
@@ -359,6 +367,16 @@ fn world(name: &str) -> Option<World> {
     let mut ipd = vec![0u8];
     ipd.extend_from_slice(&5u64.to_le_bytes()); // cooldown 5 slots
     ipd.extend_from_slice(&0u64.to_le_bytes()); // uncapped
+    // v5 (Phase 4 item 6): the 23-byte InitPool with an explicit risk mode. The F-9 suite
+    // below pins the terminal mechanics of a pool that never deployed (FEE_ONLY, no
+    // consent, no units); `f9_v5_first_loss_terminal_returns_creator_seed_s1` covers the
+    // FIRST_LOSS path (units ledger + S1).
+    let risk_mode = RISK_MODE.with(|c| c.get());
+    ipd.push(risk_mode);
+    let target: u16 = if risk_mode == 1 { 5_000 } else { 0 };
+    ipd.extend_from_slice(&target.to_le_bytes());
+    ipd.extend_from_slice(&3_000u16.to_le_bytes());
+    ipd.extend_from_slice(&500u16.to_le_bytes());
     send(
         &mut svm,
         &payer,
@@ -441,22 +459,34 @@ fn deposit_as(
     let (dpda, _) = derive_deposit_pda(&w.stake_id, &w.pool, &s.kp.pubkey());
     let mut data = vec![1u8];
     data.extend_from_slice(&amount.to_le_bytes());
+    let mut accounts = vec![
+        AccountMeta::new(s.kp.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+        AccountMeta::new(s.ata, false),
+        AccountMeta::new(w.vault, false),
+        AccountMeta::new(w.lp_mint, false),
+        AccountMeta::new(s.lp_ata, false),
+        AccountMeta::new_readonly(w.vault_auth, false),
+        AccountMeta::new(dpda, false),
+        AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+        AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+        AccountMeta::new_readonly(system_program::id(), false),
+    ];
+    if RISK_MODE.with(|c| c.get()) == 1 {
+        // v5 FIRST_LOSS: consent byte, writable market, units ledger, wrapper program.
+        data.extend_from_slice(&percolator_stake::state::deposit_consent_bytes(5_000, 3_000, 500));
+        accounts.push(AccountMeta::new(w.market, false));
+        accounts.push(AccountMeta::new(
+            percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0,
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(w.wrapper_id, false));
+    } else {
+        accounts.push(AccountMeta::new_readonly(w.market, false));
+    }
     let ix = Instruction {
         program_id: w.stake_id,
-        accounts: vec![
-            AccountMeta::new(s.kp.pubkey(), true),
-            AccountMeta::new(w.pool, false),
-            AccountMeta::new(s.ata, false),
-            AccountMeta::new(w.vault, false),
-            AccountMeta::new(w.lp_mint, false),
-            AccountMeta::new(s.lp_ata, false),
-            AccountMeta::new_readonly(w.vault_auth, false),
-            AccountMeta::new(dpda, false),
-            AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
-            AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
-            AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(w.market, false),
-        ],
+        accounts,
         data,
     };
     let payer = w.payer.insecure_clone();
@@ -1071,4 +1101,72 @@ fn f9_unpinned_wrapper_layout_is_refused() {
     set_version(&mut w, 18);
     let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
     assert!(r.is_ok(), "control: pinned layout works: {}", logs(&r));
+}
+
+/// v5 FIRST_LOSS terminal path (Phase 4 item 6, S1): the market's pre-existing insurance (the
+/// creator's BUDGET seed) became CREATOR-class units when the first v5 deposit created the units
+/// ledger. Nothing was deployed by stakers, so at terminal the wrapper pays the whole budget into
+/// the pool vault as creator-class value (`creator_paid_to_stake_atoms`), and RecoverTerminalInsurance
+/// FORWARDS it to the creator (pool.admin) instead of booking it to stakers. The staker redeems
+/// exactly its own deposit.
+#[test]
+fn f9_v5_first_loss_terminal_returns_creator_seed_s1() {
+    RISK_MODE.with(|c| c.set(1));
+    let Some(mut w) = world("f9_v5_first_loss_terminal_returns_creator_seed_s1") else {
+        return;
+    };
+    RISK_MODE.with(|c| c.set(2));
+    assert!(read_pool(&w.svm, &w.pool).is_first_loss());
+    let units = percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0;
+    let u = percolator_stake::state::read_wrapper_ins_units(
+        &w.svm.get_account(&units).expect("units ledger created by the first v5 deposit").data,
+        &w.market.to_bytes(),
+    )
+    .expect("units");
+    assert_eq!(u.units_creator, BUDGET as u128, "the seed is creator-class");
+    assert_eq!(u.units_stake, 0);
+    admin_resolve(&mut w);
+    let creator_ata = Pubkey::new_unique();
+    let (mint, admin) = (w.mint, w.admin.pubkey());
+    set_token_account(&mut w.svm, creator_ata, &mint, &admin, 0);
+    let caller = Pubkey::new_unique();
+    let mut data = vec![29u8];
+    data.extend_from_slice(&BUDGET.to_le_bytes());
+    let payer = w.payer.insecure_clone();
+    let r = send(
+        &mut w.svm,
+        &payer,
+        &[],
+        Instruction {
+            program_id: w.stake_id,
+            accounts: vec![
+                AccountMeta::new_readonly(caller, false),
+                AccountMeta::new(w.pool, false),
+                AccountMeta::new(w.vault, false),
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new(w.market, false),
+                AccountMeta::new(w.wrapper_vault, false),
+                AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+                AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+                AccountMeta::new_readonly(w.wrapper_id, false),
+                AccountMeta::new(units, false),
+                AccountMeta::new(creator_ata, false),
+            ],
+            data,
+        },
+    );
+    assert!(r.is_ok(), "v5 terminal recovery: {}", logs(&r));
+    assert_eq!(token_amount(&w.svm, &creator_ata), BUDGET, "S1: the seed went back to the creator");
+    let pool = read_pool(&w.svm, &w.pool);
+    assert_eq!(pool.creator_forwarded_atoms, BUDGET);
+    assert_eq!(pool.total_fees_earned, 0, "the seed was not booked to stakers");
+    // The staker's LP is worth exactly its deposit.
+    let alice_lp = token_amount(&w.svm, &w.alice.as_ref().unwrap().lp_ata);
+    let claim = percolator_stake::math::calc_collateral_for_withdraw(
+        pool.total_lp_supply,
+        pool.total_pool_value().unwrap(),
+        alice_lp,
+    )
+    .unwrap();
+    assert!(claim <= STAKE && claim + 2 >= STAKE - 1_000, "staker claim {claim} vs deposit {STAKE}");
 }

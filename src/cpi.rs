@@ -1410,6 +1410,169 @@ pub fn cpi_update_trade_fee_policy<'a>(
     invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
 }
 
+// ═══════════════════════════════════════════════════════════════
+// v5 (Phase 4 item 6): the wrapper's insurance-unit ledger.
+// ═══════════════════════════════════════════════════════════════
+//
+// Wrapper tag 116 `InitInsuranceUnits` (permissionless): creates the market's
+// `InsuranceUnitsV20` if missing, else refreshes its snapshot (`snap_slot = now`).
+// Accounts `[payer (signer, w), market (w), ins_units (w), system program]`, data `[116]`.
+// Stake v5 runs it before reading the deployed value, so the reading is from THIS slot.
+//
+// On a units market the wrapper REQUIRES the ledger on every asset-0 insurance path
+// (tags 9 / 57 / 41) and finds it by its PDA after the fixed accounts, so the v5
+// builders below append it as the last account.
+const TAG_INIT_INSURANCE_UNITS: u8 = 116;
+
+pub fn cpi_refresh_ins_units<'a>(
+    percolator_program: &AccountInfo<'a>,
+    payer: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+) -> ProgramResult {
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*ins_units.key, false),
+            AccountMeta::new_readonly(*system_program.key, false),
+        ],
+        data: vec![TAG_INIT_INSURANCE_UNITS],
+    };
+    solana_program::program::invoke(
+        &ix,
+        &[payer.clone(), market.clone(), ins_units.clone(), system_program.clone()],
+    )
+}
+
+/// v5 tag-9 top-up from the pool vault (vault_auth PDA signs), units ledger appended.
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_top_up_insurance_v5<'a>(
+    percolator_program: &AccountInfo<'a>,
+    signer: &AccountInfo<'a>,
+    slab: &AccountInfo<'a>,
+    signer_ata: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let data = build_top_up_insurance_data(slab, amount)?;
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*signer.key, true),
+            AccountMeta::new(*slab.key, false),
+            AccountMeta::new(*signer_ata.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*ins_units.key, false),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            signer.clone(),
+            slab.clone(),
+            signer_ata.clone(),
+            wrapper_vault.clone(),
+            token_program.clone(),
+            ins_units.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+/// v5 tag-57 live withdrawal into the pool vault (vault_auth PDA = insurance operator signs),
+/// units ledger appended (the wrapper burns stake-class units at its EXIT reading).
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_withdraw_insurance_asset_v5<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    dest_token: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let data = build_withdraw_insurance_asset_data(market, amount)?;
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*ins_units.key, false),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            vault_auth.clone(),
+            market.clone(),
+            dest_token.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            token_program.clone(),
+            ins_units.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+/// v5 tag-41 terminal withdrawal into the pool vault, units ledger appended.
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_withdraw_insurance_terminal_v5<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    dest_token: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*ins_units.key, false),
+        ],
+        data: build_withdraw_insurance_data(amount),
+    };
+    invoke_signed(
+        &ix,
+        &[
+            vault_auth.clone(),
+            market.clone(),
+            dest_token.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            token_program.clone(),
+            ins_units.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
 #[cfg(test)]
 mod tag_tests {
     use super::*;

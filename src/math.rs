@@ -538,6 +538,114 @@ pub fn terminal_cpi_delta_ok(before: u64, after: u64, requested: u64) -> bool {
     after.checked_sub(before) == Some(requested)
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// v5 (Phase 4 item 6): first-loss deployment into the wrapper's insurance.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Value of this pool's stake-class insurance units: `floor(units_stake * I / U)`,
+/// at whichever reading the caller passes (ENTRY = the wrapper's mint reading for
+/// deposits, EXIT = the free reading for withdrawals and the sync). 0 when `U == 0`.
+/// `None` = overflow or a value beyond u64 (fail closed).
+pub fn deployed_value(units_stake: u128, units_total: u128, insurance: u128) -> Option<u64> {
+    if units_total == 0 {
+        return Some(0);
+    }
+    if units_stake > units_total {
+        return None;
+    }
+    let v = units_stake.checked_mul(insurance)? / units_total;
+    u64::try_from(v).ok()
+}
+
+/// S-1: the stake units a top-up of `a` atoms must mint at the wrapper's entry reading, as the
+/// wrapper computes them (`p4_rescue_ins::ins_units_for_topup`): `floor(a * U / I_mint)`, 1:1 at
+/// genesis (`U == 0`) and after the wrapper's reset (`U > 0`, `I_mint == 0`). `None` = overflow.
+pub fn expected_topup_units(a: u64, units_total: u128, insurance_mint: u128) -> Option<u128> {
+    if units_total == 0 || insurance_mint == 0 {
+        return Some(a as u128);
+    }
+    (a as u128).checked_mul(units_total).map(|p| p / insurance_mint)
+}
+
+/// S-1: the stake units a recovery of `r` atoms must burn at the wrapper's exit reading:
+/// `ceil(r * U / I_free)` (`p4_rescue_ins::ins_units_to_burn`). `None` = nothing withdrawable,
+/// `r > I_free`, or overflow.
+pub fn expected_recover_burn(r: u64, units_total: u128, insurance_free: u128) -> Option<u128> {
+    if units_total == 0 || insurance_free == 0 || (r as u128) > insurance_free {
+        return None;
+    }
+    let p = (r as u128).checked_mul(units_total)?;
+    Some(p.div_ceil(insurance_free))
+}
+
+/// v5 pool value: the vault-resident booked value (`total_pool_value()`, which
+/// already subtracts every deployed atom through `total_flushed`) plus the market
+/// value of the deployed units.
+pub fn pool_value_v5(liquid: u64, deployed: u64) -> Option<u64> {
+    liquid.checked_add(deployed)
+}
+
+/// One sync's action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAction {
+    None,
+    /// PDA-signed insurance top-up of this many atoms (vault -> wrapper insurance).
+    TopUp(u64),
+    /// Live insurance withdrawal of this many atoms (wrapper insurance -> vault).
+    Recover(u64),
+}
+
+fn bps_of(x: u64, bps: u16) -> u64 {
+    ((x as u128) * (bps as u128) / 10_000) as u64
+}
+
+fn bps_of_ceil(x: u64, bps: u16) -> u64 {
+    ((x as u128) * (bps as u128)).div_ceil(10_000) as u64
+}
+
+/// `SyncInsuranceDeployment` plan (I-S4). With `V = liquid + deployed`,
+/// `target = floor(V * target_bps)`, `h = floor(V * hysteresis_bps)`,
+/// `buffer = ceil(V * buffer_bps)`:
+/// * `deployed + h < target`: top up `min(target - deployed, liquid - buffer)`
+///   (never below the liquid buffer, never above the target);
+/// * `deployed > target + h`: recover `deployed - target`;
+/// * otherwise nothing.
+///
+/// Kani `kani_s3_sync_bounded_by_target_and_buffer`: after a top-up `deployed' <= target`
+/// and `liquid' >= buffer`; after a recovery `deployed' == target`.
+pub fn sync_plan(
+    liquid: u64,
+    deployed: u64,
+    target_bps: u16,
+    buffer_bps: u16,
+    hysteresis_bps: u16,
+) -> Option<SyncAction> {
+    if target_bps > 10_000 || buffer_bps > 10_000 || hysteresis_bps > 10_000 {
+        return None;
+    }
+    let v = liquid.checked_add(deployed)?;
+    let target = bps_of(v, target_bps);
+    let h = bps_of(v, hysteresis_bps);
+    let buffer = bps_of_ceil(v, buffer_bps);
+    if deployed.saturating_add(h) < target {
+        let room = target - deployed;
+        let spare = liquid.saturating_sub(buffer);
+        let a = room.min(spare);
+        return Some(if a == 0 { SyncAction::None } else { SyncAction::TopUp(a) });
+    }
+    if deployed > target.saturating_add(h) {
+        return Some(SyncAction::Recover(deployed - target));
+    }
+    Some(SyncAction::None)
+}
+
+/// A first-loss withdrawal is paid from the vault: it may never exceed the
+/// liquid booked value (the deployed part waits for a sync recovery, which the
+/// wrapper only allows on a healthy market — disclosed in the risk text).
+pub fn liquid_withdrawal_ok(withdrawal: u64, liquid: u64, vault_balance: u64) -> bool {
+    withdrawal <= liquid && withdrawal <= vault_balance
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
