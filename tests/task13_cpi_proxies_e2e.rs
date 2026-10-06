@@ -62,7 +62,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 3835; // v2.2 cap-1 market (592 + 806 + 2437); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Recompute via percolator_prog::state::market_account_len_for_capacity(1) if

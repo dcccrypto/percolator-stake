@@ -46,13 +46,15 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-// v18 market account length for capacity 1 (see f3_dead_share_accrue_guard_e2e.rs).
-const MARKET_LEN_V18_CAP1: usize = 3675;
+// v2.2 (wrapper VERSION 19) market account length for capacity 1: 592 + 806 + 2437.
+// (v2.1 / VERSION 18: 3675; see f3_dead_share_accrue_guard_e2e.rs.)
+const MARKET_LEN_V18_CAP1: usize = 3835;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
-// Asset-0 raw offsets on the v18 layout (src/cpi.rs ground-truth block).
-const ASSET0_MARKET_ID_OFF: usize = 2374;
-const ASSET0_AUTHORITY_EPOCH_OFF: usize = 1934;
-const ASSET0_INSURANCE_TOP_UP_OFF: usize = 1846;
+// Asset-0 raw offsets: the SAME constants the program reads at runtime (v2.2 layout 19; the
+// pin test `wrapper_layout_v22_pin` re-derives them against the real wrapper types).
+use percolator_stake::wrapper_layout::{
+    ASSET0_AUTHORITY_EPOCH_OFF, ASSET0_INSURANCE_TOP_UP_OFF, ASSET0_MARKET_ID_OFF,
+};
 
 const BUDGET: u64 = 5_000_000;
 const STAKE: u64 = 10_000_000;
@@ -1043,9 +1045,10 @@ fn f9_dead_shares_only_budget_leaves_wrapper_but_is_not_booked() {
 }
 
 /// Security INFO (layout guard): on a Resolved market whose header VERSION reads
-/// 17 instead of the pinned 18, the mode byte at 1218 proves nothing. Tag 29, tag 30
+/// 17 (or 18, the v2.1 layout whose mode byte is 48 B earlier) instead of the pinned 19, the
+/// mode byte at 1266 proves nothing. Tag 29, tag 30
 /// and Deposit must all refuse with UnsupportedWrapperLayout (32), and nothing may
-/// move. Restoring VERSION 18 makes tag 29 work again (the refusal came from the
+/// move. Restoring VERSION 19 makes tag 29 work again (the refusal came from the
 /// guard, not from the market). The VERSION flip is the only forged byte.
 /// NEGATIVE CONTROL: drop the version check in `read_wrapper_terminal` and this
 /// test fails (tag 29 succeeds on the version-17 header).
@@ -1098,7 +1101,11 @@ fn f9_unpinned_wrapper_layout_is_refused() {
         "nothing moved"
     );
     assert_eq!(token_amount(&w.svm, &w.vault), STAKE, "nothing moved");
+    // The v2.1 header version (18) is refused too: its engine header is 48 B shorter, so the
+    // mode byte this program reads would be a different field (silent misread, not an error).
     set_version(&mut w, 18);
+    assert_eq!(terminal(&w.svm, &w.market), WrapperTerminal::UnknownLayout);
+    set_version(&mut w, percolator_stake::state::WRAPPER_SUPPORTED_VERSION);
     let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
     assert!(r.is_ok(), "control: pinned layout works: {}", logs(&r));
 }

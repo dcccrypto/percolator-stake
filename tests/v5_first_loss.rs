@@ -135,7 +135,7 @@ fn stakers_lose_pro_rata() {
 fn units_bytes(market: [u8; 32], total: u128, stake: u128, creator: u128) -> Vec<u8> {
     let mut d = vec![0u8; state::WRAPPER_INS_UNITS_LEN];
     d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
-    d[8..10].copy_from_slice(&18u16.to_le_bytes());
+    d[8..10].copy_from_slice(&percolator_stake::state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
     d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_INSURANCE_UNITS;
     d[state::WRAPPER_INS_UNITS_OFF_MARKET..state::WRAPPER_INS_UNITS_OFF_MARKET + 32].copy_from_slice(&market);
     d[state::WRAPPER_INS_UNITS_OFF_UNITS_TOTAL..][..16].copy_from_slice(&total.to_le_bytes());
