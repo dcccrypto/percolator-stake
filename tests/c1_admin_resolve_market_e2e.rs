@@ -64,7 +64,7 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 // Associated Token Program ID (used for canonical wrapper-vault ATA computation).
 // Source: v16_program.rs:13530-13531 (mirrors v17_stake_insurance_e2e.rs).
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V17_CAP1: usize = 3819; // v2.2 cap-1 market (592 + 790 + 2437); was 3147 (v17), 3675 (v2.1)
+const MARKET_LEN_V17_CAP1: usize = 3827; // v2.2 cap-1 market (592 + 798 + 2437); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Was 3067 when WRAPPER_CONFIG_LEN was 496; the 2026-07-19 fee-split fields grew

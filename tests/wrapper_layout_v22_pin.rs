@@ -1,8 +1,8 @@
 //! v2.2 layout pin (wrapper VERSION 19 / engine layout 19; wrapper f576bffc, engine 4ceac24a).
 //!
-//! Wave B grew the engine config by 32 B, so the engine header (`MARKET_GROUP_LEN`) grew
-//! 758 -> 790 and EVERY asset slot, plus the two header fields stake reads that sit after the
-//! config, moved +32. The wrapper per-asset profile offsets (inside the fixed 1024 B wrapper
+//! Wave B grew the engine config by 40 B, so the engine header (`MARKET_GROUP_LEN`) grew
+//! 758 -> 798 and EVERY asset slot, plus the two header fields stake reads that sit after the
+//! config, moved +40. The wrapper per-asset profile offsets (inside the fixed 1024 B wrapper
 //! region) did not. This file pins the numbers by value and as a delta against the v2.1
 //! values, so a future edit to one input of `wrapper_layout` cannot pass by also editing the
 //! assert next to it. The real-bytes proof is `f9_wrapper_layout_pin` (real InitMarket +
@@ -25,7 +25,7 @@ const V21_MODE_OFF: usize = 1218;
 #[test]
 fn every_slab_offset_moved_by_exactly_the_config_growth() {
     let d = w::MARKET_GROUP_LEN - w::V21_MARKET_GROUP_LEN;
-    assert_eq!(d, 32, "engine V16Config grew by 32 B in v2.2");
+    assert_eq!(d, 40, "engine V16Config grew by 40 B in v2.2 (32 + band_max_positions_per_side 8)");
     assert_eq!(w::ASSET0_WRAPPER_START, V21_ASSET0_WRAPPER_START + d);
     assert_eq!(w::ASSET0_MARKET_ID_OFF, V21_ASSET0_MARKET_ID_OFF + d);
     assert_eq!(w::ASSET0_AUTHORITY_EPOCH_OFF, V21_ASSET0_AUTHORITY_EPOCH_OFF + d);
@@ -33,7 +33,7 @@ fn every_slab_offset_moved_by_exactly_the_config_growth() {
     assert_eq!(w::ASSET0_BACKING_FEE_LONG_OFF, V21_BACKING_FEE_LONG_OFF + d);
     assert_eq!(w::ASSET0_BACKING_FEE_SHORT_OFF, V21_BACKING_FEE_SHORT_OFF + d);
     assert_eq!(w::ASSET0_TRADE_FEE_OFF, V21_TRADE_FEE_OFF + d);
-    // The two header fields sit AFTER the grown config, so they move by the same 32.
+    // The two header fields sit AFTER the grown config, so they move by the same 40.
     assert_eq!(w::MARKET_ASSET_GENERATION_FRONTIER_OFF, V21_FRONTIER_OFF + d);
     assert_eq!(w::MARKET_MODE_OFF, V21_MODE_OFF + d);
 }
@@ -42,15 +42,15 @@ fn every_slab_offset_moved_by_exactly_the_config_growth() {
 fn v22_absolute_values() {
     assert_eq!(w::WRAPPER_VERSION, 19);
     assert_eq!(w::MARKET_GROUP_OFF, 592);
-    assert_eq!(w::MARKET_GROUP_LEN, 790);
-    assert_eq!(w::ASSET0_WRAPPER_START, 1382);
-    assert_eq!(w::ASSET0_MARKET_ID_OFF, 2406);
-    assert_eq!(w::ASSET0_AUTHORITY_EPOCH_OFF, 1966);
-    assert_eq!(w::ASSET0_INSURANCE_TOP_UP_OFF, 1878);
-    assert_eq!(w::MARKET_ASSET_GENERATION_FRONTIER_OFF, 1205);
-    assert_eq!(w::MARKET_MODE_OFF, 1250);
-    // A cap-1 market: header 592 + engine header 790 + one asset slot (1024 + 1413 engine slot).
-    assert_eq!(w::MARKET_GROUP_OFF + w::MARKET_GROUP_LEN + 2437, 3819);
+    assert_eq!(w::MARKET_GROUP_LEN, 798);
+    assert_eq!(w::ASSET0_WRAPPER_START, 1390);
+    assert_eq!(w::ASSET0_MARKET_ID_OFF, 2414);
+    assert_eq!(w::ASSET0_AUTHORITY_EPOCH_OFF, 1974);
+    assert_eq!(w::ASSET0_INSURANCE_TOP_UP_OFF, 1886);
+    assert_eq!(w::MARKET_ASSET_GENERATION_FRONTIER_OFF, 1213);
+    assert_eq!(w::MARKET_MODE_OFF, 1258);
+    // A cap-1 market: header 592 + engine header 798 + one asset slot (1024 + 1413 engine slot).
+    assert_eq!(w::MARKET_GROUP_OFF + w::MARKET_GROUP_LEN + 2437, 3827);
 }
 
 #[test]
@@ -62,11 +62,11 @@ fn state_and_cpi_consume_the_single_source() {
     assert_ne!(state::WRAPPER_SUPPORTED_VERSION, 18);
 }
 
-/// Behavioural pin: a slab whose mode byte sits at the v2.1 offset (1218) and NOT at 1250 must
+/// Behavioural pin: a slab whose mode byte sits at the v2.1 offset (1218) and NOT at 1258 must
 /// not read as Resolved. Under a stale-offset program this exact image is Resolved.
 #[test]
 fn terminal_reader_does_not_look_at_the_v21_mode_byte() {
-    let mut d = vec![0u8; 3819];
+    let mut d = vec![0u8; 3827];
     d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
     d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
     d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
