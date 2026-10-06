@@ -51,10 +51,14 @@ fn ins_units_layout_matches_the_wrapper() {
         assert_eq!(h + wrapper_offset(&src, field), ours, "InsuranceUnitsV20::{field}");
     }
     assert!(
-        src.contains("assert!(core::mem::size_of::<InsuranceUnitsV20>() == 160)"),
-        "wrapper record size must be 160 (stake reads 16 + 160)"
+        src.contains("assert!(core::mem::size_of::<InsuranceUnitsV20>() == 192)"),
+        "wrapper record size must be 192 (stake reads 16 + 192)"
     );
-    assert_eq!(state::WRAPPER_INS_UNITS_LEN, h + 160);
+    assert_eq!(state::WRAPPER_INS_UNITS_LEN, h + 192);
+    // W-2 G9 fields follow `creator_paid_to_stake_atoms`; stake never reads them, but the record
+    // must not shift under the offsets above.
+    assert_eq!(wrapper_offset(&src, "g9_pending_slot"), 160);
+    assert_eq!(wrapper_offset(&src, "g9_epoch_drawn_atoms"), 176);
     assert!(src.contains("pub const KIND_INSURANCE_UNITS: u8 = 13;"), "kind 13");
     assert_eq!(state::WRAPPER_KIND_INSURANCE_UNITS, 13);
     assert!(src.contains("pub const INS_UNITS_VERSION: u8 = 1;"), "record version 1");

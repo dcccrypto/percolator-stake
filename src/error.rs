@@ -139,6 +139,14 @@ pub enum StakeError {
     AssetAdminNotBurned = 42,
     /// The sync found nothing to do (inside the hysteresis band, or no spare liquidity).
     NothingToSync = 43,
+    /// W-5 / S-3 (security review 2026-10-05): the wrapper's mint (entry) reading differs from
+    /// its free (exit) reading (a G9 receivable or a reservation is outstanding). Moving value
+    /// into or out of the deployed units at that spread would transfer it between unit holders,
+    /// so the sync top-up / recovery and a deposit into a pool with deployed units wait.
+    InsuranceReadingsDiverged = 44,
+    /// S-1 (security review 2026-10-05): the wrapper minted (top-up) or burned (recovery) a
+    /// different number of stake units than `floor(a*U/I_mint)` / `ceil(r*U/I_free)`, or zero.
+    InsuranceUnitsMismatch = 45,
 }
 
 impl From<StakeError> for ProgramError {
@@ -195,6 +203,8 @@ pub fn error_hint(code: u32) -> &'static str {
         41 => "Not supported on first-loss pools — tranches, HWM and admin rotation of the insurance authority are disabled",
         42 => "Asset admin not burned — burn the asset admin (BurnAssetAdmin) before stake can be deployed into insurance",
         43 => "Nothing to sync — the deployed value is within the hysteresis band of the target, or there is no spare liquidity",
+        44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid",
+        45 => "Insurance units mismatch — the wrapper did not mint or burn the expected stake units; the sync was reverted",
         _ => "Unknown error — check the error code and pool state",
     }
 }

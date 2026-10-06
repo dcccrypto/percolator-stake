@@ -302,7 +302,32 @@ pub const RISK_MODE_FEE_ONLY: u8 = 2;
 /// Version of the first-loss risk text a depositor signs over (the app shows it and
 /// passes this byte; a mismatch is refused with `ConsentRequired`). Bumping it is a
 /// program upgrade, so a staker always consents to the text the program enforces.
-pub const CONSENT_VERSION_FIRST_LOSS: u8 = 1;
+///
+/// Version 2 (security review 2026-10-05, W-2 / S-4 / S-5). The text MUST say, in substance:
+/// * Up to `deploy_target_bps` of the pool (the target signed in the consent, including a
+///   pending raise) is deployed into the market's insurance fund and absorbs trading losses pro
+///   rata with every other insurance unit (stake and creator class alike).
+/// * The insurance backstop (wrapper tag 111, G9) can lend up to 50% of the insurance fund
+///   (and at most 20% per ~day) to the market's vault LP once its Earn seniors are exhausted.
+///   It is announced on chain at least 9,000 slots (~1 hour) before it can execute. On a market
+///   whose price is pushed by the creator (Manual / AuthMark oracle) a manipulated price can
+///   trigger it, so up to 50% of the deployed share can be lost to it. The loan is repaid first
+///   from any vault-LP recovery, but repayment is not guaranteed.
+/// * Withdrawals are paid only from the liquid part of the pool, first come first served; the
+///   deployed part returns over successive syncs while the market is healthy.
+pub const CONSENT_VERSION_FIRST_LOSS: u8 = 2;
+
+/// S-5: the 7 consent bytes a FIRST_LOSS `Deposit` appends after the amount:
+/// `[version u8][target_bps u16][buffer_bps u16][hysteresis_bps u16]` (little endian), with the
+/// CURRENT version. `target_bps` is the larger of the committed and a pending target.
+pub fn deposit_consent_bytes(target_bps: u16, buffer_bps: u16, hysteresis_bps: u16) -> [u8; 7] {
+    let (t, b, h) = (
+        target_bps.to_le_bytes(),
+        buffer_bps.to_le_bytes(),
+        hysteresis_bps.to_le_bytes(),
+    );
+    [CONSENT_VERSION_FIRST_LOSS, t[0], t[1], b[0], b[1], h[0], h[1]]
+}
 /// Protocol bounds and defaults (founder decision 5: target 50%, buffer 30%).
 pub const DEPLOY_TARGET_MAX_BPS: u16 = 8_000;
 pub const DEPLOY_TARGET_DEFAULT_BPS: u16 = 5_000;
@@ -311,17 +336,25 @@ pub const HYSTERESIS_DEFAULT_BPS: u16 = 500;
 pub const HYSTERESIS_MAX_BPS: u16 = 2_000;
 /// One sync per 150 slots (~1 minute) by default.
 pub const SYNC_COOLDOWN_DEFAULT_SLOTS: u64 = 150;
+/// S-6 (security review 2026-10-05): a deploy-target change commits no earlier than this many
+/// slots (~1 day) after its proposal, whatever the creator-chosen pool cooldown (min 1 slot):
+/// the stakers' exit window is a protocol constant.
+pub const DEPLOY_TARGET_TIMELOCK_MIN_SLOTS: u64 = 216_000;
+/// S-6: `_v5_reserved[0]` (byte 456) = 1 while the pending target was proposed by the protocol
+/// authority (an admin proposal may not overwrite it).
+pub const V5_RESERVED_IDX_PENDING_BY_PROTOCOL: usize = 0;
 
 // ════════════════════════════════════════════════════════════════════════════
 // v5 CROSS-PROGRAM LAYOUT CONTRACT: the wrapper's `InsuranceUnitsV20`
 // (`percolator-prog` `state::InsuranceUnitsV20`, PDA `["ins_units", market]`
-// under the wrapper, header kind 13, record version 1, 16 + 160 bytes).
+// under the wrapper, header kind 13, record version 1, 16 + 192 bytes; 160..192 are the
+// wrapper's G9 proposal / epoch fields, which stake does not read).
 // Mirrored here byte for byte; `tests/v5_wrapper_ins_units_pin.rs` pins them
 // against the wrapper crate's own const asserts by value. Deploy together.
 // ════════════════════════════════════════════════════════════════════════════
 pub const WRAPPER_INS_UNITS_SEED: &[u8] = b"ins_units";
 pub const WRAPPER_KIND_INSURANCE_UNITS: u8 = 13;
-pub const WRAPPER_INS_UNITS_LEN: usize = WRAPPER_HEADER_LEN + 160;
+pub const WRAPPER_INS_UNITS_LEN: usize = WRAPPER_HEADER_LEN + 192;
 pub const WRAPPER_INS_UNITS_OFF_MARKET: usize = WRAPPER_HEADER_LEN;
 pub const WRAPPER_INS_UNITS_OFF_UNITS_TOTAL: usize = WRAPPER_HEADER_LEN + 32;
 pub const WRAPPER_INS_UNITS_OFF_UNITS_STAKE: usize = WRAPPER_HEADER_LEN + 48;

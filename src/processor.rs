@@ -404,7 +404,20 @@ pub fn process(
         StakeInstruction::DepositWithConsent {
             amount,
             accept_first_loss_version,
-        } => process_deposit(program_id, accounts, amount, Some(accept_first_loss_version)),
+            target_bps,
+            buffer_bps,
+            hysteresis_bps,
+        } => process_deposit(
+            program_id,
+            accounts,
+            amount,
+            Some(DepositConsent {
+                version: accept_first_loss_version,
+                target_bps,
+                buffer_bps,
+                hysteresis_bps,
+            }),
+        ),
         StakeInstruction::SyncInsuranceDeployment => {
             process_sync_insurance_deployment(program_id, accounts)
         }
@@ -815,11 +828,32 @@ fn process_init_pool(
 // 1: Deposit
 // ═══════════════════════════════════════════════════════════════
 
+/// v5 (S-5): what a first-loss depositor signs over: the risk-text version AND the pool's
+/// deployment parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepositConsent {
+    version: u8,
+    target_bps: u16,
+    buffer_bps: u16,
+    hysteresis_bps: u16,
+}
+
+/// S-5: the deployment target a depositor must accept: the committed target, or a PENDING raise
+/// if larger (it can take effect while the deposit is held).
+fn consent_target_bps(pool: &StakePool) -> u64 {
+    let committed = pool.deploy_target_bps as u64;
+    if pool.pending_target_slot != 0 {
+        committed.max(pool.pending_target_bps)
+    } else {
+        committed
+    }
+}
+
 fn process_deposit(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     amount: u64,
-    consent: Option<u8>,
+    consent: Option<DepositConsent>,
 ) -> ProgramResult {
     if amount == 0 {
         return Err(StakeError::ZeroAmount.into());
@@ -872,15 +906,31 @@ fn process_deposit(
     }
 
     // v5 (I-S2): every FIRST_LOSS deposit carries the staker's signed consent to the
-    // current risk text.
+    // current risk text. S-5 (security review 2026-10-05): bound to the deployment parameters
+    // too (target incl. a pending raise, buffer, hysteresis), so a staker never consents to
+    // parameters other than the ones the pool enforces.
     let first_loss = pool.is_first_loss();
-    if first_loss && consent != Some(pool.consent_version) {
-        msg!(
-            "Deposit: first-loss pool requires accept_first_loss_version == {} (got {:?})",
-            pool.consent_version,
-            consent
-        );
-        return Err(StakeError::ConsentRequired.into());
+    if first_loss {
+        let ok = match consent {
+            Some(c) => {
+                c.version == pool.consent_version
+                    && c.target_bps as u64 == consent_target_bps(pool)
+                    && c.buffer_bps == pool.liquid_buffer_bps
+                    && c.hysteresis_bps == pool.hysteresis_bps
+            }
+            None => false,
+        };
+        if !ok {
+            msg!(
+                "Deposit: first-loss pool requires consent (version {}, target {}, buffer {}, hysteresis {}) (got {:?})",
+                pool.consent_version,
+                consent_target_bps(pool),
+                pool.liquid_buffer_bps,
+                pool.hysteresis_bps,
+                consent
+            );
+            return Err(StakeError::ConsentRequired.into());
+        }
     }
 
     // I7: Block deposits after market resolution
@@ -1103,6 +1153,17 @@ fn process_deposit(
             v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
             system_program,
         )?;
+        // W-5 / S-3 (security review 2026-10-05): with stake units deployed, a deposit priced at
+        // the ENTRY reading while the EXIT reading is lower (G9 receivable / reservation open)
+        // taxes the newcomer for the incumbents' benefit; wait until the readings agree.
+        if units.units_stake != 0 && units.snap_mint != units.snap_free {
+            msg!(
+                "Deposit: insurance readings diverged (mint {} != free {})",
+                units.snap_mint,
+                units.snap_free
+            );
+            return Err(StakeError::InsuranceReadingsDiverged.into());
+        }
         let deployed =
             crate::math::deployed_value(units.units_stake, units.units_total, units.snap_mint)
                 .ok_or(StakeError::Overflow)?;
@@ -2563,6 +2624,20 @@ fn v5_read_units<'a>(
         return Err(StakeError::InsuranceUnitsInvalid.into());
     }
     Ok(u)
+}
+
+/// S-1: re-read the wrapper's unit ledger after a sync CPI (same account checks as
+/// `v5_read_units`: owner = the pool's wrapper, layout, market, class invariant).
+fn v5_units_after_cpi(
+    pool: &state::StakePool,
+    ins_units: &AccountInfo<'_>,
+    percolator_program: &AccountInfo<'_>,
+) -> Result<state::WrapperInsUnits, ProgramError> {
+    if ins_units.owner != percolator_program.key {
+        return Err(StakeError::InsuranceUnitsInvalid.into());
+    }
+    state::read_wrapper_ins_units(&ins_units.try_borrow_data()?, &pool.slab)
+        .ok_or_else(|| StakeError::InsuranceUnitsInvalid.into())
 }
 
 /// SPL amount of an initialized token account.
@@ -4676,6 +4751,18 @@ fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInf
     )
     .ok_or(StakeError::InvalidDeployConfig)?;
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    // W-5 / W-8 / S-3 (security review 2026-10-05): a top-up mints at the ENTRY reading and a
+    // recovery burns at the EXIT reading; while they differ, either moves value between unit
+    // holders. Neither runs until the readings agree (the G9 receivable is repaid and no
+    // reservation is open).
+    if plan != crate::math::SyncAction::None && units.snap_mint != units.snap_free {
+        msg!(
+            "Sync: insurance readings diverged (mint {} != free {})",
+            units.snap_mint,
+            units.snap_free
+        );
+        return Err(StakeError::InsuranceReadingsDiverged.into());
+    }
     match plan {
         crate::math::SyncAction::None => {
             msg!("Sync: nothing to do (liquid {}, deployed {})", liquid, deployed);
@@ -4689,6 +4776,18 @@ fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInf
             if a > before {
                 return Err(StakeError::InsufficientVaultBalance.into());
             }
+            // S-1: the wrapper must mint exactly `floor(a*U/I_mint)` (> 0) stake units.
+            let expected = crate::math::expected_topup_units(a, units.units_total, units.snap_mint)
+                .ok_or(StakeError::Overflow)?;
+            if expected == 0 {
+                return Err(StakeError::InsuranceUnitsMismatch.into());
+            }
+            // The wrapper resets a ledger whose fund AND receivable are empty (every unit worth 0).
+            let stake_before = if units.units_total != 0 && units.snap_mint == 0 {
+                0
+            } else {
+                units.units_stake
+            };
             cpi::cpi_top_up_insurance_v5(
                 percolator_program,
                 vault_auth,
@@ -4704,10 +4803,21 @@ fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInf
             if before.checked_sub(after) != Some(a) {
                 return Err(StakeError::CpiFailed.into());
             }
+            let minted = v5_units_after_cpi(pool, ins_units, percolator_program)?
+                .units_stake
+                .checked_sub(stake_before)
+                .ok_or(StakeError::InsuranceUnitsMismatch)?;
+            if minted != expected {
+                msg!("Sync: wrapper minted {} stake units, expected {}", minted, expected);
+                return Err(StakeError::InsuranceUnitsMismatch.into());
+            }
             pool.total_flushed = pool.total_flushed.checked_add(a).ok_or(StakeError::Overflow)?;
             msg!("Sync: deployed {} (liquid {} -> {}, deployed {})", a, liquid, liquid - a, deployed);
         }
         crate::math::SyncAction::Recover(r) => {
+            // S-1: the wrapper must burn exactly `ceil(r*U/I_free)` stake units.
+            let expected = crate::math::expected_recover_burn(r, units.units_total, units.snap_free)
+                .ok_or(StakeError::InsuranceUnitsMismatch)?;
             let before = token_balance(vault)?;
             cpi::cpi_withdraw_insurance_asset_v5(
                 percolator_program,
@@ -4724,6 +4834,14 @@ fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInf
             let after = token_balance(vault)?;
             if after.checked_sub(before) != Some(r) {
                 return Err(StakeError::CpiFailed.into());
+            }
+            let burned = units
+                .units_stake
+                .checked_sub(v5_units_after_cpi(pool, ins_units, percolator_program)?.units_stake)
+                .ok_or(StakeError::InsuranceUnitsMismatch)?;
+            if burned != expected {
+                msg!("Sync: wrapper burned {} stake units, expected {}", burned, expected);
+                return Err(StakeError::InsuranceUnitsMismatch.into());
             }
             pool.total_returned = pool.total_returned.checked_add(r).ok_or(StakeError::Overflow)?;
             pool.total_recovered_from_wrapper = pool
@@ -4755,6 +4873,12 @@ fn is_upgrade_authority(program_id: &Pubkey, signer: &AccountInfo, program_data:
 // ═══════════════════════════════════════════════════════════════
 // 32: ProposeDeployTarget (v5) — admin lowers, protocol authority raises
 // ═══════════════════════════════════════════════════════════════
+
+/// S-6 (security review 2026-10-05): the deploy-target timelock is at least
+/// `DEPLOY_TARGET_TIMELOCK_MIN_SLOTS`, independent of the creator-chosen pool cooldown.
+fn deploy_target_timelock_slots(pool: &state::StakePool) -> u64 {
+    pool.cooldown_slots.max(state::DEPLOY_TARGET_TIMELOCK_MIN_SLOTS)
+}
 
 fn process_propose_deploy_target(
     program_id: &Pubkey,
@@ -4794,13 +4918,19 @@ fn process_propose_deploy_target(
     } else if !protocol && pool.admin != signer.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
+    // S-6: an admin proposal may not overwrite a pending PROTOCOL proposal.
+    let by_protocol_idx = state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL;
+    if !protocol && pool.pending_target_slot != 0 && pool._v5_reserved[by_protocol_idx] != 0 {
+        return Err(StakeError::NotProtocolAuthority.into());
+    }
     pool.pending_target_bps = target_bps as u64;
     pool.pending_target_slot = Clock::get()?.slot.max(1);
+    pool._v5_reserved[by_protocol_idx] = u8::from(protocol);
     msg!(
         "ProposeDeployTarget: {} -> {} bps, committable after {} slots",
         pool.deploy_target_bps,
         target_bps,
-        pool.cooldown_slots
+        deploy_target_timelock_slots(pool)
     );
     Ok(())
 }
@@ -4827,7 +4957,7 @@ fn process_commit_deploy_target(program_id: &Pubkey, accounts: &[AccountInfo]) -
     validate_pool_version(pool)?;
     let now = Clock::get()?.slot;
     if pool.pending_target_slot == 0
-        || now < pool.pending_target_slot.saturating_add(pool.cooldown_slots)
+        || now < pool.pending_target_slot.saturating_add(deploy_target_timelock_slots(pool))
     {
         return Err(StakeError::NoPendingDeployTarget.into());
     }
@@ -4835,6 +4965,7 @@ fn process_commit_deploy_target(program_id: &Pubkey, accounts: &[AccountInfo]) -
     pool.deploy_target_bps = t;
     pool.pending_target_bps = 0;
     pool.pending_target_slot = 0;
+    pool._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL] = 0;
     msg!("CommitDeployTarget: deploy target now {} bps", t);
     Ok(())
 }

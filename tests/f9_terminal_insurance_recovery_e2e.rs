@@ -40,10 +40,10 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
-// v5: the stake program is loaded at the id the wrapper's devnet build PINS (VmpVUArR), so the
+// v5: the stake program is loaded at the id the wrapper's devnet build PINS (A6DVNubv, the v2.1 fresh id), so the
 // wrapper recognises the pool's vault_auth as the STAKE unit class (Phase 4 item 6). Every other
 // F-9 assertion is id-independent.
-const STAKE_ID: &str = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w";
+const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v18 market account length for capacity 1 (see f3_dead_share_accrue_guard_e2e.rs).
@@ -474,7 +474,7 @@ fn deposit_as(
     ];
     if RISK_MODE.with(|c| c.get()) == 1 {
         // v5 FIRST_LOSS: consent byte, writable market, units ledger, wrapper program.
-        data.push(percolator_stake::state::CONSENT_VERSION_FIRST_LOSS);
+        data.extend_from_slice(&percolator_stake::state::deposit_consent_bytes(5_000, 3_000, 500));
         accounts.push(AccountMeta::new(w.market, false));
         accounts.push(AccountMeta::new(
             percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0,

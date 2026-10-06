@@ -330,7 +330,11 @@ fn deposit_ix(
     data.extend_from_slice(&amount.to_le_bytes());
     // v5: the 16-byte InitPool creates a FIRST_LOSS pool -> signed consent byte + the
     // wrapper's InsuranceUnitsV20 (refreshed by CPI) + the wrapper program.
-    data.push(percolator_stake::state::CONSENT_VERSION_FIRST_LOSS);
+    data.extend_from_slice(&percolator_stake::state::deposit_consent_bytes(
+        percolator_stake::state::DEPLOY_TARGET_DEFAULT_BPS,
+        percolator_stake::state::LIQUID_BUFFER_DEFAULT_BPS,
+        percolator_stake::state::HYSTERESIS_DEFAULT_BPS,
+    ));
     let units = percolator_stake::state::derive_wrapper_ins_units(&wrapper_id, &slab).0;
     Instruction {
         program_id: stake_id,

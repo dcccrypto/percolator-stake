@@ -557,6 +557,27 @@ pub fn deployed_value(units_stake: u128, units_total: u128, insurance: u128) -> 
     u64::try_from(v).ok()
 }
 
+/// S-1: the stake units a top-up of `a` atoms must mint at the wrapper's entry reading, as the
+/// wrapper computes them (`p4_rescue_ins::ins_units_for_topup`): `floor(a * U / I_mint)`, 1:1 at
+/// genesis (`U == 0`) and after the wrapper's reset (`U > 0`, `I_mint == 0`). `None` = overflow.
+pub fn expected_topup_units(a: u64, units_total: u128, insurance_mint: u128) -> Option<u128> {
+    if units_total == 0 || insurance_mint == 0 {
+        return Some(a as u128);
+    }
+    (a as u128).checked_mul(units_total).map(|p| p / insurance_mint)
+}
+
+/// S-1: the stake units a recovery of `r` atoms must burn at the wrapper's exit reading:
+/// `ceil(r * U / I_free)` (`p4_rescue_ins::ins_units_to_burn`). `None` = nothing withdrawable,
+/// `r > I_free`, or overflow.
+pub fn expected_recover_burn(r: u64, units_total: u128, insurance_free: u128) -> Option<u128> {
+    if units_total == 0 || insurance_free == 0 || (r as u128) > insurance_free {
+        return None;
+    }
+    let p = (r as u128).checked_mul(units_total)?;
+    Some(p.div_ceil(insurance_free))
+}
+
 /// v5 pool value: the vault-resident booked value (`total_pool_value()`, which
 /// already subtracts every deployed atom through `total_flushed`) plus the market
 /// value of the deployed units.

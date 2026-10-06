@@ -189,10 +189,21 @@ fn v5_wire_decodes() {
     let mut dep = vec![1u8];
     dep.extend_from_slice(&42u64.to_le_bytes());
     assert!(matches!(StakeInstruction::unpack(&dep).unwrap(), StakeInstruction::Deposit { amount: 42 }));
-    dep.push(1);
+    // S-5: the old 9-byte consent (version only) is refused; the 15-byte form binds the
+    // deployment parameters.
+    let mut stale = dep.clone();
+    stale.push(1);
+    assert!(StakeInstruction::unpack(&stale).is_err(), "version-only consent refused");
+    dep.extend_from_slice(&percolator_stake::state::deposit_consent_bytes(6_000, 2_500, 400));
     assert!(matches!(
         StakeInstruction::unpack(&dep).unwrap(),
-        StakeInstruction::DepositWithConsent { amount: 42, accept_first_loss_version: 1 }
+        StakeInstruction::DepositWithConsent {
+            amount: 42,
+            accept_first_loss_version: 2,
+            target_bps: 6_000,
+            buffer_bps: 2_500,
+            hysteresis_bps: 400
+        }
     ));
     assert!(matches!(StakeInstruction::unpack(&[31]).unwrap(), StakeInstruction::SyncInsuranceDeployment));
     assert!(StakeInstruction::unpack(&[31, 0]).is_err());
@@ -215,4 +226,26 @@ fn v5_config_bounds() {
     assert!(mk(2, 1, 0, 0).validate().is_err(), "fee-only never deploys");
     assert!(mk(0, 0, 0, 0).validate().is_err(), "legacy mode is not creatable");
     assert!(mk(3, 0, 0, 0).validate().is_err());
+}
+
+/// S-1 (security review 2026-10-05): the units stake demands from a sync CPI. The reviewer's
+/// SEC-D2 state (`U = 1` against `I = 3,000,000`) expects ZERO units for a 2,000,000 top-up, which
+/// the sync refuses (`InsuranceUnitsMismatch`) instead of donating the deployment.
+#[test]
+fn s1_expected_units() {
+    assert_eq!(math::expected_topup_units(2_000_000, 1, 3_000_000), Some(0), "SEC-D2 shape -> 0 -> refused");
+    assert_eq!(math::expected_topup_units(2_000_000, 0, 0), Some(2_000_000), "genesis 1:1");
+    assert_eq!(math::expected_topup_units(7, 5, 0), Some(7), "after the wrapper's reset");
+    assert_eq!(math::expected_topup_units(1_000, 3_000, 2_000), Some(1_500));
+    assert_eq!(math::expected_recover_burn(1_000, 3_000, 2_000), Some(1_500));
+    assert_eq!(math::expected_recover_burn(1, 3, 2), Some(2), "ceil");
+    assert_eq!(math::expected_recover_burn(3, 3, 2), None, "r > I_free");
+    assert_eq!(math::expected_recover_burn(1, 0, 2), None);
+    // Same rounding as the wrapper: floor on mint, ceil on burn.
+    for (a, u, i) in [(1u64, 7u128, 3u128), (999, 1_000_003, 999_983), (5, 1, 9)] {
+        let m = math::expected_topup_units(a, u, i).unwrap();
+        assert_eq!(m, (a as u128) * u / i);
+        let b = math::expected_recover_burn(a.min(i as u64), u, i).unwrap();
+        assert_eq!(b, ((a.min(i as u64) as u128) * u).div_ceil(i));
+    }
 }

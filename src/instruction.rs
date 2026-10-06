@@ -126,15 +126,24 @@ pub enum StakeInstruction {
     ///      (`["ins_units", slab]` under `pool.percolator_program`).
     ///  13. `[]` v5 FIRST_LOSS only: the wrapper program (`pool.percolator_program`).
     ///
-    /// Data: `[1][amount u64]` (8 B), or v5 `[1][amount u64][accept_first_loss_version u8]`
-    /// (9 B, decoded as `DepositWithConsent`). A FIRST_LOSS pool REQUIRES the 9-byte form with
-    /// `accept_first_loss_version == pool.consent_version` (else `ConsentRequired`); the
-    /// deployed units are priced at the wrapper's ENTRY (mint) reading.
+    /// Data: `[1][amount u64]` (8 B), or v5 `[1][amount u64][accept_first_loss_version u8]
+    /// [target_bps u16][buffer_bps u16][hysteresis_bps u16]` (15 B, decoded as
+    /// `DepositWithConsent`). A FIRST_LOSS pool REQUIRES the 15-byte form with the version ==
+    /// `pool.consent_version` AND the deployment parameters the staker accepts equal to the
+    /// pool's (S-5: `target_bps` == the larger of the committed and a pending target), else
+    /// `ConsentRequired`. The deployed units are priced at the wrapper's ENTRY (mint) reading.
     Deposit { amount: u64 },
 
-    /// 1 (v5, 9-byte data): `Deposit` carrying the staker's signed first-loss consent.
-    /// Same accounts as `Deposit`.
-    DepositWithConsent { amount: u64, accept_first_loss_version: u8 },
+    /// 1 (v5, 15-byte data): `Deposit` carrying the staker's signed first-loss consent, bound
+    /// to the risk-text version and the pool's deployment parameters (S-5). Same accounts as
+    /// `Deposit`.
+    DepositWithConsent {
+        amount: u64,
+        accept_first_loss_version: u8,
+        target_bps: u16,
+        buffer_bps: u16,
+        hysteresis_bps: u16,
+    },
 
     /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown.
     ///
@@ -796,7 +805,7 @@ impl StakeInstruction {
                 })
             }
             1 => {
-                if rest.len() != 8 && rest.len() != 9 {
+                if rest.len() != 8 && rest.len() != 15 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 let amount = u64::from_le_bytes(
@@ -804,10 +813,14 @@ impl StakeInstruction {
                         .try_into()
                         .map_err(|_| ProgramError::InvalidInstructionData)?,
                 );
-                if rest.len() == 9 {
+                if rest.len() == 15 {
+                    let u16_at = |o: usize| u16::from_le_bytes([rest[o], rest[o + 1]]);
                     return Ok(Self::DepositWithConsent {
                         amount,
                         accept_first_loss_version: rest[8],
+                        target_bps: u16_at(9),
+                        buffer_bps: u16_at(11),
+                        hysteresis_bps: u16_at(13),
                     });
                 }
                 Ok(Self::Deposit { amount })
@@ -1398,10 +1411,11 @@ mod tests {
             (
                 1,
                 {
-                    // v5: a 9th byte is the first-loss consent version; a 10th is trailing.
+                    // v5 (S-5): the 15-byte consent form; a 16th byte is trailing.
                     let mut payload = Vec::new();
                     payload.extend_from_slice(&42u64.to_le_bytes());
-                    payload.push(1);
+                    payload.push(2);
+                    payload.extend_from_slice(&[0u8; 6]);
                     payload.push(99);
                     payload
                 },
