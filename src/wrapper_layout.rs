@@ -44,18 +44,18 @@ pub const WRAPPER_VERSION: u16 = 19;
 
 /// Start of the engine `MarketGroupV16HeaderAccount` inside a market account.
 pub const MARKET_GROUP_OFF: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
-/// `size_of::<MarketGroupV16HeaderAccount>()`. v2.1: 758. v2.2: 798
+/// `size_of::<MarketGroupV16HeaderAccount>()`. v2.1: 758. v2.2: 806
 /// (`V16ConfigAccount` +40 B: band_bps, band_max_epoch_slots, band_max_pin_slots,
 /// rent_max_e9_per_slot, band_max_positions_per_side [Wave B review, engine 30b2ec20]).
-pub const MARKET_GROUP_LEN: usize = 798;
+pub const MARKET_GROUP_LEN: usize = 806;
 pub const V21_MARKET_GROUP_LEN: usize = 758;
 
 /// Header-relative offset of `next_market_id` (the asset-generation frontier,
-/// `ResolveMarket` tag 19). v2.1: 581; v2.2: 621 (after the grown config).
-pub const GROUP_NEXT_MARKET_ID_OFF: usize = 621;
+/// `ResolveMarket` tag 19). v2.1: 581; v2.2: 629 (after the grown config).
+pub const GROUP_NEXT_MARKET_ID_OFF: usize = 629;
 /// Header-relative offset of the engine `mode` byte (0 Live, 1 Resolved, 2 Recovery).
-/// v2.1: 626; v2.2: 666.
-pub const GROUP_MODE_OFF: usize = 666;
+/// v2.1: 626; v2.2: 674.
+pub const GROUP_MODE_OFF: usize = 674;
 
 /// Fixed wrapper-owned region at the start of every asset slot (`Market.wrapper`).
 pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
@@ -94,16 +94,16 @@ pub const MIN_MARKET_ACCOUNT_LEN: usize = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
 
 // ── Value pins. Edit an input above without updating these and the build fails. ──
 const _: () = assert!(MARKET_GROUP_OFF == 592);
-const _: () = assert!(ASSET0_WRAPPER_START == 1390);
-const _: () = assert!(ASSET0_MARKET_ID_OFF == 2414);
-const _: () = assert!(ASSET0_AUTHORITY_EPOCH_OFF == 1974);
-const _: () = assert!(ASSET0_INSURANCE_TOP_UP_OFF == 1886);
-const _: () = assert!(ASSET0_BACKING_FEE_LONG_OFF == 1910);
-const _: () = assert!(ASSET0_BACKING_FEE_SHORT_OFF == 1918);
-const _: () = assert!(ASSET0_TRADE_FEE_OFF == 1926);
-const _: () = assert!(MARKET_ASSET_GENERATION_FRONTIER_OFF == 1213);
-const _: () = assert!(MARKET_MODE_OFF == 1258);
-const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1390);
+const _: () = assert!(ASSET0_WRAPPER_START == 1398);
+const _: () = assert!(ASSET0_MARKET_ID_OFF == 2422);
+const _: () = assert!(ASSET0_AUTHORITY_EPOCH_OFF == 1982);
+const _: () = assert!(ASSET0_INSURANCE_TOP_UP_OFF == 1894);
+const _: () = assert!(ASSET0_BACKING_FEE_LONG_OFF == 1918);
+const _: () = assert!(ASSET0_BACKING_FEE_SHORT_OFF == 1926);
+const _: () = assert!(ASSET0_TRADE_FEE_OFF == 1934);
+const _: () = assert!(MARKET_ASSET_GENERATION_FRONTIER_OFF == 1221);
+const _: () = assert!(MARKET_MODE_OFF == 1266);
+const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1398);
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);

@@ -50,8 +50,8 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 // counter (`insurance_reserve_withdrawn_atoms`, bytes [560..576)) is unchanged.
 // Run these suites against a v18 wrapper .so: the v17-era CI pin (15eb8b0c) rejects
 // the v18 InitPool marketauth CPI wire with InvalidInstructionData.
-// v2.2 (wrapper VERSION 19): 592 + 798 + 2437 = 3827 (3675 on v2.1).
-const MARKET_LEN_V18_CAP1: usize = 3827;
+// v2.2 (wrapper VERSION 19): 592 + 806 + 2437 = 3835 (3675 on v2.1).
+const MARKET_LEN_V18_CAP1: usize = 3835;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 // ---- Artifact paths ----
