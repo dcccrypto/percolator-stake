@@ -307,12 +307,13 @@ pub const RISK_MODE_FEE_ONLY: u8 = 2;
 /// * Up to `deploy_target_bps` of the pool (the target signed in the consent, including a
 ///   pending raise) is deployed into the market's insurance fund and absorbs trading losses pro
 ///   rata with every other insurance unit (stake and creator class alike).
-/// * The insurance backstop (wrapper tag 111, G9) can lend up to 50% of the insurance fund
-///   (and at most 20% per ~day) to the market's vault LP once its Earn seniors are exhausted.
-///   It is announced on chain at least 9,000 slots (~1 hour) before it can execute. On a market
-///   whose price is pushed by the creator (Manual / AuthMark oracle) a manipulated price can
-///   trigger it, so up to 50% of the deployed share can be lost to it. The loan is repaid first
-///   from any vault-LP recovery, but repayment is not guaranteed.
+/// * The insurance backstop (wrapper tag 111, G9) can lend insurance to the market's vault LP
+///   once its Earn seniors are exhausted, **up to the seniors' own loss that is still
+///   outstanding**, and never more than 50% of the fund (at most 20% per ~day). It is announced on
+///   chain at least 9,000 slots (~1 hour) before it can execute. On mainnet builds it runs only
+///   on a market priced by an external oracle (an authenticated Hybrid whose legs are Chainlink
+///   or allowlisted Switchboard feeds); on devnet any market can use it for testing. The loan is
+///   repaid first from any vault-LP recovery, but repayment is not guaranteed.
 /// * Withdrawals are paid only from the liquid part of the pool, first come first served; the
 ///   deployed part returns over successive syncs while the market is healthy.
 pub const CONSENT_VERSION_FIRST_LOSS: u8 = 2;
