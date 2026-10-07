@@ -198,10 +198,16 @@ fn preallocate_empty_spl_account(
 // n6_marketauth_rotation_e2e.rs's init_pool_ix/setup exactly. ----
 
 fn encode_init_pool(cooldown_slots: u64, deposit_cap: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(17);
+    let mut out = Vec::with_capacity(24);
     out.push(0u8); // tag InitPool
     out.extend_from_slice(&cooldown_slots.to_le_bytes());
     out.extend_from_slice(&deposit_cap.to_le_bytes());
+    // v5: the 16-byte InitPool now creates a FIRST_LOSS pool (consent-gated deposits). These suites test
+    // the pre-v5 fee-only (mode 0) behaviour, which is v5 risk mode FEE_ONLY: no insurance deployment.
+    out.push(2u8); // risk_mode FEE_ONLY
+    out.extend_from_slice(&0u16.to_le_bytes()); // deploy_target_bps
+    out.extend_from_slice(&3_000u16.to_le_bytes()); // liquid_buffer_bps
+    out.extend_from_slice(&500u16.to_le_bytes()); // hysteresis_bps
     out
 }
 

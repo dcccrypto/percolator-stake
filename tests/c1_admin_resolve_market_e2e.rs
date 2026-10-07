@@ -890,6 +890,7 @@ fn read_pool_state(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
 /// reject, proving an admin cannot use ReturnInsurance alone to unlock
 /// resolution while flushed capital sits stranded in the wrapper.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
     let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
     else {
@@ -1011,6 +1012,7 @@ fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
 /// instruction allowed to advance `total_recovered_from_wrapper`. Only once
 /// that real recovery has run does `AdminResolveMarket` succeed.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn admin_resolve_market_h1_unblocked_only_after_real_recover_flushed_insurance() {
     let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
     else {
