@@ -42,7 +42,7 @@ use std::str::FromStr;
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 3995; // v2.2 combined cap-1 market (592 + 806 + 2597: slot = 2325 + 112 band/rent + 160 funding-scale drift tail); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Was 3067 when WRAPPER_CONFIG_LEN was 496; the 2026-07-19 fee-split fields grew
@@ -198,10 +198,16 @@ fn preallocate_empty_spl_account(
 // n6_marketauth_rotation_e2e.rs's init_pool_ix/setup exactly. ----
 
 fn encode_init_pool(cooldown_slots: u64, deposit_cap: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(17);
+    let mut out = Vec::with_capacity(24);
     out.push(0u8); // tag InitPool
     out.extend_from_slice(&cooldown_slots.to_le_bytes());
     out.extend_from_slice(&deposit_cap.to_le_bytes());
+    // v5: the 16-byte InitPool now creates a FIRST_LOSS pool (consent-gated deposits). These suites test
+    // the pre-v5 fee-only (mode 0) behaviour, which is v5 risk mode FEE_ONLY: no insurance deployment.
+    out.push(2u8); // risk_mode FEE_ONLY
+    out.extend_from_slice(&0u16.to_le_bytes()); // deploy_target_bps
+    out.extend_from_slice(&3_000u16.to_le_bytes()); // liquid_buffer_bps
+    out.extend_from_slice(&500u16.to_le_bytes()); // hysteresis_bps
     out
 }
 

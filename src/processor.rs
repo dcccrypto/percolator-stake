@@ -374,14 +374,62 @@ pub fn process(
         StakeInstruction::InitPool {
             cooldown_slots,
             deposit_cap,
-        } => process_init_pool(program_id, accounts, cooldown_slots, deposit_cap),
-        StakeInstruction::Deposit { amount } => process_deposit(program_id, accounts, amount),
+        } => process_init_pool(
+            program_id,
+            accounts,
+            cooldown_slots,
+            deposit_cap,
+            V5Init::first_loss_defaults(),
+        ),
+        StakeInstruction::InitPoolV5 {
+            cooldown_slots,
+            deposit_cap,
+            risk_mode,
+            deploy_target_bps,
+            liquid_buffer_bps,
+            hysteresis_bps,
+        } => process_init_pool(
+            program_id,
+            accounts,
+            cooldown_slots,
+            deposit_cap,
+            V5Init {
+                risk_mode,
+                deploy_target_bps,
+                liquid_buffer_bps,
+                hysteresis_bps,
+            },
+        ),
+        StakeInstruction::Deposit { amount } => process_deposit(program_id, accounts, amount, None),
+        StakeInstruction::DepositWithConsent {
+            amount,
+            accept_first_loss_version,
+            target_bps,
+            buffer_bps,
+            hysteresis_bps,
+        } => process_deposit(
+            program_id,
+            accounts,
+            amount,
+            Some(DepositConsent {
+                version: accept_first_loss_version,
+                target_bps,
+                buffer_bps,
+                hysteresis_bps,
+            }),
+        ),
+        StakeInstruction::SyncInsuranceDeployment => {
+            process_sync_insurance_deployment(program_id, accounts)
+        }
+        StakeInstruction::ProposeDeployTarget { target_bps } => {
+            process_propose_deploy_target(program_id, accounts, target_bps)
+        }
+        StakeInstruction::CommitDeployTarget => process_commit_deploy_target(program_id, accounts),
         StakeInstruction::Withdraw { lp_amount } => {
             process_withdraw(program_id, accounts, lp_amount)
         }
-        StakeInstruction::FlushToInsurance { amount } => {
-            process_flush_to_insurance(program_id, accounts, amount)
-        }
+        // v5: the creator-admin flush is removed (I-S1).
+        StakeInstruction::FlushToInsurance { .. } => Err(StakeError::DeprecatedV5.into()),
         StakeInstruction::UpdateConfig {
             new_cooldown_slots,
             new_deposit_cap,
@@ -412,9 +460,8 @@ pub fn process(
         StakeInstruction::ReturnInsurance { amount } => {
             process_return_insurance(program_id, accounts, amount)
         }
-        StakeInstruction::RecoverFlushedInsurance { amount } => {
-            process_recover_flushed_insurance(program_id, accounts, amount)
-        }
+        // v5: recovery is part of SyncInsuranceDeployment.
+        StakeInstruction::RecoverFlushedInsurance { .. } => Err(StakeError::DeprecatedV5.into()),
         StakeInstruction::RecoverTerminalInsurance { amount } => {
             process_recover_terminal_insurance(program_id, accounts, amount)
         }
@@ -475,12 +522,55 @@ pub fn process(
 // 0: InitPool
 // ═══════════════════════════════════════════════════════════════
 
+/// v5 InitPool risk settings (Phase 4 item 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V5Init {
+    pub risk_mode: u8,
+    pub deploy_target_bps: u16,
+    pub liquid_buffer_bps: u16,
+    pub hysteresis_bps: u16,
+}
+
+impl V5Init {
+    /// The 16-byte InitPool: FIRST_LOSS with the protocol defaults (founder decision 5).
+    pub fn first_loss_defaults() -> Self {
+        Self {
+            risk_mode: state::RISK_MODE_FIRST_LOSS,
+            deploy_target_bps: state::DEPLOY_TARGET_DEFAULT_BPS,
+            liquid_buffer_bps: state::LIQUID_BUFFER_DEFAULT_BPS,
+            hysteresis_bps: state::HYSTERESIS_DEFAULT_BPS,
+        }
+    }
+
+    /// Protocol bounds: FIRST_LOSS target <= 8,000 bps and target + buffer <= 10,000;
+    /// FEE_ONLY never deploys (target 0); hysteresis <= 2,000; legacy mode 0 is not
+    /// creatable.
+    pub fn validate(&self) -> ProgramResult {
+        let ok = match self.risk_mode {
+            state::RISK_MODE_FIRST_LOSS => {
+                self.deploy_target_bps <= state::DEPLOY_TARGET_MAX_BPS
+                    && (self.deploy_target_bps as u32) + (self.liquid_buffer_bps as u32) <= 10_000
+            }
+            state::RISK_MODE_FEE_ONLY => self.deploy_target_bps == 0,
+            _ => false,
+        } && self.hysteresis_bps <= state::HYSTERESIS_MAX_BPS
+            && self.liquid_buffer_bps <= 10_000;
+        if ok {
+            Ok(())
+        } else {
+            Err(StakeError::InvalidDeployConfig.into())
+        }
+    }
+}
+
 fn process_init_pool(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     cooldown_slots: u64,
     deposit_cap: u64,
+    v5: V5Init,
 ) -> ProgramResult {
+    v5.validate()?;
     let accounts_iter = &mut accounts.iter();
 
     let admin = next_account_info(accounts_iter)?;
@@ -711,6 +801,21 @@ fn process_init_pool(
     pool.pool_mode = 0; // InitTradingPool overrides to 1 after this call
     pool.pending_admin = [0u8; 32];
     pool.set_discriminator();
+    // v5 (Phase 4 item 6).
+    pool.risk_mode = v5.risk_mode;
+    pool.consent_version = if v5.risk_mode == state::RISK_MODE_FIRST_LOSS {
+        state::CONSENT_VERSION_FIRST_LOSS
+    } else {
+        0
+    };
+    pool.deploy_target_bps = v5.deploy_target_bps;
+    pool.liquid_buffer_bps = v5.liquid_buffer_bps;
+    pool.hysteresis_bps = v5.hysteresis_bps;
+    pool.last_sync_slot = 0;
+    pool.pending_target_bps = 0;
+    pool.pending_target_slot = 0;
+    pool.sync_cooldown_slots = state::SYNC_COOLDOWN_DEFAULT_SLOTS;
+    pool.creator_forwarded_atoms = 0;
 
     msg!(
         "StakePool initialized for slab {} (admin transfer pending)",
@@ -723,7 +828,33 @@ fn process_init_pool(
 // 1: Deposit
 // ═══════════════════════════════════════════════════════════════
 
-fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+/// v5 (S-5): what a first-loss depositor signs over: the risk-text version AND the pool's
+/// deployment parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepositConsent {
+    version: u8,
+    target_bps: u16,
+    buffer_bps: u16,
+    hysteresis_bps: u16,
+}
+
+/// S-5: the deployment target a depositor must accept: the committed target, or a PENDING raise
+/// if larger (it can take effect while the deposit is held).
+fn consent_target_bps(pool: &StakePool) -> u64 {
+    let committed = pool.deploy_target_bps as u64;
+    if pool.pending_target_slot != 0 {
+        committed.max(pool.pending_target_bps)
+    } else {
+        committed
+    }
+}
+
+fn process_deposit(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    amount: u64,
+    consent: Option<DepositConsent>,
+) -> ProgramResult {
     if amount == 0 {
         return Err(StakeError::ZeroAmount.into());
     }
@@ -743,6 +874,9 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     let system_program = next_account_info(accounts_iter)?;
     // #290: wrapper market account (pool.slab). Required for a mode-0 pool; see pre_accrue_fee_modes.
     let fee_slab = accounts_iter.next();
+    // v5 FIRST_LOSS: [12] the wrapper's InsuranceUnitsV20, [13] the wrapper program.
+    let v5_units_ai = accounts_iter.next();
+    let v5_wrapper_ai = accounts_iter.next();
 
     if !user.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -771,6 +905,34 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         return Err(StakeError::InvalidPda.into());
     }
 
+    // v5 (I-S2): every FIRST_LOSS deposit carries the staker's signed consent to the
+    // current risk text. S-5 (security review 2026-10-05): bound to the deployment parameters
+    // too (target incl. a pending raise, buffer, hysteresis), so a staker never consents to
+    // parameters other than the ones the pool enforces.
+    let first_loss = pool.is_first_loss();
+    if first_loss {
+        let ok = match consent {
+            Some(c) => {
+                c.version == pool.consent_version
+                    && c.target_bps as u64 == consent_target_bps(pool)
+                    && c.buffer_bps == pool.liquid_buffer_bps
+                    && c.hysteresis_bps == pool.hysteresis_bps
+            }
+            None => false,
+        };
+        if !ok {
+            msg!(
+                "Deposit: first-loss pool requires consent (version {}, target {}, buffer {}, hysteresis {}) (got {:?})",
+                pool.consent_version,
+                consent_target_bps(pool),
+                pool.liquid_buffer_bps,
+                pool.hysteresis_bps,
+                consent
+            );
+            return Err(StakeError::ConsentRequired.into());
+        }
+    }
+
     // I7: Block deposits after market resolution
     if pool.market_resolved() {
         return Err(StakeError::MarketResolved.into());
@@ -792,7 +954,12 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     if pool.deposit_cap > 0 {
         // #154: enforce the cap on PRINCIPAL TVL (no accrued fees), not total_pool_value();
         // otherwise fee appreciation on a mode-1 trading pool silently locks out new deposits.
-        let current_value = pool.principal_tvl().ok_or(StakeError::Overflow)?;
+        // v5: a first-loss pool's deployed principal is still staker principal.
+        let current_value = if first_loss {
+            pool.total_deposited.saturating_sub(pool.total_withdrawn)
+        } else {
+            pool.principal_tvl().ok_or(StakeError::Overflow)?
+        };
         let new_value = current_value
             .checked_add(amount)
             .ok_or(StakeError::Overflow)?;
@@ -915,7 +1082,9 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             );
             return Err(StakeError::InsuranceLossOutstanding.into());
         }
-    } else if pool.wrapper_recoverable() > 0 {
+    } else if !first_loss && pool.wrapper_recoverable() > 0 {
+        // (v5: a FIRST_LOSS pool prices its deployed insurance at the wrapper's ENTRY reading
+        // below, so no permissionless recovery can reprice it: there is no window to snipe.)
         // A-H2: refuse to mint while a permissionless recovery could reprice the pool.
         //
         // `RecoverFlushedInsurance` (tag 23) is permissionless, so any caller can move
@@ -972,6 +1141,38 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         let senior_lp = pool.senior_total_lp();
         let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
         crate::math::calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
+            .ok_or(StakeError::Overflow)?
+    } else if first_loss {
+        // v5: pool value = liquid + deployed units at the wrapper's ENTRY (mint) reading (the
+        // higher one), so a newcomer never buys below the incumbents' value.
+        let units = v5_read_units(
+            pool,
+            user,
+            fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            system_program,
+        )?;
+        // W-5 / S-3 (security review 2026-10-05): with stake units deployed, a deposit priced at
+        // the ENTRY reading while the EXIT reading is lower (G9 receivable / reservation open)
+        // taxes the newcomer for the incumbents' benefit; wait until the readings agree.
+        if units.units_stake != 0 && units.snap_mint != units.snap_free {
+            msg!(
+                "Deposit: insurance readings diverged (mint {} != free {})",
+                units.snap_mint,
+                units.snap_free
+            );
+            return Err(StakeError::InsuranceReadingsDiverged.into());
+        }
+        let deployed =
+            crate::math::deployed_value(units.units_stake, units.units_total, units.snap_mint)
+                .ok_or(StakeError::Overflow)?;
+        let pv = crate::math::pool_value_v5(
+            pool.total_pool_value().ok_or(StakeError::Overflow)?,
+            deployed,
+        )
+        .ok_or(StakeError::Overflow)?;
+        crate::math::calc_lp_for_deposit(pool.total_lp_supply, pv, amount)
             .ok_or(StakeError::Overflow)?
     } else {
         pool.calc_lp_for_deposit(amount)
@@ -1159,6 +1360,10 @@ fn process_withdraw(
     // #290: OPTIONAL wrapper market account (pool.slab). When present, pending wrapper-paid
     // fees are accrued before pricing; when absent the accrual is skipped (see pre_accrue_fee_modes).
     let fee_slab = accounts_iter.next();
+    // v5 FIRST_LOSS: [11] the wrapper's InsuranceUnitsV20, [12] the wrapper program, [13] system.
+    let v5_units_ai = accounts_iter.next();
+    let v5_wrapper_ai = accounts_iter.next();
+    let v5_system_ai = accounts_iter.next();
 
     if !user.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1332,6 +1537,35 @@ fn process_withdraw(
         let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
         crate::math::calc_senior_collateral_for_withdraw(senior_lp, senior_bal, lp_amount)
             .ok_or(StakeError::Overflow)?
+    } else if pool.is_first_loss() {
+        // v5: pool value = liquid + deployed units at the wrapper's EXIT (free) reading (the
+        // lower one), so a leaver never takes more than its share; the payout must fit the
+        // LIQUID value (the deployed part returns through a sync recovery on a healthy market).
+        let units = v5_read_units(
+            pool,
+            user,
+            fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_system_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+        )?;
+        let deployed =
+            crate::math::deployed_value(units.units_stake, units.units_total, units.snap_free)
+                .ok_or(StakeError::Overflow)?;
+        let liquid = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+        let pv = crate::math::pool_value_v5(liquid, deployed).ok_or(StakeError::Overflow)?;
+        let w = crate::math::calc_collateral_for_withdraw(pool.total_lp_supply, pv, lp_amount)
+            .ok_or(StakeError::Overflow)?;
+        if !crate::math::liquid_withdrawal_ok(w, liquid, token_balance(vault)?) {
+            msg!(
+                "Withdraw: {} exceeds the liquid value {} (deployed {}); sync recovers it on a healthy market",
+                w,
+                liquid,
+                deployed
+            );
+            return Err(StakeError::LiquidityBufferExhausted.into());
+        }
+        w
     } else {
         // No tranches: valued against full global pool
         pool.calc_collateral_for_withdraw(lp_amount)
@@ -1553,199 +1787,15 @@ fn process_withdraw(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 3: FlushToInsurance — CPI into wrapper TopUpInsurance
+// 3: FlushToInsurance — REMOVED in v5 (Phase 4 item 6)
 // ═══════════════════════════════════════════════════════════════
-
-fn process_flush_to_insurance(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    amount: u64,
-) -> ProgramResult {
-    if amount == 0 {
-        return Err(StakeError::ZeroAmount.into());
-    }
-
-    let accounts_iter = &mut accounts.iter();
-
-    let caller = next_account_info(accounts_iter)?;
-    let pool_pda = next_account_info(accounts_iter)?;
-    let vault = next_account_info(accounts_iter)?;
-    let vault_auth = next_account_info(accounts_iter)?;
-    let slab = next_account_info(accounts_iter)?;
-    let wrapper_vault = next_account_info(accounts_iter)?;
-    let percolator_program = next_account_info(accounts_iter)?;
-    let token_program = next_account_info(accounts_iter)?;
-
-    if !caller.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // FINDING-2: Validate pool account ownership and non-emptiness before reading it.
-    // Without these guards an attacker can pass a crafted account; bytemuck would
-    // reinterpret foreign data as StakePool state and all subsequent field checks
-    // operate on attacker-controlled bytes.
-    validate_account_owner(pool_pda, program_id)?;
-    validate_account_not_empty(pool_pda)?;
-    validate_account_writable(pool_pda)?; // N-4: flush mutates pool state
-
-    // FINDING-2: Verify token program before the CPI call that grants PDA signer authority.
-    // Without this check an attacker can pass a fake token program, receive the PDA
-    // signer authority via invoke_signed, and drain the vault.
-    verify_token_program(token_program)?;
-
-    // Read pool
-    let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool = pool_from_data_mut(&mut pool_data[..])?;
-
-    if pool.is_initialized != 1 {
-        return Err(StakeError::NotInitialized.into());
-    }
-    // AUDIT HIGH-2: validate discriminator before trusting pool data
-    if !pool.validate_discriminator() {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    // FINDING-5: Validate pool version on FlushToInsurance.
-    validate_pool_version(pool)?;
-
-    // CRITICAL (C10): FlushToInsurance must be admin-only.
-    // Without this, ANY signer can drain the stake vault to wrapper insurance,
-    // locking all LP holder withdrawals until market resolution.
-    // This is a DoS vector that freezes depositor funds indefinitely.
-    if pool.admin != caller.key.to_bytes() {
-        return Err(StakeError::Unauthorized.into());
-    }
-
-    if pool.slab != slab.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-    if pool.vault != vault.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-    if pool.percolator_program != percolator_program.key.to_bytes() {
-        return Err(StakeError::InvalidPercolatorProgram.into());
-    }
-
-    // FlushToInsurance moves vault funds to the wrapper insurance fund.
-    // This operation is only meaningful on insurance LP pools (mode 0).
-    // Trading LP pools (mode 1) use fee-based accounting; flushing would
-    // undercount pool value in AccrueFees (total_deposited - total_withdrawn
-    // formula doesn't subtract total_flushed) and leave the vault
-    // permanently below the expected accounting balance.
-    if pool.pool_mode != 0 {
-        msg!("FlushToInsurance: not valid for trading LP pools (mode 1)");
-        return Err(StakeError::InvalidPoolMode.into());
-    }
-
-    // N-6: block flush after market resolution. After SetMarketResolved, LP holders
-    // expect to be redeeming capital; flushing post-resolution moves vault tokens to the
-    // wrapper insurance fund and blocks all withdrawals until admin calls
-    // WithdrawInsurance + ReturnInsurance — which can be stalled indefinitely.
-    // process_deposit already gates on market_resolved (line ~610); this makes flush
-    // consistent with that invariant.
-    if pool.market_resolved() {
-        msg!("FlushToInsurance: market is resolved — use ReturnInsurance path instead");
-        return Err(StakeError::MarketResolved.into());
-    }
-
-    // Validate wrapper_vault holds the correct collateral mint (defense-in-depth).
-    // The percolator CPI also validates this, but an explicit check here gives a clear
-    // error and prevents tokens of the wrong type from being routed to the insurance vault.
-    // SPL token account layout: bytes [0..32] = mint.
-    // N-5: verify SPL Token ownership before reading raw bytes — mirrors the guard in
-    // pre_accrue_fee_modes (line ~1902) and process_return_insurance (line ~2618). Without
-    // this, a crafted non-token account with forged bytes at [0..32] passes the mint check.
-    if *wrapper_vault.owner != crate::spl_token::id() {
-        msg!("Error: wrapper_vault is not owned by the SPL Token program");
-        return Err(StakeError::InvalidAccount.into());
-    }
-    {
-        let wv_data = wrapper_vault.try_borrow_data()?;
-        if wv_data.len() < crate::spl_token::state::ACCOUNT_LEN {
-            return Err(StakeError::InvalidAccount.into());
-        }
-        let wv_mint: &[u8; 32] = wv_data[0..32]
-            .try_into()
-            .map_err(|_| StakeError::InvalidAccount)?;
-        if wv_mint != &pool.collateral_mint {
-            msg!("Error: wrapper_vault mint does not match pool collateral_mint");
-            return Err(StakeError::InvalidMint.into());
-        }
-    }
-
-    // Verify vault balance — can't flush more than the pool's value physically in the vault.
-    //
-    // #198: the previous inline chain `((D - W) - F) + R` (u64, left-to-right) UNDERFLOWED
-    // at the intermediate `(D - W) - F` whenever `D - W < F` (equivalently total_pool_value()
-    // < total_returned) and failed the flush with Overflow even though `D - W - F + R` was
-    // positive and the tokens were in the vault — the same false-underflow brick that
-    // total_pool_value() was widened to i128 to avoid (#169); this duplicate was missed.
-    //
-    // It ALSO over-counted by omitting `- realized_junior_loss`: the #161 last-junior-exit
-    // booking raises total_returned by the forfeited loss WITHOUT a token movement (a phantom
-    // return recorded in realized_junior_loss), so `D - W - F + R` exceeds the real vault
-    // balance by realized_junior_loss. The vault physically holds exactly total_pool_value()
-    // (= D - W - F + R - realized_junior_loss for a mode-0 pool; fees are 0 here because flush
-    // is mode-0 only, gated above). Reuse the canonical i128-widened fn: it is the exact
-    // flushable balance, can never report more than the vault holds, and returns None only on
-    // genuine insolvency — which correctly fails the flush closed.
-    let available = pool.total_pool_value().ok_or(StakeError::Overflow)?;
-    if amount > available {
-        return Err(StakeError::InsufficientVaultBalance.into());
-    }
-
-    // Derive vault authority for signing
-    let (expected_vault_auth, vault_auth_bump) =
-        state::derive_vault_authority(program_id, pool_pda.key);
-    if *vault_auth.key != expected_vault_auth {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
-
-    // CPI TopUpInsurance: vault_auth PDA signs, stake vault is the "signer_ata"
-    // TopUpInsurance checks: verify_token_account(a_user_ata, a_user.key, &mint)
-    // Our vault's owner (in SPL token terms) = vault_auth PDA = signer. ✓
-    cpi::cpi_top_up_insurance(
-        percolator_program,
-        vault_auth, // signer (PDA, we invoke_signed)
-        slab,
-        vault,         // signer_ata (owned by vault_auth PDA)
-        wrapper_vault, // percolator vault
-        token_program,
-        amount,
-        vault_auth_seeds,
-    )?;
-
-    // Update pool tracking
-    pool.total_flushed = pool
-        .total_flushed
-        .checked_add(amount)
-        .ok_or(StakeError::Overflow)?;
-
-    // PERC-313 HWM: a flush is a realized insurance LOSS — pool TVL drops by `amount`.
-    // The high-water-mark withdrawal floor must track that loss, or LPs get frozen out
-    // of a pool that just lost money. `refresh_hwm` only RAISES the mark within an epoch
-    // and is never called here, so the mark must be lowered explicitly. Lower it by
-    // exactly the flushed amount (the realized loss) so the floor recomputes against the
-    // loss-adjusted peak (peak − Σ losses). This preserves anti-drain protection:
-    // WITHDRAWALS never lower the mark (only refresh_hwm's raise and this flush do), so a
-    // withdrawal-driven drain is still floored; only a real loss lowers the floor, and only
-    // by the loss amount — no free withdrawal headroom is created (TVL dropped by the same
-    // `amount`). saturating_sub is panic-free; if a stale/zero mark is below `amount` it
-    // floors at 0 (floor 0 = no restriction), and the next withdraw's refresh_hwm re-bases
-    // the mark to live TVL. Left ungated on hwm_enabled(): the mark is only ever READ in the
-    // hwm_enabled branch, and a lowered mark is strictly more permissive, so tracking the
-    // loss unconditionally keeps "mark = peak − losses" true and avoids a stale-high mark
-    // re-freezing if HWM is toggled on mid-epoch after a flush. ReturnInsurance is left
-    // untouched: recovery rides the existing same-epoch refresh_hwm raise (clamped to TVL).
-    pool.set_epoch_high_water_tvl(pool.epoch_high_water_tvl().saturating_sub(amount));
-
-    msg!(
-        "Flushed {} collateral to percolator insurance via CPI",
-        amount
-    );
-    Ok(())
-}
+//
+// The creator-admin flush let `pool.admin` (the market creator) move stakers' funds into
+// the insurance that protects the creator's own LP / junior: a conflict of interest, and
+// the insurance it created had no owner. v5 replaces it with the permissionless,
+// rate-limited `SyncInsuranceDeployment` (tag 31), which deploys toward a target share of
+// pool value through the wrapper's insurance-unit ledger. Tag 3 returns `DeprecatedV5`
+// (dispatch below). I-S1: no admin-signed path moves pool funds anywhere but to stakers.
 
 // ═══════════════════════════════════════════════════════════════
 // 4: UpdateConfig
@@ -2357,6 +2407,10 @@ fn process_rotate_insurance_operator(
             return Err(StakeError::InvalidAccount.into());
         }
         validate_pool_version(pool)?;
+    // v5 (Phase 4 item 6): not on a FIRST_LOSS pool.
+    if pool.is_first_loss() {
+        return Err(StakeError::NotSupportedOnFirstLoss.into());
+    }
         if pool.admin != admin.key.to_bytes() {
             return Err(StakeError::Unauthorized.into());
         }
@@ -2439,6 +2493,10 @@ fn process_rotate_insurance_authority(
             return Err(StakeError::InvalidAccount.into());
         }
         validate_pool_version(pool)?;
+    // v5 (Phase 4 item 6): not on a FIRST_LOSS pool.
+    if pool.is_first_loss() {
+        return Err(StakeError::NotSupportedOnFirstLoss.into());
+    }
         // Admin-gated: only the pool admin may rotate the insurance authority.
         if pool.admin != admin.key.to_bytes() {
             return Err(StakeError::Unauthorized.into());
@@ -2525,6 +2583,75 @@ fn apply_minimum_liquidity_lock(
 // ============================================================================
 // PERC-272: LP Vault — Fee Accrual & Trading Pool Init
 // ============================================================================
+
+// ═══════════════════════════════════════════════════════════════
+// v5 helpers (Phase 4 item 6): the wrapper's insurance-unit ledger
+// ═══════════════════════════════════════════════════════════════
+
+/// v5: refresh the market's `InsuranceUnitsV20` (CPI wrapper tag 116, which creates it on
+/// first use) and read it. Binds every account to the pool (market = `pool.slab`, wrapper =
+/// `pool.percolator_program`, ledger = the PDA under that wrapper and owned by it) and
+/// requires the snapshot to be from THIS slot, so the deployed value can never be priced on
+/// a stale reading. `payer` must be a signer (it pays the ledger's rent on first use).
+fn v5_read_units<'a>(
+    pool: &state::StakePool,
+    payer: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+) -> Result<state::WrapperInsUnits, ProgramError> {
+    if market.key.to_bytes() != pool.slab
+        || percolator_program.key.to_bytes() != pool.percolator_program
+        || market.owner.to_bytes() != pool.percolator_program
+    {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if *system_program.key != solana_program::system_program::id() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    let (expected, _) = state::derive_wrapper_ins_units(percolator_program.key, market.key);
+    if *ins_units.key != expected {
+        return Err(StakeError::InsuranceUnitsInvalid.into());
+    }
+    cpi::cpi_refresh_ins_units(percolator_program, payer, market, ins_units, system_program)?;
+    if ins_units.owner != percolator_program.key {
+        return Err(StakeError::InsuranceUnitsInvalid.into());
+    }
+    let u = state::read_wrapper_ins_units(&ins_units.try_borrow_data()?, &pool.slab)
+        .ok_or(StakeError::InsuranceUnitsInvalid)?;
+    if u.snap_slot != Clock::get()?.slot {
+        return Err(StakeError::InsuranceUnitsInvalid.into());
+    }
+    Ok(u)
+}
+
+/// S-1: re-read the wrapper's unit ledger after a sync CPI (same account checks as
+/// `v5_read_units`: owner = the pool's wrapper, layout, market, class invariant).
+fn v5_units_after_cpi(
+    pool: &state::StakePool,
+    ins_units: &AccountInfo<'_>,
+    percolator_program: &AccountInfo<'_>,
+) -> Result<state::WrapperInsUnits, ProgramError> {
+    if ins_units.owner != percolator_program.key {
+        return Err(StakeError::InsuranceUnitsInvalid.into());
+    }
+    state::read_wrapper_ins_units(&ins_units.try_borrow_data()?, &pool.slab)
+        .ok_or_else(|| StakeError::InsuranceUnitsInvalid.into())
+}
+
+/// SPL amount of an initialized token account.
+fn token_balance(ai: &AccountInfo) -> Result<u64, ProgramError> {
+    if *ai.owner != crate::spl_token::id() {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = ai.try_borrow_data()?;
+    let acct = crate::spl_token::state::Account::unpack(&data)?;
+    if acct.state != crate::spl_token::state::AccountState::Initialized {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(acct.amount)
+}
 
 /// #136 pre-accrue guard — shared by EVERY path that prices against pool balances
 /// (`process_deposit`, `process_withdraw`, `process_deposit_junior`). Crystallizes any
@@ -2682,6 +2809,22 @@ fn accrue_fees_inner(
     // payout to the dead shares just before minting. Here it is a silent skip, not a
     // refusal, so deposits and withdrawals are never blocked; the permissionless
     // AccrueFees instruction refuses explicitly (NoRealLpHolders) before reaching here.
+    // S2 (F5, v5 FIRST_LOSS pools): fees the wrapper paid while the pool had no real staker
+    // belong to nobody who staked for them. Consume them from the attribution cursor instead of
+    // leaving them for the FIRST staker to book (they stay as unbooked vault surplus, which the
+    // terminal recovery books to whoever holds LP then).
+    if fee_delta > 0
+        && pool.pool_mode == 0
+        && pool.is_first_loss()
+        && !crate::math::has_real_lp_holders(pool.total_lp_supply)
+    {
+        pool.mode0_fees_attributed = pool
+            .mode0_fees_attributed
+            .checked_add(fee_delta)
+            .ok_or(StakeError::Overflow)?;
+        msg!("AccrueFees: {} pre-stake fee backlog consumed unbooked (S2)", fee_delta);
+        return Ok(());
+    }
     if fee_delta > 0 && crate::math::has_real_lp_holders(pool.total_lp_supply) {
         if pool.pool_mode == 0 {
             pool.mode0_fees_attributed = pool
@@ -2910,6 +3053,10 @@ fn process_admin_set_hwm_config(
     }
     // FINDING-5: Validate pool version on AdminSetHwmConfig.
     validate_pool_version(pool)?;
+    // v5 (Phase 4 item 6): not on a FIRST_LOSS pool.
+    if pool.is_first_loss() {
+        return Err(StakeError::NotSupportedOnFirstLoss.into());
+    }
     // N-11: auth check BEFORE parameter validation. Previously validate_hwm_floor_bps
     // fired before the admin identity check, letting any signer distinguish in-range vs
     // out-of-range hwm_floor_bps values from InvalidArgument vs Unauthorized. Move the
@@ -2983,6 +3130,10 @@ fn process_admin_set_tranche_config(
     }
     // FINDING-5: Validate pool version on AdminSetTrancheConfig.
     validate_pool_version(pool)?;
+    // v5 (Phase 4 item 6): not on a FIRST_LOSS pool.
+    if pool.is_first_loss() {
+        return Err(StakeError::NotSupportedOnFirstLoss.into());
+    }
     if pool.admin != admin.key.to_bytes() {
         return Err(StakeError::Unauthorized.into());
     }
@@ -3081,6 +3232,10 @@ fn process_deposit_junior(
     }
     // FINDING-9: Validate pool version on DepositJunior, matching process_deposit.
     validate_pool_version(pool)?;
+    // v5 (Phase 4 item 6): not on a FIRST_LOSS pool.
+    if pool.is_first_loss() {
+        return Err(StakeError::NotSupportedOnFirstLoss.into());
+    }
     if !pool.tranche_enabled() {
         return Err(StakeError::TrancheNotEnabled.into());
     }
@@ -3368,8 +3523,19 @@ fn process_init_trading_pool(
     cooldown_slots: u64,
     deposit_cap: u64,
 ) -> ProgramResult {
-    // Reuse InitPool logic
-    process_init_pool(program_id, accounts, cooldown_slots, deposit_cap)?;
+    // Reuse InitPool logic. A trading-LP pool never deploys into insurance (FEE_ONLY).
+    process_init_pool(
+        program_id,
+        accounts,
+        cooldown_slots,
+        deposit_cap,
+        V5Init {
+            risk_mode: state::RISK_MODE_FEE_ONLY,
+            deploy_target_bps: 0,
+            liquid_buffer_bps: 0,
+            hysteresis_bps: 0,
+        },
+    )?;
 
     // Now update pool_mode to 1 (trading LP)
     // AUDIT HIGH-4: Validate pool_pda ownership instead of trusting hardcoded index
@@ -3515,175 +3681,12 @@ fn process_return_insurance(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 23: RecoverFlushedInsurance — PDA-signed insurance recovery
+// 23: RecoverFlushedInsurance — REMOVED in v5 (Phase 4 item 6)
 // ═══════════════════════════════════════════════════════════════
 //
-// Issues a CPI to wrapper tag 57 `WithdrawInsuranceAsset`, signing as the
-// vault_auth PDA (which is the insurance_operator after BindInsuranceAuthority).
-// Tokens flow from the wrapper insurance vault into pool.vault directly.
-//
-// PERMISSIONLESS: no admin gate. Funds can only reach pool.vault (the DRAIN
-// CHECK below guarantees this), so any caller can trigger recovery.
-//
-// CONSERVATION: on success `pool.total_returned += amount` (post-CPI, so
-// the accounting update only happens when tokens actually moved).
-//
-// Accounts:
-//   0. `[]`          Caller (permissionless)
-//   1. `[writable]`  Pool PDA
-//   2. `[writable]`  Pool vault token account (dest; must equal pool.vault)
-//   3. `[]`          Vault authority PDA (signs the CPI as insurance_operator)
-//   4. `[writable]`  Wrapper market account
-//   5. `[writable]`  Wrapper vault token account (insurance source)
-//   6. `[]`          Wrapper vault authority PDA
-//   7. `[]`          Token program
-//   8. `[]`          Percolator program
-
-fn process_recover_flushed_insurance(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    amount: u64,
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-
-    let _caller = next_account_info(accounts_iter)?; // 0: permissionless caller
-    let pool_pda = next_account_info(accounts_iter)?; // 1: pool PDA (writable)
-    let vault = next_account_info(accounts_iter)?; // 2: pool vault (dest; writable)
-    let vault_auth = next_account_info(accounts_iter)?; // 3: vault_auth PDA (signer for CPI)
-    let market = next_account_info(accounts_iter)?; // 4: wrapper market (writable)
-    let wrapper_vault = next_account_info(accounts_iter)?; // 5: wrapper insurance vault (source)
-    let wrapper_vault_auth = next_account_info(accounts_iter)?; // 6: wrapper vault auth
-    let token_program = next_account_info(accounts_iter)?; // 7: token program
-    let percolator_program = next_account_info(accounts_iter)?; // 8: wrapper program
-
-    // Standard guards — mirror process_flush_to_insurance / process_return_insurance.
-    verify_token_program(token_program)?;
-    validate_account_owner(pool_pda, program_id)?;
-    validate_account_not_empty(pool_pda)?;
-    validate_account_writable(pool_pda)?;
-
-    let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool = pool_from_data_mut(&mut pool_data[..])?;
-
-    if pool.is_initialized != 1 {
-        return Err(StakeError::NotInitialized.into());
-    }
-    if !pool.validate_discriminator() {
-        return Err(StakeError::InvalidAccount.into());
-    }
-    validate_pool_version(pool)?;
-
-    // #254 / #271: fail fast if the wrapper market handed in is not THIS pool's
-    // slab. `process_flush_to_insurance` already checks the analogous
-    // `pool.slab != slab.key` (:1550); this path passed `market` straight through
-    // to the tag-57 WithdrawInsuranceAsset CPI without it. Exploitation is blocked
-    // by the wrapper (tag 57 checks the stake-pool owner), so this is
-    // defence-in-depth — but relying on the callee for a caller-side invariant is
-    // exactly the coupling the rest of this file avoids.
-    if pool.slab != market.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    // Insurance LP pools only (pool_mode == 0). Mirror FlushToInsurance and ReturnInsurance.
-    if pool.pool_mode != 0 {
-        msg!("RecoverFlushedInsurance: not valid for trading LP pools (mode 1)");
-        return Err(StakeError::InvalidPoolMode.into());
-    }
-
-    // Amount must be non-zero.
-    if amount == 0 {
-        return Err(StakeError::ZeroAmount.into());
-    }
-
-    // CAP: measured against `total_recovered_from_wrapper`, NOT `total_returned`.
-    // `total_returned` is also bumped by ReturnInsurance and by the #161 phantom
-    // settlement, neither of which moves tokens out of the wrapper — using it here
-    // both understated the capacity (bricking the H-1 resolve gate below) and, in
-    // the #262 variant, never converged. See `StakePool::wrapper_recoverable`.
-    let outstanding = pool.wrapper_recoverable();
-    if outstanding == 0 {
-        msg!(
-            "RecoverFlushedInsurance: nothing to recover (total_flushed={} realized_junior_loss={} total_recovered_from_wrapper={})",
-            pool.total_flushed,
-            pool.realized_junior_loss(),
-            pool.total_recovered_from_wrapper
-        );
-        return Err(StakeError::InsufficientVaultBalance.into());
-    }
-    if (amount as u128) > (outstanding as u128) {
-        msg!(
-            "RecoverFlushedInsurance: amount {} exceeds outstanding {}",
-            amount,
-            outstanding
-        );
-        return Err(StakeError::InsufficientVaultBalance.into());
-    }
-
-    // Wrapper program must match pool.percolator_program.
-    if pool.percolator_program != percolator_program.key.to_bytes() {
-        return Err(StakeError::InvalidPercolatorProgram.into());
-    }
-
-    // DRAIN CHECK: the CPI destination MUST be pool.vault.
-    // This prevents any caller from redirecting recovered tokens to an attacker-controlled
-    // account. Mirror process_return_insurance's `pool.vault != vault.key` guard.
-    if pool.vault != vault.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    // Derive vault authority PDA and verify it matches the passed account.
-    let (expected_vault_auth, vault_auth_bump) =
-        state::derive_vault_authority(program_id, pool_pda.key);
-    if *vault_auth.key != expected_vault_auth {
-        return Err(StakeError::InvalidPda.into());
-    }
-
-    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
-
-    // CPI: WithdrawInsuranceAsset (wrapper tag 57).
-    // vault_auth PDA signs as insurance_operator (set by BindInsuranceAuthority tag 19).
-    // Tokens flow: wrapper_vault → vault (= pool.vault). The drain check above ensures
-    // vault == pool.vault so tokens can only land in the stake pool's own vault.
-    cpi::cpi_withdraw_insurance_asset(
-        percolator_program,
-        vault_auth,
-        market,
-        vault,         // dest_token = pool.vault (drain-check-verified above)
-        wrapper_vault, // source = wrapper insurance vault
-        wrapper_vault_auth,
-        token_program,
-        amount,
-        vault_auth_seeds,
-    )?;
-
-    // CONSERVATION: total_returned += amount. Update AFTER the CPI so the accounting
-    // only advances when the token movement actually succeeded.
-    pool.total_returned = pool
-        .total_returned
-        .checked_add(amount)
-        .ok_or(StakeError::Overflow)?;
-
-    // H-1 re-review fix: this is the ONLY site that increments
-    // `total_recovered_from_wrapper` — it runs exclusively after the tag-57
-    // WithdrawInsuranceAsset CPI above has succeeded, so this counter tracks
-    // real wrapper-side recovery only. `process_return_insurance` (admin's own
-    // wallet -> pool.vault, no wrapper CPI) and the #161 last-junior-exit
-    // phantom write-off (realized_junior_loss, zero token movement) must NEVER
-    // touch this counter — see its doc comment on `StakePool` and the H-1 gates
-    // in `process_admin_resolve_market` / `process_set_market_resolved`.
-    pool.total_recovered_from_wrapper = pool
-        .total_recovered_from_wrapper
-        .checked_add(amount)
-        .ok_or(StakeError::Overflow)?;
-
-    msg!(
-        "RecoverFlushedInsurance: {} tokens recovered to pool vault (total_returned: {}, total_recovered_from_wrapper: {})",
-        amount,
-        pool.total_returned,
-        pool.total_recovered_from_wrapper
-    );
-    Ok(())
-}
+// Recovery of deployed insurance is part of `SyncInsuranceDeployment` (tag 31): the
+// wrapper burns stake-class units at its exit reading for every atom returned. Tag 23
+// returns `DeprecatedV5`.
 
 // ═══════════════════════════════════════════════════════════════
 // 29: RecoverTerminalInsurance — F-9 terminal insurance recovery
@@ -3714,7 +3717,10 @@ fn process_recover_terminal_insurance(
     let wrapper_vault_auth = next_account_info(accounts_iter)?; // 6: wrapper vault auth
     let token_program = next_account_info(accounts_iter)?; // 7: token program
     let percolator_program = next_account_info(accounts_iter)?; // 8: wrapper program
-    let stray = accounts_iter.next(); // 9: OPTIONAL stray vault_auth-owned token account
+    // v5 FIRST_LOSS: [9] the wrapper's InsuranceUnitsV20 (REQUIRED: the wrapper burns the stake
+    // class at terminal), [10] the creator's token account (S1 forward; owner == pool.admin),
+    // then [11] the optional stray account. Legacy pools keep [9] = stray.
+    let rest: Vec<&AccountInfo> = accounts_iter.collect();
 
     verify_token_program(token_program)?;
     validate_account_owner(pool_pda, program_id)?;
@@ -3774,11 +3780,24 @@ fn process_recover_terminal_insurance(
     }
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
+    let first_loss = pool.is_first_loss();
+    let (v5_units, v5_creator, stray) = if first_loss {
+        let units = *rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let creator = *rest.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let (expected, _) = state::derive_wrapper_ins_units(percolator_program.key, market.key);
+        if *units.key != expected || units.owner != percolator_program.key {
+            return Err(StakeError::InsuranceUnitsInvalid.into());
+        }
+        (Some(units), Some(creator), rest.get(2).copied())
+    } else {
+        (None, None, rest.first().copied())
+    };
+
     // TERMINAL GATE. Booking a raw vault surplus is only safe once the market can
     // no longer take deposits or flushes (see `StakePool::book_terminal_recovery`).
     let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
     if terminal == state::WrapperTerminal::UnknownLayout {
-        msg!("RecoverTerminalInsurance: wrapper market is not the pinned layout (VERSION 18)");
+        msg!("RecoverTerminalInsurance: wrapper market is not the pinned layout (VERSION 19)");
         return Err(StakeError::UnsupportedWrapperLayout.into());
     }
     if terminal == state::WrapperTerminal::NotTerminal {
@@ -3805,17 +3824,32 @@ fn process_recover_terminal_insurance(
             return Err(StakeError::MarketNotTerminal.into());
         }
         let before = read_vault_balance(vault)?;
-        cpi::cpi_withdraw_insurance_terminal(
-            percolator_program,
-            vault_auth,
-            market,
-            vault, // dest_token = pool.vault (drain-checked above)
-            wrapper_vault,
-            wrapper_vault_auth,
-            token_program,
-            amount,
-            vault_auth_seeds,
-        )?;
+        if let Some(units) = v5_units {
+            cpi::cpi_withdraw_insurance_terminal_v5(
+                percolator_program,
+                vault_auth,
+                market,
+                vault, // dest_token = pool.vault (drain-checked above)
+                wrapper_vault,
+                wrapper_vault_auth,
+                token_program,
+                units,
+                amount,
+                vault_auth_seeds,
+            )?;
+        } else {
+            cpi::cpi_withdraw_insurance_terminal(
+                percolator_program,
+                vault_auth,
+                market,
+                vault, // dest_token = pool.vault (drain-checked above)
+                wrapper_vault,
+                wrapper_vault_auth,
+                token_program,
+                amount,
+                vault_auth_seeds,
+            )?;
+        }
         let after = read_vault_balance(vault)?;
         // CONSERVATION: the pool receives exactly what the wrapper released.
         if !crate::math::terminal_cpi_delta_ok(before, after, amount) {
@@ -3888,6 +3922,60 @@ fn process_recover_terminal_insurance(
 
     // (4) Book. First the wrapper-attributable tag-87 fees through the normal
     // AccrueFees path (so the #290 cursor stays consistent), then the rest.
+    // S1 (v5): the creator-class insurance value the wrapper paid into this vault at terminal
+    // (once the stake class was exhausted) is the creator's seed, not stakers' money: forward
+    // `creator_paid_to_stake - forwarded` to the creator (pool.admin's token account) BEFORE
+    // the surplus is booked.
+    let mut forwarded: u64 = 0;
+    if let (Some(units), Some(creator)) = (v5_units, v5_creator) {
+        let u = state::read_wrapper_ins_units(&units.try_borrow_data()?, &pool.slab)
+            .ok_or(StakeError::InsuranceUnitsInvalid)?;
+        let paid = u64::try_from(u.creator_paid_to_stake).map_err(|_| StakeError::Overflow)?;
+        let owed = paid.saturating_sub(pool.creator_forwarded_atoms);
+        if owed > 0 {
+            validate_account_writable(creator)?;
+            if *creator.owner != crate::spl_token::id() {
+                return Err(ProgramError::IllegalOwner);
+            }
+            {
+                let data = creator.try_borrow_data()?;
+                if data.len() < crate::spl_token::state::ACCOUNT_LEN
+                    || data[0..32] != pool.collateral_mint
+                    || data[32..64] != pool.admin
+                {
+                    msg!("RecoverTerminalInsurance: S1 creator account must be pool.admin's collateral account");
+                    return Err(StakeError::InvalidAccount.into());
+                }
+            }
+            let send = owed.min(read_vault_balance(vault)?);
+            if send > 0 {
+                invoke_signed(
+                    &crate::spl_token::transfer(
+                        token_program.key,
+                        vault.key,
+                        creator.key,
+                        vault_auth.key,
+                        &[],
+                        send,
+                    )?,
+                    &[
+                        vault.clone(),
+                        creator.clone(),
+                        vault_auth.clone(),
+                        token_program.clone(),
+                    ],
+                    &[vault_auth_seeds],
+                )?;
+                pool.creator_forwarded_atoms = pool
+                    .creator_forwarded_atoms
+                    .checked_add(send)
+                    .ok_or(StakeError::Overflow)?;
+                forwarded = send;
+                msg!("RecoverTerminalInsurance: S1 forwarded {} of creator seed to pool.admin", send);
+            }
+        }
+    }
+
     let balance = read_vault_balance(vault)?;
     let fees_before = pool.total_fees_earned;
     if terminal == state::WrapperTerminal::Resolved {
@@ -3903,7 +3991,7 @@ fn process_recover_terminal_insurance(
     // (5) The market is over for this pool: no more deposits or flushes.
     pool.set_market_resolved(true);
 
-    if moved == 0 && attributed == 0 && to_returned == 0 && to_fees == 0 {
+    if moved == 0 && attributed == 0 && to_returned == 0 && to_fees == 0 && forwarded == 0 {
         msg!("RecoverTerminalInsurance: nothing withdrawn, swept or booked");
         return Err(StakeError::NothingToRecover.into());
     }
@@ -3992,7 +4080,7 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     }
     let terminal = state::read_wrapper_terminal(&market.try_borrow_data()?);
     if terminal == state::WrapperTerminal::UnknownLayout {
-        msg!("AdminCloseSlab: wrapper market is not the pinned layout (VERSION 18)");
+        msg!("AdminCloseSlab: wrapper market is not the pinned layout (VERSION 19)");
         return Err(StakeError::UnsupportedWrapperLayout.into());
     }
     if terminal != state::WrapperTerminal::Resolved {
@@ -4174,7 +4262,9 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
     // Threshold is net of `realized_junior_loss`: that capital was forfeited by the
     // exiting junior and is deliberately left in the wrapper, so requiring it back
     // would make this gate unsatisfiable. See `StakePool::wrapper_recoverable`.
-    if !pool.wrapper_fully_recovered() {
+    // v5: a FIRST_LOSS pool's deployed units stay withdrawable after resolution (wrapper
+    // tag 41 pays the stake class through RecoverTerminalInsurance): nothing is stranded.
+    if !pool.is_first_loss() && !pool.wrapper_fully_recovered() {
         msg!(
             "SetMarketResolved: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
             pool.wrapper_recoverable()
@@ -4260,7 +4350,9 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
         // `process_recover_flushed_insurance`, after its wrapper CPI succeeds.
         // Net of `realized_junior_loss` for the same reason as the SetMarketResolved
         // gate above — see `StakePool::wrapper_recoverable`.
-        if !pool.wrapper_fully_recovered() {
+        // v5: a FIRST_LOSS pool's deployed units stay withdrawable after resolution (wrapper
+        // tag 41 pays the stake class through RecoverTerminalInsurance): nothing is stranded.
+        if !pool.is_first_loss() && !pool.wrapper_fully_recovered() {
             msg!(
                 "AdminResolveMarket: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
                 pool.wrapper_recoverable()
@@ -4557,6 +4649,324 @@ fn process_admin_update_trade_fee_policy(
     msg!(
         "AdminUpdateTradeFeePolicy: wrapper trade fee policy updated via pool PDA CPI (marketauth)"
     );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 31: SyncInsuranceDeployment (v5) — permissionless, replaces the admin flush
+// ═══════════════════════════════════════════════════════════════
+//
+// Keeps the pool's deployed insurance near `pool_value * deploy_target_bps`
+// (`math::sync_plan`): a PDA-signed wrapper top-up (tag 9) that never dips the vault
+// below `liquid_buffer_bps` of pool value, or a PDA-signed live recovery (tag 57) of the
+// excess, which the wrapper only allows on a healthy market. Both carry the wrapper's
+// `InsuranceUnitsV20`, so the top-up mints STAKE-class units at the wrapper's entry price
+// and the recovery burns them at its exit price; losses reach the pool only through the
+// unit price, pro rata with every other unit holder.
+//
+// Rate-limited by `sync_cooldown_slots`. A TOP-UP additionally needs the asset admin
+// burned (`BurnAssetAdmin`), so no admin key can afterwards rotate the insurance authority
+// off this pool and strand the deployed units.
+
+fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let caller = next_account_info(accounts_iter)?; // 0
+    let pool_pda = next_account_info(accounts_iter)?; // 1
+    let vault = next_account_info(accounts_iter)?; // 2
+    let vault_auth = next_account_info(accounts_iter)?; // 3
+    let market = next_account_info(accounts_iter)?; // 4
+    let wrapper_vault = next_account_info(accounts_iter)?; // 5
+    let wrapper_vault_auth = next_account_info(accounts_iter)?; // 6
+    let ins_units = next_account_info(accounts_iter)?; // 7
+    let token_program = next_account_info(accounts_iter)?; // 8
+    let percolator_program = next_account_info(accounts_iter)?; // 9
+    let system_program = next_account_info(accounts_iter)?; // 10
+
+    if !caller.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+    validate_account_writable(vault)?;
+    verify_token_program(token_program)?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if !pool.is_first_loss() || pool.pool_mode != 0 {
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+    if pool.market_resolved() {
+        return Err(StakeError::MarketResolved.into());
+    }
+    if pool.slab != market.key.to_bytes() || pool.vault != vault.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool.percolator_program != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+    // The wrapper vault must hold the pool's collateral (the wrapper re-checks it is the
+    // market's canonical vault).
+    {
+        if *wrapper_vault.owner != crate::spl_token::id() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        let wv = wrapper_vault.try_borrow_data()?;
+        if wv.len() < crate::spl_token::state::ACCOUNT_LEN || wv[0..32] != pool.collateral_mint {
+            return Err(StakeError::InvalidMint.into());
+        }
+    }
+
+    let now = Clock::get()?.slot;
+    if pool.last_sync_slot != 0
+        && now < pool.last_sync_slot.saturating_add(pool.sync_cooldown_slots)
+    {
+        return Err(StakeError::SyncCooldownActive.into());
+    }
+
+    // Book wrapper-paid fees first so the liquid value is current.
+    pre_accrue_fee_modes(pool, vault, Some(market), true)?;
+    let units = v5_read_units(pool, caller, market, ins_units, percolator_program, system_program)?;
+    let liquid = pool.total_pool_value().ok_or(StakeError::Overflow)?;
+    let deployed = crate::math::deployed_value(units.units_stake, units.units_total, units.snap_free)
+        .ok_or(StakeError::Overflow)?;
+    let plan = crate::math::sync_plan(
+        liquid,
+        deployed,
+        pool.deploy_target_bps,
+        pool.liquid_buffer_bps,
+        pool.hysteresis_bps,
+    )
+    .ok_or(StakeError::InvalidDeployConfig)?;
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
+    // W-5 / W-8 / S-3 (security review 2026-10-05): a top-up mints at the ENTRY reading and a
+    // recovery burns at the EXIT reading; while they differ, either moves value between unit
+    // holders. Neither runs until the readings agree (the G9 receivable is repaid and no
+    // reservation is open).
+    if plan != crate::math::SyncAction::None && units.snap_mint != units.snap_free {
+        msg!(
+            "Sync: insurance readings diverged (mint {} != free {})",
+            units.snap_mint,
+            units.snap_free
+        );
+        return Err(StakeError::InsuranceReadingsDiverged.into());
+    }
+    match plan {
+        crate::math::SyncAction::None => {
+            msg!("Sync: nothing to do (liquid {}, deployed {})", liquid, deployed);
+            return Err(StakeError::NothingToSync.into());
+        }
+        crate::math::SyncAction::TopUp(a) => {
+            if !pool.asset_admin_burned() {
+                return Err(StakeError::AssetAdminNotBurned.into());
+            }
+            let before = token_balance(vault)?;
+            if a > before {
+                return Err(StakeError::InsufficientVaultBalance.into());
+            }
+            // S-1: the wrapper must mint exactly `floor(a*U/I_mint)` (> 0) stake units.
+            let expected = crate::math::expected_topup_units(a, units.units_total, units.snap_mint)
+                .ok_or(StakeError::Overflow)?;
+            if expected == 0 {
+                return Err(StakeError::InsuranceUnitsMismatch.into());
+            }
+            // The wrapper resets a ledger whose fund AND receivable are empty (every unit worth 0).
+            let stake_before = if units.units_total != 0 && units.snap_mint == 0 {
+                0
+            } else {
+                units.units_stake
+            };
+            cpi::cpi_top_up_insurance_v5(
+                percolator_program,
+                vault_auth,
+                market,
+                vault,
+                wrapper_vault,
+                token_program,
+                ins_units,
+                a,
+                vault_auth_seeds,
+            )?;
+            let after = token_balance(vault)?;
+            if before.checked_sub(after) != Some(a) {
+                return Err(StakeError::CpiFailed.into());
+            }
+            let minted = v5_units_after_cpi(pool, ins_units, percolator_program)?
+                .units_stake
+                .checked_sub(stake_before)
+                .ok_or(StakeError::InsuranceUnitsMismatch)?;
+            if minted != expected {
+                msg!("Sync: wrapper minted {} stake units, expected {}", minted, expected);
+                return Err(StakeError::InsuranceUnitsMismatch.into());
+            }
+            pool.total_flushed = pool.total_flushed.checked_add(a).ok_or(StakeError::Overflow)?;
+            msg!("Sync: deployed {} (liquid {} -> {}, deployed {})", a, liquid, liquid - a, deployed);
+        }
+        crate::math::SyncAction::Recover(r) => {
+            // S-1: the wrapper must burn exactly `ceil(r*U/I_free)` stake units.
+            let expected = crate::math::expected_recover_burn(r, units.units_total, units.snap_free)
+                .ok_or(StakeError::InsuranceUnitsMismatch)?;
+            let before = token_balance(vault)?;
+            cpi::cpi_withdraw_insurance_asset_v5(
+                percolator_program,
+                vault_auth,
+                market,
+                vault,
+                wrapper_vault,
+                wrapper_vault_auth,
+                token_program,
+                ins_units,
+                r,
+                vault_auth_seeds,
+            )?;
+            let after = token_balance(vault)?;
+            if after.checked_sub(before) != Some(r) {
+                return Err(StakeError::CpiFailed.into());
+            }
+            let burned = units
+                .units_stake
+                .checked_sub(v5_units_after_cpi(pool, ins_units, percolator_program)?.units_stake)
+                .ok_or(StakeError::InsuranceUnitsMismatch)?;
+            if burned != expected {
+                msg!("Sync: wrapper burned {} stake units, expected {}", burned, expected);
+                return Err(StakeError::InsuranceUnitsMismatch.into());
+            }
+            pool.total_returned = pool.total_returned.checked_add(r).ok_or(StakeError::Overflow)?;
+            pool.total_recovered_from_wrapper = pool
+                .total_recovered_from_wrapper
+                .checked_add(r)
+                .ok_or(StakeError::Overflow)?;
+            msg!("Sync: recovered {} (deployed {})", r, deployed);
+        }
+    }
+    pool.last_sync_slot = now.max(1);
+    Ok(())
+}
+
+/// True iff `signer` is this program's upgrade authority, proven by its program-data
+/// account (`[program_id]` under the upgradeable loader; ProgramData = enum tag 3, then the
+/// slot (8), then `Option<Pubkey>` at 12..45).
+fn is_upgrade_authority(program_id: &Pubkey, signer: &AccountInfo, program_data: &AccountInfo) -> bool {
+    let loader = solana_program::bpf_loader_upgradeable::id();
+    let (expected, _) = Pubkey::find_program_address(&[program_id.as_ref()], &loader);
+    if !signer.is_signer || *program_data.key != expected || *program_data.owner != loader {
+        return false;
+    }
+    let Ok(d) = program_data.try_borrow_data() else {
+        return false;
+    };
+    d.len() >= 45 && d[0..4] == 3u32.to_le_bytes() && d[12] == 1 && d[13..45] == signer.key.to_bytes()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 32: ProposeDeployTarget (v5) — admin lowers, protocol authority raises
+// ═══════════════════════════════════════════════════════════════
+
+/// S-6 (security review 2026-10-05): the deploy-target timelock is at least
+/// `DEPLOY_TARGET_TIMELOCK_MIN_SLOTS`, independent of the creator-chosen pool cooldown.
+fn deploy_target_timelock_slots(pool: &state::StakePool) -> u64 {
+    pool.cooldown_slots.max(state::DEPLOY_TARGET_TIMELOCK_MIN_SLOTS)
+}
+
+fn process_propose_deploy_target(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    target_bps: u16,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let signer = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let program_data = accounts_iter.next();
+    if !signer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+    if pool.is_initialized != 1 || !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    if !pool.is_first_loss() {
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+    if target_bps > state::DEPLOY_TARGET_MAX_BPS
+        || (target_bps as u32) + (pool.liquid_buffer_bps as u32) > 10_000
+    {
+        return Err(StakeError::InvalidDeployConfig.into());
+    }
+    let protocol = program_data.is_some_and(|pd| is_upgrade_authority(program_id, signer, pd));
+    if target_bps >= pool.deploy_target_bps {
+        // Raising staker risk: protocol authority only.
+        if !protocol {
+            return Err(StakeError::NotProtocolAuthority.into());
+        }
+    } else if !protocol && pool.admin != signer.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+    // S-6: an admin proposal may not overwrite a pending PROTOCOL proposal.
+    let by_protocol_idx = state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL;
+    if !protocol && pool.pending_target_slot != 0 && pool._v5_reserved[by_protocol_idx] != 0 {
+        return Err(StakeError::NotProtocolAuthority.into());
+    }
+    pool.pending_target_bps = target_bps as u64;
+    pool.pending_target_slot = Clock::get()?.slot.max(1);
+    pool._v5_reserved[by_protocol_idx] = u8::from(protocol);
+    msg!(
+        "ProposeDeployTarget: {} -> {} bps, committable after {} slots",
+        pool.deploy_target_bps,
+        target_bps,
+        deploy_target_timelock_slots(pool)
+    );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 33: CommitDeployTarget (v5) — permissionless after the pool cooldown
+// ═══════════════════════════════════════════════════════════════
+
+fn process_commit_deploy_target(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let signer = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    if !signer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    validate_account_owner(pool_pda, program_id)?;
+    validate_account_not_empty(pool_pda)?;
+    validate_account_writable(pool_pda)?;
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool = pool_from_data_mut(&mut pool_data[..])?;
+    if pool.is_initialized != 1 || !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    validate_pool_version(pool)?;
+    let now = Clock::get()?.slot;
+    if pool.pending_target_slot == 0
+        || now < pool.pending_target_slot.saturating_add(deploy_target_timelock_slots(pool))
+    {
+        return Err(StakeError::NoPendingDeployTarget.into());
+    }
+    let t = u16::try_from(pool.pending_target_bps).map_err(|_| StakeError::InvalidDeployConfig)?;
+    pool.deploy_target_bps = t;
+    pool.pending_target_bps = 0;
+    pool.pending_target_slot = 0;
+    pool._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL] = 0;
+    msg!("CommitDeployTarget: deploy target now {} bps", t);
     Ok(())
 }
 

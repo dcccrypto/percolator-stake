@@ -102,11 +102,51 @@ pub enum StakeError {
     /// surplus. The call is refused so a keeper can tell a no-op from a recovery.
     NothingToRecover = 31,
     /// F-9 (security INFO): the bound wrapper market account is not the wrapper
-    /// layout this program has pinned (magic, VERSION 18, kind, minimum length,
+    /// layout this program has pinned (magic, VERSION 19, kind, minimum length,
     /// known mode value). Its engine `mode` byte cannot be trusted, so the terminal
     /// recovery, the CloseSlab proxy, and the mode-0 deposit path all refuse rather
     /// than guess. A wrapper layout bump needs a coordinated stake upgrade.
     UnsupportedWrapperLayout = 32,
+    // ── v5 (Phase 4 item 6): first-loss insurance staking ─────────────────────
+    /// A FIRST_LOSS deposit must carry `accept_first_loss_version == pool.consent_version`
+    /// (the signed, on-chain consent to the risk text). Missing or stale consent is refused.
+    ConsentRequired = 33,
+    /// Removed on v5: `FlushToInsurance` (the creator-admin flush) and
+    /// `RecoverFlushedInsurance`. Deployment is the permissionless `SyncInsuranceDeployment`.
+    DeprecatedV5 = 34,
+    /// The wrapper `InsuranceUnitsV20` account is missing, not the PDA of this market under
+    /// the pool's wrapper, not owned by it, the wrong layout/version, or its snapshot is not
+    /// from the current slot (the wrapper refresh CPI did not run).
+    InsuranceUnitsInvalid = 35,
+    /// A first-loss withdrawal larger than the pool's liquid (vault-resident) value: the
+    /// deployed part returns on the next `SyncInsuranceDeployment` recovery (healthy market).
+    LiquidityBufferExhausted = 36,
+    /// `SyncInsuranceDeployment` ran less than `sync_cooldown_slots` ago.
+    SyncCooldownActive = 37,
+    /// A deploy target / buffer / hysteresis / risk mode outside the protocol bounds, or a
+    /// target change the signer may not make (the admin may only LOWER the target).
+    InvalidDeployConfig = 38,
+    /// Raising the deploy target needs the stake program's upgrade authority (Squads on
+    /// mainnet), proven by the program-data account.
+    NotProtocolAuthority = 39,
+    /// `CommitDeployTarget` with no pending proposal, or before the timelock elapsed.
+    NoPendingDeployTarget = 40,
+    /// Not available on a FIRST_LOSS pool: tranches, HWM, admin rotation of the insurance
+    /// authority/operator (it would strand the stakers' insurance units).
+    NotSupportedOnFirstLoss = 41,
+    /// A sync top-up needs the asset admin burned (no admin key can rotate the insurance
+    /// authority away from the pool afterwards).
+    AssetAdminNotBurned = 42,
+    /// The sync found nothing to do (inside the hysteresis band, or no spare liquidity).
+    NothingToSync = 43,
+    /// W-5 / S-3 (security review 2026-10-05): the wrapper's mint (entry) reading differs from
+    /// its free (exit) reading (a G9 receivable or a reservation is outstanding). Moving value
+    /// into or out of the deployed units at that spread would transfer it between unit holders,
+    /// so the sync top-up / recovery and a deposit into a pool with deployed units wait.
+    InsuranceReadingsDiverged = 44,
+    /// S-1 (security review 2026-10-05): the wrapper minted (top-up) or burned (recovery) a
+    /// different number of stake units than `floor(a*U/I_mint)` / `ceil(r*U/I_free)`, or zero.
+    InsuranceUnitsMismatch = 45,
 }
 
 impl From<StakeError> for ProgramError {
@@ -151,7 +191,20 @@ pub fn error_hint(code: u32) -> &'static str {
         29 => "No real LP holders — the pool's only LP supply is the MINIMUM_LIQUIDITY dead-share floor, so AccrueFees refuses to book fees nobody could redeem; the fees stay in the vault and are booked once a real staker deposits (F3)",
         30 => "Market not terminal — RecoverTerminalInsurance needs the bound wrapper market to be Resolved (or closed); while the market is Live use RecoverFlushedInsurance, and a non-zero amount needs a Resolved (not closed) market (F-9)",
         31 => "Nothing to recover — no terminal insurance was withdrawn, no stray vault_auth token account was swept, and the pool vault has no unbooked surplus (F-9)",
-        32 => "Unsupported wrapper layout — the bound market account is not the pinned wrapper layout (magic, VERSION 18, kind, minimum length), so its resolved/live state cannot be read; the stake program must be upgraded together with the wrapper (F-9)",
+        32 => "Unsupported wrapper layout — the bound market account is not the pinned wrapper layout (magic, VERSION 19, kind, minimum length), so its resolved/live state cannot be read; the stake program must be upgraded together with the wrapper (F-9)",
+        33 => "Consent required — a first-loss stake deposit must carry the current risk-consent version; review and accept the risk text in the app",
+        34 => "Deprecated on v5 — FlushToInsurance / RecoverFlushedInsurance were removed; deployment is the permissionless SyncInsuranceDeployment",
+        35 => "Insurance units invalid — pass the wrapper's InsuranceUnitsV20 account for this market (it is refreshed in the same instruction)",
+        36 => "Liquidity buffer exhausted — this withdrawal exceeds the pool's liquid value; the deployed part returns after the next sync on a healthy market",
+        37 => "Sync cooldown active — SyncInsuranceDeployment ran recently; retry after sync_cooldown_slots",
+        38 => "Invalid deploy config — target/buffer/hysteresis out of bounds, or the admin tried to raise the target",
+        39 => "Not protocol authority — raising the deploy target needs the stake program's upgrade authority",
+        40 => "No pending deploy target — propose a target first, or wait for its timelock (the pool cooldown)",
+        41 => "Not supported on first-loss pools — tranches, HWM and admin rotation of the insurance authority are disabled",
+        42 => "Asset admin not burned — burn the asset admin (BurnAssetAdmin) before stake can be deployed into insurance",
+        43 => "Nothing to sync — the deployed value is within the hysteresis band of the target, or there is no spare liquidity",
+        44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid",
+        45 => "Insurance units mismatch — the wrapper did not mint or burn the expected stake units; the sync was reverted",
         _ => "Unknown error — check the error code and pool state",
     }
 }

@@ -58,7 +58,7 @@ const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // earlier v17=2987, then 3003 (post source-domain convergence), then 3067; current=3147
 // (post InitMatcherCtx port / protocol-fee tag renumbering, percolator-prog
 // HEAD 1d4594a5 — confirmed via `cargo run --example dump_sizes`).
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 3995; // v2.2 combined cap-1 market (592 + 806 + 2597: slot = 2325 + 112 band/rent + 160 funding-scale drift tail); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Was 3067 when WRAPPER_CONFIG_LEN was 496; the 2026-07-19 fee-split fields grew
@@ -195,12 +195,33 @@ fn encode_withdraw_insurance_asset(asset_index: u16, amount: u128) -> Vec<u8> {
 
 // ── Transaction helpers ───────────────────────────────────────────────────────
 
+/// v2.2 combined release: complete the stale direct wrapper wire (tag 57 lacked `market_id` and the
+/// `authority_epoch` trailer, so the drain attempt decoded as InvalidInstructionData and the RED
+/// control proved nothing). Values come from the live market bytes.
+fn complete_wrapper_wire(svm: &LiteSVM, ix: &mut Instruction) {
+    use percolator_stake::wrapper_layout::{ASSET0_AUTHORITY_EPOCH_OFF, ASSET0_MARKET_ID_OFF};
+    let d = ix.data.clone();
+    if d.first() != Some(&57u8) || d.len() != 19 {
+        return;
+    }
+    let Some(m) = ix.accounts.get(1) else { return };
+    let Some(acct) = svm.get_account(&m.pubkey) else { return };
+    let rd = |off: usize| u64::from_le_bytes(acct.data[off..off + 8].try_into().unwrap());
+    let mut n = vec![57u8];
+    n.extend_from_slice(&d[1..3]);
+    n.extend_from_slice(&rd(ASSET0_MARKET_ID_OFF).to_le_bytes());
+    n.extend_from_slice(&d[3..19]);
+    n.extend_from_slice(&rd(ASSET0_AUTHORITY_EPOCH_OFF).to_le_bytes());
+    ix.data = n;
+}
+
 fn send(
     svm: &mut LiteSVM,
     payer: &Keypair,
     signers: &[&Keypair],
-    ix: Instruction,
+    mut ix: Instruction,
 ) -> Result<(), TransactionError> {
+    complete_wrapper_wire(svm, &mut ix);
     let mut all: Vec<&Keypair> = vec![payer];
     all.extend_from_slice(signers);
     // The v17 wrapper installs a custom 128KB BumpAllocator (V16_HEAP_FRAME_BYTES,
@@ -593,6 +614,7 @@ fn init_market_v17_wire_is_219_bytes() {
 /// RED: flush without bind reverts Custom(8) Unauthorized.
 /// GREEN: bind then flush moves tokens.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn flush_applies_insurance_after_bind_v17() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -636,7 +658,10 @@ fn flush_applies_insurance_after_bind_v17() {
     .expect_err("flush without bind must revert");
     match err {
         TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
-            assert_eq!(code, 8, "must be Unauthorized=8, not some other error");
+            // v5: FlushToInsurance is deprecated for EVERY caller (DeprecatedV5 = 34) before any
+            // authorisation check, so Unauthorized=8 is unreachable; the flush still must not
+            // succeed, and must not be an EngineLockActive revert.
+            assert_eq!(code, 34, "v5: DeprecatedV5=34 for any signer (was Unauthorized=8 pre-v5)");
             assert_ne!(code, 21, "must NOT be EngineLockActive (market IS Live)");
         }
         other => panic!("expected Custom(8) Unauthorized, got {other:?}"),
@@ -753,6 +778,7 @@ fn flush_applies_insurance_after_bind_v17() {
 ///   2. Second fresh market, full secure bind + burn. Admin calls tag-57 WITHOUT
 ///      pre-rotating anything → drain FAILS (Custom(8)). [GREEN]
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn no_admin_drain_before_and_after_bind() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -969,6 +995,7 @@ fn no_admin_drain_before_and_after_bind() {
 /// the local-authorized path. The fixed implementation rejects the first rotate
 /// in stake with StakeError::Unauthorized.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn secure_bind_burn_blocks_rotate_back_to_admin() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -1073,6 +1100,7 @@ fn secure_bind_burn_blocks_rotate_back_to_admin() {
 /// No-admin-drain: a third-party attacker (not admin, not insurance_operator) also
 /// cannot drain. This is an independent check from the admin case above.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn no_attacker_drain_after_bind() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -1186,6 +1214,7 @@ fn no_attacker_drain_after_bind() {
 // This proves the no-lockout guarantee holds under the v17 tag-65 wire.
 
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn no_lockout_rotate_then_rebind_from_new_program_v17() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -1435,6 +1464,7 @@ fn no_lockout_rotate_then_rebind_from_new_program_v17() {
 /// Proves recovery works AFTER the irreversible burn (no admin can rotate back),
 /// pool.total_returned increases, and tokens land in pool.vault.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn recover_flushed_insurance_after_burn() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -1585,6 +1615,7 @@ fn recover_flushed_insurance_after_burn() {
 /// NEGATIVE: wrong dest_token (not pool.vault) is rejected BEFORE any CPI.
 /// Proves drain-vector is closed at the stake processor level, not the wrapper.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn recover_flushed_insurance_wrong_dest_rejected() {
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
@@ -1755,10 +1786,11 @@ fn recover_flushed_insurance_nothing_flushed_rejected() {
 
     match err {
         TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
+            // v5: RecoverFlushedInsurance is deprecated (DeprecatedV5 = 34) before any balance check.
             assert_eq!(
                 code,
-                StakeError::InsufficientVaultBalance as u32,
-                "expected InsufficientVaultBalance=13, got code={code}"
+                StakeError::DeprecatedV5 as u32,
+                "v5: RecoverFlushedInsurance returns DeprecatedV5=34 (was InsufficientVaultBalance=13 pre-v5), got code={code}"
             );
         }
         other => panic!("expected Custom(InsufficientVaultBalance=13), got {other:?}"),

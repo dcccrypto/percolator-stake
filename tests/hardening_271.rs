@@ -49,8 +49,35 @@ fn release_profile_enables_overflow_checks() {
     );
 }
 
+/// v5 (Phase 4 item 6): `RecoverFlushedInsurance` (tag 23) and `FlushToInsurance` (tag 3)
+/// are REMOVED; recovery is part of `SyncInsuranceDeployment` (tag 31). The slab-binding
+/// property this test pinned now lives in `v5_read_units` (market == pool.slab before any
+/// CPI) and in the sync handler's own `pool.slab != market` guard.
 #[test]
-fn recover_flushed_insurance_binds_the_market_to_the_pool_slab() {
+fn v5_recover_flushed_insurance_is_removed_and_sync_binds_the_slab() {
+    let src = source();
+    assert!(
+        !src.contains("fn process_recover_flushed_insurance"),
+        "v5: the tag-23 handler must be gone"
+    );
+    assert!(
+        src.contains("StakeInstruction::RecoverFlushedInsurance { .. } => Err(StakeError::DeprecatedV5.into())"),
+        "v5: tag 23 must dispatch to DeprecatedV5"
+    );
+    let sync = src
+        .split("fn process_sync_insurance_deployment")
+        .nth(1)
+        .expect("the sync handler must exist");
+    let body = sync.split("\nfn ").next().unwrap_or(sync);
+    let guard_at = body
+        .find("pool.slab != market.key.to_bytes()")
+        .expect("sync must bind the market to pool.slab");
+    let cpi_at = body.find("cpi::").unwrap_or(usize::MAX);
+    assert!(guard_at < cpi_at, "the slab guard must run BEFORE any CPI");
+}
+
+#[allow(dead_code)]
+fn recover_flushed_insurance_binds_the_market_to_the_pool_slab_v4() {
     // Item 1. `process_flush_to_insurance` has always checked `pool.slab ==
     // slab.key`; the recover path passed `market` straight through to the tag-57
     // CPI. It was not exploitable — the vault_auth PDA is only that slab's

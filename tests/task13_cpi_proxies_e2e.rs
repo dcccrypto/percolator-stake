@@ -62,7 +62,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 3995; // v2.2 combined cap-1 market (592 + 806 + 2597: slot = 2325 + 112 band/rent + 160 funding-scale drift tail); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Recompute via percolator_prog::state::market_account_len_for_capacity(1) if
@@ -164,12 +164,49 @@ fn encode_init_market_v17() -> Vec<u8> {
     out
 }
 
+/// v2.2 combined release: the direct wrapper-wire helpers in this file were written for the pre-W3A /
+/// W4-AE wrapper wire (no `market_id`, `authority_epoch` or `policy_sequence` trailer), so every
+/// direct call decoded as InvalidInstructionData: the positive controls failed and, worse, the
+/// negative controls "rejected" for the wrong reason. Complete the wire from the live market bytes
+/// (the same values the stake proxy reads) so the controls exercise the real authorisation path.
+fn complete_wrapper_wire(svm: &LiteSVM, ix: &mut Instruction) {
+    use percolator_stake::wrapper_layout::{ASSET0_AUTHORITY_EPOCH_OFF, ASSET0_MARKET_ID_OFF};
+    let Some(market_meta) = ix.accounts.iter().find(|m| m.is_writable && svm.get_account(&m.pubkey).map_or(false, |a| a.data.len() > ASSET0_MARKET_ID_OFF + 8)) else { return };
+    let data = svm.get_account(&market_meta.pubkey).unwrap().data;
+    let rd = |off: usize| u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+    let (market_id, epoch) = (rd(ASSET0_MARKET_ID_OFF), rd(ASSET0_AUTHORITY_EPOCH_OFF));
+    let d = ix.data.clone();
+    match d.first().copied() {
+        Some(32) if d.len() == 33 => ix.data.extend_from_slice(&epoch.to_le_bytes()),
+        Some(86) if d.len() == 7 => ix.data.extend_from_slice(&epoch.to_le_bytes()),
+        Some(55) if d.len() == 9 => ix.data.extend_from_slice(&1u64.to_le_bytes()),
+        Some(51) if d.len() == 7 => {
+            let mut n = vec![51u8];
+            n.extend_from_slice(&d[1..3]);
+            n.extend_from_slice(&market_id.to_le_bytes());
+            n.extend_from_slice(&d[3..7]);
+            n.extend_from_slice(&1u64.to_le_bytes());
+            ix.data = n;
+        }
+        Some(65) if d.len() == 36 => {
+            let mut n = vec![65u8];
+            n.extend_from_slice(&d[1..3]);
+            n.extend_from_slice(&market_id.to_le_bytes());
+            n.extend_from_slice(&d[3..]);
+            n.extend_from_slice(&epoch.to_le_bytes());
+            ix.data = n;
+        }
+        _ => {}
+    }
+}
+
 fn send(
     svm: &mut LiteSVM,
     payer: &Keypair,
     signers: &[&Keypair],
-    ix: Instruction,
+    mut ix: Instruction,
 ) -> Result<(), TransactionError> {
+    complete_wrapper_wire(svm, &mut ix);
     let mut all: Vec<&Keypair> = vec![payer];
     all.extend_from_slice(signers);
     let cb_heap =
@@ -527,10 +564,16 @@ struct Staked {
 }
 
 fn encode_init_pool(cooldown_slots: u64, deposit_cap: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(17);
+    let mut out = Vec::with_capacity(24);
     out.push(0u8); // tag InitPool
     out.extend_from_slice(&cooldown_slots.to_le_bytes());
     out.extend_from_slice(&deposit_cap.to_le_bytes());
+    // v5: the 16-byte InitPool now creates a FIRST_LOSS pool (consent-gated deposits). These suites test
+    // the pre-v5 fee-only (mode 0) behaviour, which is v5 risk mode FEE_ONLY: no insurance deployment.
+    out.push(2u8); // risk_mode FEE_ONLY
+    out.extend_from_slice(&0u16.to_le_bytes()); // deploy_target_bps
+    out.extend_from_slice(&3_000u16.to_le_bytes()); // liquid_buffer_bps
+    out.extend_from_slice(&500u16.to_le_bytes()); // hysteresis_bps
     out
 }
 

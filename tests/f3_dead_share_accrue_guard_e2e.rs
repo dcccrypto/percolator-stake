@@ -50,7 +50,8 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 // counter (`insurance_reserve_withdrawn_atoms`, bytes [560..576)) is unchanged.
 // Run these suites against a v18 wrapper .so: the v17-era CI pin (15eb8b0c) rejects
 // the v18 InitPool marketauth CPI wire with InvalidInstructionData.
-const MARKET_LEN_V18_CAP1: usize = 3675;
+// v2.2 (wrapper VERSION 19): 592 + 806 + 2437 = 3835 (3675 on v2.1).
+const MARKET_LEN_V18_CAP1: usize = 3995;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 // ---- Artifact paths ----
@@ -325,8 +326,17 @@ fn deposit_ix(
     slab: Pubkey,
 ) -> Instruction {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
     let mut data = vec![1u8]; // tag = Deposit
     data.extend_from_slice(&amount.to_le_bytes());
+    // v5: the 16-byte InitPool creates a FIRST_LOSS pool -> signed consent byte + the
+    // wrapper's InsuranceUnitsV20 (refreshed by CPI) + the wrapper program.
+    data.extend_from_slice(&percolator_stake::state::deposit_consent_bytes(
+        percolator_stake::state::DEPLOY_TARGET_DEFAULT_BPS,
+        percolator_stake::state::LIQUID_BUFFER_DEFAULT_BPS,
+        percolator_stake::state::HYSTERESIS_DEFAULT_BPS,
+    ));
+    let units = percolator_stake::state::derive_wrapper_ins_units(&wrapper_id, &slab).0;
     Instruction {
         program_id: stake_id,
         accounts: vec![
@@ -341,7 +351,9 @@ fn deposit_ix(
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(slab, false), // 11. wrapper market (#290)
+            AccountMeta::new(slab, false), // 11. wrapper market (#290; v5: writable)
+            AccountMeta::new(units, false), // 12. v5 InsuranceUnitsV20
+            AccountMeta::new_readonly(wrapper_id, false), // 13. v5 wrapper program
         ],
         data,
     }
@@ -414,7 +426,17 @@ fn withdraw_ix(
             AccountMeta::new(deposit_pda, false),
             AccountMeta::new_readonly(a.token_program, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
-            AccountMeta::new_readonly(a.slab, false), // 10. wrapper market (#290, optional)
+            AccountMeta::new(a.slab, false), // 10. wrapper market (#290; v5: required, writable)
+            AccountMeta::new(
+                percolator_stake::state::derive_wrapper_ins_units(
+                    &Pubkey::from_str(WRAPPER_MAINNET).unwrap(),
+                    &a.slab,
+                )
+                .0,
+                false,
+            ), // 11. v5 InsuranceUnitsV20
+            AccountMeta::new_readonly(Pubkey::from_str(WRAPPER_MAINNET).unwrap(), false), // 12.
+            AccountMeta::new_readonly(system_program::id(), false), // 13.
         ],
         data,
     }
@@ -636,15 +658,14 @@ fn f3_accrue_fees_refused_when_only_dead_shares_exist() {
     );
 }
 
-/// (a, continued) The un-booked push is NOT lost: the first real depositor's
-/// Deposit pre-accrue skips (it must not book the push to the dead shares just
-/// before minting either), and the first AccrueFees after that books it.
-///
-/// This also measures the residual: the first real staker after an all-exit
-/// receives almost all of a push that was paid while nobody was staked.
+/// (a, continued) S2 (Phase 4 v5, FIRST_LOSS pools): a push paid while ONLY the dead shares
+/// exist belongs to no staker. The first real depositor's Deposit pre-accrue consumes it from
+/// the #290 attribution cursor UNBOOKED, so it is never booked to that first staker (the F5
+/// windfall this test used to measure is closed). The tokens stay in the vault as unbooked
+/// surplus (terminal recovery books them to whoever then holds LP).
 #[test]
-fn f3_pending_push_is_booked_once_a_real_staker_exists() {
-    let Some(mut w) = world("f3_pending_push_is_booked_once_a_real_staker_exists") else {
+fn f3_s2_pending_push_is_never_booked_to_the_first_staker() {
+    let Some(mut w) = world("f3_s2_pending_push_is_never_booked_to_the_first_staker") else {
         return;
     };
     let alice = deposit(&mut w, 2_000);
@@ -670,53 +691,38 @@ fn f3_pending_push_is_booked_once_a_real_staker_exists() {
         accrue(&mut w).is_err(),
         "refused while only dead shares exist"
     );
+    let cursor_before = read_pool(&w.svm, &w.accts.pool_pda).mode0_fees_attributed;
 
-    // A real staker deposits. Pricing is against the un-accrued pool value (the
-    // pre-accrue skipped), so they are NOT charged the push as an inflated price.
     let pv_before = read_pool(&w.svm, &w.accts.pool_pda)
         .total_pool_value()
         .unwrap();
     let dep: u64 = 10_000;
     let bob = deposit(&mut w, dep);
     let pool = read_pool(&w.svm, &w.accts.pool_pda);
+    assert_eq!(pool.total_fees_earned, 0, "nothing booked at the deposit");
     assert_eq!(
-        pool.total_fees_earned, 0,
-        "F3: the Deposit pre-accrue must not book the push to the dead shares"
+        pool.mode0_fees_attributed,
+        cursor_before + fees,
+        "S2: the pre-stake backlog is consumed from the cursor"
     );
     let bob_lp = token_amount(&w.svm, &bob.lp_ata);
     let expected_lp =
         percolator_stake::math::calc_lp_for_deposit(MINIMUM_LIQUIDITY, pv_before, dep).unwrap();
     assert_eq!(bob_lp, expected_lp, "minted at the un-accrued price");
-    assert_eq!(pool.total_lp_supply, MINIMUM_LIQUIDITY + bob_lp);
 
-    // Now AccrueFees books the whole pending push.
-    accrue(&mut w).unwrap_or_else(|e| {
-        panic!(
-            "AccrueFees must succeed once a real staker exists.\nLogs:\n{}",
-            e.meta.logs.join("\n")
-        )
-    });
+    // A later AccrueFees has nothing attributable: the backlog is never Bob's.
+    let _ = accrue(&mut w);
     let pool = read_pool(&w.svm, &w.accts.pool_pda);
-    assert_eq!(
-        pool.total_fees_earned, fees,
-        "the pending push is booked in full"
-    );
-    assert_eq!(pool.total_pool_value().unwrap(), pv_before + dep + fees);
-
-    // Residual (not fixed here, like wrapper F5): bob's claim now includes nearly
-    // the whole push that was paid before he staked.
+    assert_eq!(pool.total_fees_earned, 0, "S2: the backlog is never booked");
     let bob_claim = percolator_stake::math::calc_collateral_for_withdraw(
         pool.total_lp_supply,
         pool.total_pool_value().unwrap(),
         bob_lp,
     )
     .unwrap();
-    eprintln!(
-        "F3 residual: bob deposited {dep}, claim after first accrual = {bob_claim} \
-         (windfall {} of a {fees} push; dead shares keep the rest)",
-        bob_claim - dep
-    );
-    assert!(bob_claim > dep);
+    assert!(bob_claim <= dep, "S2: no first-staker windfall ({bob_claim} vs {dep})");
+    // The tokens are still in the vault (unbooked surplus).
+    assert!(token_amount(&w.svm, &w.accts.vault) >= pv_before + dep + fees);
 }
 
 /// (b) A pool with real stakers still accrues. Includes the exact boundary: a
