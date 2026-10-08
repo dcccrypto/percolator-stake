@@ -72,7 +72,7 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 // v2.2: cap-1 market = 592 + 806 + 2437 = 3835 (v2.1: 3675). The two offsets are the SAME
 // constants stake's CPI builders read at runtime, imported rather than copied, so this test
 // cannot drift from the program it pins.
-const MARKET_LEN_V19_CAP1: usize = 4027;
+const MARKET_LEN_V19_CAP1: usize = 4059;
 use percolator_stake::wrapper_layout::{ASSET0_AUTHORITY_EPOCH_OFF, MARKET_ASSET_GENERATION_FRONTIER_OFF};
 
 fn wrapper_sos() -> Vec<PathBuf> {

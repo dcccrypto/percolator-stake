@@ -48,7 +48,7 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v2.2 (wrapper VERSION 19) market account length for capacity 1: 592 + 806 + 2437.
 // (v2.1 / VERSION 18: 3675; see f3_dead_share_accrue_guard_e2e.rs.)
-const MARKET_LEN_V18_CAP1: usize = 4027;
+const MARKET_LEN_V18_CAP1: usize = 4059;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 // Asset-0 raw offsets: the SAME constants the program reads at runtime (v2.2 layout 19; the
 // pin test `wrapper_layout_v22_pin` re-derives them against the real wrapper types).
