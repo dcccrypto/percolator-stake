@@ -523,6 +523,10 @@ pub fn mode0_attributable_fees(
 /// next depositor. Fee accrual is therefore allowed only ABOVE the floor. Mirrors the
 /// wrapper LP vault's `total_lp_shares_outstanding <= LP_VAULT_MINIMUM_LIQUIDITY`
 /// refusal.
+///
+/// R-1 (2026-10-09): this is the SINGLE-floor rule. It is exact for non-tranche and
+/// legacy pools only; a tranche pool can hold one floor per sub-pool, so every
+/// production gate calls `StakePool::has_real_lp_holders` (per-sub-pool, exact) instead.
 pub fn has_real_lp_holders(total_lp_supply: u64) -> bool {
     total_lp_supply > crate::state::MINIMUM_LIQUIDITY
 }

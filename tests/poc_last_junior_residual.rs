@@ -431,6 +431,7 @@ fn spl_transfer_ix(c: &Ctx, src: Pubkey, dst: Pubkey, owner: &Pubkey, amount: u6
 struct World {
     svm: LiteSVM,
     c: Ctx,
+    admin: Keypair,
     payer: Keypair,
 }
 
@@ -440,6 +441,31 @@ fn world() -> World {
 }
 
 fn world_mult(junior_mult_bps: u16) -> World {
+    let mut w = world_untranched();
+    enable_tranches_mult(&mut w, junior_mult_bps);
+    w
+}
+
+fn enable_tranches(w: &mut World) {
+    enable_tranches_mult(w, JUNIOR_MULT_BPS);
+}
+
+fn enable_tranches_mult(w: &mut World, junior_mult_bps: u16) {
+    let payer = w.payer.insecure_clone();
+    let admin = w.admin.insecure_clone();
+    send(
+        &mut w.svm,
+        &payer,
+        &[&admin],
+        set_tranche_config_ix(&w.c, &admin.pubkey(), junior_mult_bps),
+    )
+    .expect("AdminSetTrancheConfig");
+    w.svm.expire_blockhash();
+    assert!(pool(w).tranche_enabled(), "tranches on");
+}
+
+/// Real InitMarket -> real InitTradingPool (mode 1), tranches OFF.
+fn world_untranched() -> World {
     assert!(
         stake_so().exists(),
         "missing {} — run `cargo build-sbf` first. Without this the suite would report \
@@ -491,19 +517,16 @@ fn world_mult(junior_mult_bps: u16) -> World {
     )
     .expect("InitTradingPool");
     svm.expire_blockhash();
-    send(
-        &mut svm,
-        &payer,
-        &[&admin],
-        set_tranche_config_ix(&c, &admin.pubkey(), junior_mult_bps),
-    )
-    .expect("AdminSetTrancheConfig");
-    svm.expire_blockhash();
 
     let p = read_pool(&svm, &pool_pda);
     assert_eq!(p.pool_mode, 1, "trading pool");
-    assert!(p.tranche_enabled(), "tranches on");
-    World { svm, c, payer }
+    assert!(!p.tranche_enabled(), "tranches off until enabled");
+    World {
+        svm,
+        c,
+        admin,
+        payer,
+    }
 }
 
 struct User {
@@ -900,4 +923,160 @@ fn new1_first_senior_after_junior_genesis_locks_dead_senior_shares() {
         "dead senior shares survive the exit"
     );
     assert_vault_matches_books(&w);
+}
+
+// ── R-1: real-holder detection must count one floor PER SUB-POOL (review of b83ddf9) ──
+//
+// Since NEW-1 a tranche pool can hold two dead-share floors (senior + junior), so
+// `total_lp_supply > MINIMUM_LIQUIDITY` no longer means "a real LP exists". Every fee
+// gate (AccrueFees F3 refusal, the deposit/withdraw pre-accrue, F-9 terminal recovery)
+// and the junior/senior fee split must use the per-sub-pool real supply.
+
+/// `StakeError::NoRealLpHolders`.
+const ERR_NO_REAL_LP_HOLDERS: u32 = 29;
+
+fn try_donate_and_accrue(
+    w: &mut World,
+    donor: &User,
+    amount: u64,
+) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let payer = w.payer.insecure_clone();
+    let t = spl_transfer_ix(&w.c, donor.ata, w.c.vault, &donor.kp.pubkey(), amount);
+    let a = accrue_fees_ix(&w.c, &donor.kp.pubkey());
+    let r = send_batch(&mut w.svm, &payer, &[&donor.kp], vec![t, a]);
+    w.svm.expire_blockhash();
+    r
+}
+
+/// Reviewer's repro: senior 2,000 + junior 5,000, everyone exits -> 2,000 dead LP
+/// (1,000 per sub-pool). A donation + AccrueFees must be refused (29), exactly as the
+/// single-floor pool is on 9185fdd, and nothing booked.
+#[test]
+fn r1_dead_only_tranche_pool_refuses_accrue() {
+    let mut w = world();
+    let s = new_user(&mut w, SENIOR_GENESIS);
+    deposit_senior(&mut w, &s, SENIOR_GENESIS);
+    let j = new_user(&mut w, 5_000);
+    deposit_junior(&mut w, &j, 5_000);
+    withdraw_all(&mut w, &j);
+    withdraw_all(&mut w, &s);
+    let p = pool(&w);
+    let floor = percolator_stake::state::MINIMUM_LIQUIDITY;
+    assert_eq!(
+        (p.total_lp_supply, p.junior_total_lp(), p.senior_total_lp()),
+        (2 * floor, floor, floor)
+    );
+    let fees_before = p.total_fees_earned;
+
+    let donor = new_user(&mut w, 1_000_000);
+    let err = try_donate_and_accrue(&mut w, &donor, 1_000_000).expect_err("dead-only pool");
+    assert_eq!(custom_code(&err), Some(ERR_NO_REAL_LP_HOLDERS));
+    assert_eq!(pool(&w).total_fees_earned, fees_before, "nothing booked");
+}
+
+/// A junior sub-pool holding only its dead shares takes no share of fees: everything
+/// goes to the senior sub-pool, whose real holders exist.
+#[test]
+fn r1_dead_only_junior_gets_no_fee_share() {
+    let mut w = world();
+    let s = new_user(&mut w, 100_000);
+    deposit_senior(&mut w, &s, 100_000);
+    let j = new_user(&mut w, 5_000);
+    deposit_junior(&mut w, &j, 5_000);
+    withdraw_all(&mut w, &j);
+    let p = pool(&w);
+    assert_eq!(
+        p.junior_total_lp(),
+        percolator_stake::state::MINIMUM_LIQUIDITY
+    );
+    let (jb_before, sb_before) = (p.junior_balance(), p.senior_balance().unwrap());
+
+    let donor = new_user(&mut w, 1_000_000);
+    donate_and_accrue(&mut w, &donor, 1_000_000);
+    let p = pool(&w);
+    assert_eq!(
+        p.junior_balance(),
+        jb_before,
+        "dead-only junior booked no fee"
+    );
+    assert_eq!(
+        p.senior_balance().unwrap(),
+        sb_before + 1_000_000,
+        "all fee to senior"
+    );
+    assert_vault_matches_books(&w);
+}
+
+/// Mirror: junior genesis, a senior enters and leaves -> senior holds only its dead
+/// floor; every fee goes to the junior sub-pool.
+#[test]
+fn r1_dead_only_senior_gets_no_fee_share() {
+    let mut w = world();
+    let j = new_user(&mut w, 100_000);
+    deposit_junior(&mut w, &j, 100_000);
+    let s = new_user(&mut w, 5_000);
+    deposit_senior(&mut w, &s, 5_000);
+    withdraw_all(&mut w, &s);
+    let p = pool(&w);
+    assert_eq!(
+        p.senior_total_lp(),
+        percolator_stake::state::MINIMUM_LIQUIDITY
+    );
+    let (jb_before, sb_before) = (p.junior_balance(), p.senior_balance().unwrap());
+
+    let donor = new_user(&mut w, 1_000_000);
+    donate_and_accrue(&mut w, &donor, 1_000_000);
+    let p = pool(&w);
+    assert_eq!(
+        p.senior_balance().unwrap(),
+        sb_before,
+        "dead-only senior booked no fee"
+    );
+    assert_eq!(
+        p.junior_balance(),
+        jb_before + 1_000_000,
+        "all fee to junior"
+    );
+    assert_vault_matches_books(&w);
+}
+
+/// Non-tranche pool that turns tranches on after deposits: its genesis floor sits in
+/// the senior supply, the first junior adds one junior floor; once every real staker is
+/// out the pool is dead-only and refuses AccrueFees.
+#[test]
+fn r1_tranches_enabled_later_counts_both_floors() {
+    let mut w = world_untranched();
+    let s = new_user(&mut w, SENIOR_GENESIS);
+    deposit_senior(&mut w, &s, SENIOR_GENESIS);
+    enable_tranches(&mut w);
+    let j = new_user(&mut w, 5_000);
+    deposit_junior(&mut w, &j, 5_000);
+    withdraw_all(&mut w, &j);
+    withdraw_all(&mut w, &s);
+    let floor = percolator_stake::state::MINIMUM_LIQUIDITY;
+    let p = pool(&w);
+    assert_eq!((p.senior_total_lp(), p.junior_total_lp()), (floor, floor));
+    let donor = new_user(&mut w, 1_000);
+    let err = try_donate_and_accrue(&mut w, &donor, 1_000).expect_err("dead-only pool");
+    assert_eq!(custom_code(&err), Some(ERR_NO_REAL_LP_HOLDERS));
+}
+
+/// The #127 multiplier lock follows REAL junior LP: once every real junior is out
+/// (only the dead floor left, which takes no fee share), the admin may change it.
+#[test]
+fn r1_multiplier_unlocks_when_only_dead_junior_shares_remain() {
+    let mut w = world();
+    let s = new_user(&mut w, SENIOR_GENESIS);
+    deposit_senior(&mut w, &s, SENIOR_GENESIS);
+    let j = new_user(&mut w, 5_000);
+    deposit_junior(&mut w, &j, 5_000);
+    let payer = w.payer.insecure_clone();
+    let admin = w.admin.insecure_clone();
+    let ix = set_tranche_config_ix(&w.c, &admin.pubkey(), 30_000);
+    send(&mut w.svm, &payer, &[&admin], ix).expect_err("locked while a real junior exists");
+    w.svm.expire_blockhash();
+    withdraw_all(&mut w, &j);
+    let ix = set_tranche_config_ix(&w.c, &admin.pubkey(), 30_000);
+    send(&mut w.svm, &payer, &[&admin], ix).expect("free again with only dead junior LP");
+    assert_eq!(pool(&w).junior_fee_mult_bps(), 30_000);
 }

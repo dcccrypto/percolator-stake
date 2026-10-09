@@ -24,6 +24,11 @@ pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 
 /// USDC=6, SOL=9) without materially raising the practical minimum pool size.
 pub const MINIMUM_LIQUIDITY: u64 = 1_000;
 
+/// R-1 floor flag: the senior sub-pool supply holds a MINIMUM_LIQUIDITY dead floor.
+pub const FLOOR_SENIOR: u8 = 0x01;
+/// R-1 floor flag: `junior_total_lp` holds a MINIMUM_LIQUIDITY dead floor.
+pub const FLOOR_JUNIOR: u8 = 0x02;
+
 /// Stake pool state — one per slab (market).
 /// PDA seeds: [b"stake_pool", slab_pubkey]
 ///
@@ -542,7 +547,8 @@ impl StakePool {
     //   [51..59] = realized_junior_loss: u64 (LE)
     //   [59]     = asset_admin_burned (0=false, 1=true)
     //   [60]     = fee_attribution_armed (#290; 0=legacy, 1=armed)
-    //   [61..64] = free
+    //   [61]     = dead-share floor flags (R-1; bit0 senior, bit1 junior; 0=legacy)
+    //   [62..64] = free
     // ════════════════════════════════════════════════════════════
 
     /// Whether the market has been resolved (blocks new deposits).
@@ -686,6 +692,93 @@ impl StakePool {
         self.cooldown_proposed_at_slot = val;
     }
 
+    // ════════════════════════════════════════════════════════════
+    // R-1 (security review of b83ddf9, 2026-10-09): per-sub-pool dead-share floors.
+    //
+    // Since NEW-1 each sub-pool (senior, junior) locks its own MINIMUM_LIQUIDITY dead
+    // shares on its first deposit, so a tranche pool can carry 0, 1 or 2 floors and
+    // `total_lp_supply > MINIMUM_LIQUIDITY` no longer means "a real LP exists". The
+    // floors are recorded exactly, at lock time, in `_reserved[61]`:
+    //   bit0 (FLOOR_SENIOR) = senior supply (total - junior) holds MINIMUM_LIQUIDITY dead
+    //   bit1 (FLOOR_JUNIOR) = junior_total_lp holds MINIMUM_LIQUIDITY dead
+    // A non-tranche genesis sets FLOOR_SENIOR (that floor is the senior supply once
+    // tranches are turned on). `0` with `total_lp_supply > 0` is a LEGACY pool (created
+    // before this byte existed): it holds exactly one genesis floor in an unknown
+    // sub-pool and keeps the pre-fix semantics (see `dead_lp`).
+    // ════════════════════════════════════════════════════════════
+
+    /// Raw R-1 floor flags (`_reserved[61]`).
+    pub fn floor_flags(&self) -> u8 {
+        self._reserved[61]
+    }
+
+    /// Record that the `junior` (or senior) sub-pool just locked its dead-share floor.
+    /// Call exactly when `apply_minimum_liquidity_lock` locked (sub-pool supply was 0),
+    /// BEFORE this deposit's supply increments. For a legacy pool (flags 0, supply > 0)
+    /// the pre-fix code locked exactly one floor at pool genesis, and it cannot be in the
+    /// sub-pool being locked now (that sub-pool's supply is 0 and dead shares are never
+    /// burned), so it is recorded in the OTHER sub-pool — after which the pool is exact.
+    pub fn record_floor_lock(&mut self, junior: bool) {
+        let mut f = self._reserved[61];
+        let (mine, other) = if junior {
+            (FLOOR_JUNIOR, FLOOR_SENIOR)
+        } else {
+            (FLOOR_SENIOR, FLOOR_JUNIOR)
+        };
+        if f == 0 && self.total_lp_supply > 0 {
+            f |= other;
+        }
+        f |= mine;
+        self._reserved[61] = f;
+    }
+
+    /// Dead (never-minted, never-burnable) LP in each sub-pool: `Some((senior, junior))`,
+    /// each `0` or `MINIMUM_LIQUIDITY`. `None` for a legacy pool (flags 0): one floor of
+    /// `MINIMUM_LIQUIDITY` somewhere in `total_lp_supply` (or none if it is empty).
+    pub fn dead_lp(&self) -> Option<(u64, u64)> {
+        let f = self._reserved[61];
+        if f == 0 {
+            return None;
+        }
+        let d = |bit: u8| if f & bit != 0 { MINIMUM_LIQUIDITY } else { 0 };
+        Some((d(FLOOR_SENIOR), d(FLOOR_JUNIOR)))
+    }
+
+    /// Real (SPL-minted, redeemable) senior LP: `senior_total_lp() - senior_dead`.
+    /// Legacy pools: `senior_total_lp()` (pre-fix routing never excluded senior).
+    pub fn real_senior_lp(&self) -> u64 {
+        match self.dead_lp() {
+            Some((sd, _)) => self.senior_total_lp().saturating_sub(sd),
+            None => self.senior_total_lp(),
+        }
+    }
+
+    /// Real junior LP: `junior_total_lp() - junior_dead`. Legacy pools:
+    /// `junior_total_lp()` (pre-fix routing: any junior supply takes a fee share).
+    pub fn real_junior_lp(&self) -> u64 {
+        match self.dead_lp() {
+            Some((_, jd)) => self.junior_total_lp().saturating_sub(jd),
+            None => self.junior_total_lp(),
+        }
+    }
+
+    /// Real LP across the whole pool: `total_lp_supply - senior_dead - junior_dead`.
+    /// Legacy pools: `total_lp_supply - MINIMUM_LIQUIDITY` (saturating), i.e. exactly the
+    /// pre-fix F3 rule. Non-tranche pools: `total_lp_supply - MINIMUM_LIQUIDITY` too
+    /// (their single genesis floor is FLOOR_SENIOR), so they are unchanged.
+    pub fn real_lp_supply(&self) -> u64 {
+        match self.dead_lp() {
+            Some((sd, jd)) => self.total_lp_supply.saturating_sub(sd).saturating_sub(jd),
+            None => self.total_lp_supply.saturating_sub(MINIMUM_LIQUIDITY),
+        }
+    }
+
+    /// F3 / R-1: the pool has at least one real LP share (`real_lp_supply() > 0`). The
+    /// ONE gate for AccrueFees, the deposit/withdraw pre-accrue and F-9 recovery.
+    pub fn has_real_lp_holders(&self) -> bool {
+        self.real_lp_supply() > 0
+    }
+
     /// Loss-adjusted junior tranche balance.
     ///
     /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
@@ -785,7 +878,12 @@ impl StakePool {
         // senior_balance() derives from total_pool_value() which includes
         // total_fees_earned, so reading it post-increment would inflate the senior
         // weight in distribute_fees and systematically shortchange the junior tranche.
-        let distribute_to_junior = self.tranche_enabled() && self.junior_total_lp() > 0;
+        // R-1: route by REAL holders. A junior sub-pool holding only its dead floor takes
+        // no share (it used to whenever junior_total_lp() > 0, which since NEW-1 is
+        // forever once a junior existed); a senior sub-pool holding only its dead floor
+        // takes none either, so the whole fee goes to the junior tranche.
+        let distribute_to_junior = self.tranche_enabled() && self.real_junior_lp() > 0;
+        let junior_takes_all = distribute_to_junior && self.real_senior_lp() == 0;
         let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
             (
                 self.junior_balance(),
@@ -805,12 +903,17 @@ impl StakePool {
         // senior_balance = total_pool_value() - junior_balance and total_fees_earned
         // was already incremented by the full fee_delta above.
         if distribute_to_junior {
-            let (junior_fee, _) = crate::math::distribute_fees(
-                snapshot_junior_bal,
-                snapshot_senior_bal,
-                self.junior_fee_mult_bps(),
-                fee_delta,
-            );
+            let junior_fee = if junior_takes_all {
+                fee_delta
+            } else {
+                crate::math::distribute_fees(
+                    snapshot_junior_bal,
+                    snapshot_senior_bal,
+                    self.junior_fee_mult_bps(),
+                    fee_delta,
+                )
+                .0
+            };
             self.set_junior_balance(
                 self.junior_balance()
                     .checked_add(junior_fee)
@@ -866,7 +969,7 @@ impl StakePool {
         let (to_returned, to_fees) = crate::math::terminal_recovery_split(
             surplus,
             self.wrapper_recoverable(),
-            crate::math::has_real_lp_holders(self.total_lp_supply),
+            self.has_real_lp_holders(),
         );
         if to_returned > 0 {
             self.total_returned = self
@@ -1415,6 +1518,64 @@ mod tests {
         // Empty / sub-header.
         assert_eq!(read_wrapper_terminal(&[]), UnknownLayout);
         assert_eq!(read_wrapper_terminal(&[0u8; 15]), UnknownLayout);
+    }
+
+    /// R-1 helper semantics, every pool history.
+    #[test]
+    fn r1_real_lp_helpers() {
+        let m = MINIMUM_LIQUIDITY;
+        let mut p = StakePool::zeroed();
+        // Empty fresh pool.
+        assert_eq!(
+            (p.dead_lp(), p.real_lp_supply(), p.has_real_lp_holders()),
+            (None, 0, false)
+        );
+
+        // Non-tranche genesis 5_000 (lock recorded before the supply increment).
+        p.record_floor_lock(false);
+        p.total_lp_supply = 5_000;
+        assert_eq!(p.dead_lp(), Some((m, 0)));
+        assert_eq!(p.real_lp_supply(), 5_000 - m);
+        p.total_lp_supply = m; // everyone out
+        assert!(!p.has_real_lp_holders());
+
+        // Tranches on later; first junior locks its own floor.
+        p.set_tranche_enabled(true);
+        p.record_floor_lock(true);
+        p.total_lp_supply = m + 3_000;
+        p.set_junior_total_lp(3_000);
+        assert_eq!(p.dead_lp(), Some((m, m)));
+        assert_eq!(
+            (p.real_senior_lp(), p.real_junior_lp(), p.real_lp_supply()),
+            (0, 2_000, 2_000)
+        );
+        p.total_lp_supply = 2 * m;
+        p.set_junior_total_lp(m);
+        assert!(!p.has_real_lp_holders(), "two floors, no real holder");
+
+        // Legacy pool (flags 0, one pre-fix floor): pre-fix F3 rule and routing.
+        let mut l = StakePool::zeroed();
+        l.set_tranche_enabled(true);
+        l.total_lp_supply = 1_500;
+        l.set_junior_total_lp(500);
+        assert_eq!(l.dead_lp(), None);
+        assert_eq!(
+            (l.real_lp_supply(), l.real_junior_lp(), l.real_senior_lp()),
+            (500, 500, 1_000)
+        );
+        // Legacy senior-genesis pool whose junior emptied: the next junior lock also
+        // records the legacy floor on the senior side, after which it is exact.
+        l.set_junior_total_lp(0);
+        l.total_lp_supply = 1_000;
+        l.record_floor_lock(true);
+        assert_eq!(l.dead_lp(), Some((m, m)));
+        // Legacy junior-genesis pool whose senior is empty: senior lock records junior's.
+        let mut k = StakePool::zeroed();
+        k.set_tranche_enabled(true);
+        k.total_lp_supply = 4_000;
+        k.set_junior_total_lp(4_000);
+        k.record_floor_lock(false);
+        assert_eq!(k.dead_lp(), Some((m, m)));
     }
 
     fn f9_pool(deposited: u64, flushed: u64, lp: u64) -> StakePool {

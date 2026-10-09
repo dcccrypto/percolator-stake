@@ -798,6 +798,7 @@ fn process_init_pool(
     pool.total_fees_earned = 0;
     pool.last_fee_accrual_slot = 0;
     pool.mode0_fees_attributed = 0;
+    pool._reserved[61] = 0; // R-1 floor flags: no floor locked yet (explicit, as above)
     pool.pool_mode = 0; // InitTradingPool overrides to 1 after this call
     pool.pending_admin = [0u8; 32];
     pool.set_discriminator();
@@ -1205,6 +1206,9 @@ fn process_deposit(
         pool.total_lp_supply
     };
     let mint_amount = apply_minimum_liquidity_lock(supply_before, lp_to_mint)?;
+    if supply_before == 0 {
+        pool.record_floor_lock(false); // R-1: senior (or non-tranche genesis) floor
+    }
 
     // Transfer collateral: user ATA → stake vault
     invoke(
@@ -2828,11 +2832,7 @@ fn accrue_fees_inner(
     // belong to nobody who staked for them. Consume them from the attribution cursor instead of
     // leaving them for the FIRST staker to book (they stay as unbooked vault surplus, which the
     // terminal recovery books to whoever holds LP then).
-    if fee_delta > 0
-        && pool.pool_mode == 0
-        && pool.is_first_loss()
-        && !crate::math::has_real_lp_holders(pool.total_lp_supply)
-    {
+    if fee_delta > 0 && pool.pool_mode == 0 && pool.is_first_loss() && !pool.has_real_lp_holders() {
         pool.mode0_fees_attributed = pool
             .mode0_fees_attributed
             .checked_add(fee_delta)
@@ -2840,7 +2840,7 @@ fn accrue_fees_inner(
         msg!("AccrueFees: {} pre-stake fee backlog consumed unbooked (S2)", fee_delta);
         return Ok(());
     }
-    if fee_delta > 0 && crate::math::has_real_lp_holders(pool.total_lp_supply) {
+    if fee_delta > 0 && pool.has_real_lp_holders() {
         if pool.pool_mode == 0 {
             pool.mode0_fees_attributed = pool
                 .mode0_fees_attributed
@@ -2966,11 +2966,11 @@ fn process_accrue_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     // attribution cursor is not advanced, so they remain bookable once a real staker
     // exists. Mirrors the wrapper LP vault's
     // `total_lp_shares_outstanding <= LP_VAULT_MINIMUM_LIQUIDITY` refusal.
-    if !crate::math::has_real_lp_holders(pool.total_lp_supply) {
+    if !pool.has_real_lp_holders() {
         msg!(
-            "AccrueFees: pool has no real LP holders (total_lp_supply={} <= MINIMUM_LIQUIDITY={}); nothing booked (F3)",
+            "AccrueFees: pool has no real LP holders (total_lp_supply={}, dead floors {:?}); nothing booked (F3/R-1)",
             pool.total_lp_supply,
-            state::MINIMUM_LIQUIDITY
+            pool.dead_lp()
         );
         return Err(StakeError::NoRealLpHolders.into());
     }
@@ -3179,13 +3179,16 @@ fn process_admin_set_tranche_config(
     //
     // NOTE: this guard was dropped in the v17 convergence (it post-dated the branch
     // point); restored here to match the audited pre-v17 behavior.
-    if pool.junior_total_lp() > 0 && pool.junior_fee_mult_bps() != junior_fee_mult_bps {
+    // R-1: since NEW-1 the junior supply never returns to 0 (dead floor), so "juniors
+    // exist" means REAL junior LP. A dead-only junior sub-pool takes no fee share
+    // (book_fee_delta), so the multiplier is free again once every real junior is out.
+    if pool.real_junior_lp() > 0 && pool.junior_fee_mult_bps() != junior_fee_mult_bps {
         msg!(
             "AdminSetTrancheConfig: junior_fee_mult_bps is locked while juniors \
-             exist (current={}, requested={}, junior_total_lp={})",
+             exist (current={}, requested={}, real junior LP={})",
             pool.junior_fee_mult_bps(),
             junior_fee_mult_bps,
-            pool.junior_total_lp()
+            pool.real_junior_lp()
         );
         return Err(StakeError::Unauthorized.into());
     }
@@ -3396,6 +3399,9 @@ fn process_deposit_junior(
     // calc_junior_collateral_for_withdraw is then defence in depth only.
     let junior_lp_before = pool.junior_total_lp();
     let mint_amount = apply_minimum_liquidity_lock(junior_lp_before, lp_to_mint)?;
+    if junior_lp_before == 0 {
+        pool.record_floor_lock(true); // R-1: junior floor
+    }
 
     invoke(
         &crate::spl_token::transfer(

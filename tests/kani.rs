@@ -963,7 +963,7 @@ mod kani_proofs {
         };
         let recoverable0 = p.wrapper_recoverable();
         let returned0 = p.total_returned;
-        let real = percolator_stake::math::has_real_lp_holders(p.total_lp_supply);
+        let real = p.has_real_lp_holders(); // R-1: the production gate (legacy flags here == old rule)
         let balance = v0 + released; // vault was fully booked; wrapper paid `released`
         let (r, f) = match p.book_terminal_recovery(balance) {
             Ok(x) => x,
