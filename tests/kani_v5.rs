@@ -555,6 +555,39 @@ fn port_161_recovery_never_windfalls_protected_senior() {
     assert!(senior <= sp);
 }
 
+/// ST-5 (stake fix `9942a2c`, Kani review round 2 B1): `calc_junior_collateral_for_withdraw`
+/// (`src/math.rs`): a FULL-supply junior burn pays exactly the junior balance (never more than the
+/// junior tranche's value, and no N7 residual left behind for senior); a partial burn is unchanged
+/// (the N7 formula `calc_collateral_for_withdraw`) and never exceeds the balance; a burn above the
+/// supply, or at zero supply, is refused. Full-burn and refusal arms at full u64 width; the partial
+/// arm at u16 (it divides). Mutant ST-M4 (the full-burn branch reverted to the N7 formula). Cost M.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn st5_last_junior_full_burn_pays_exactly_ejb() {
+    // full-burn and refusal arms: full width, no division on these paths
+    let supply: u64 = kani::any();
+    let bal: u64 = kani::any();
+    let lp: u64 = kani::any();
+    let r = calc_junior_collateral_for_withdraw(supply, bal, lp);
+    if supply == 0 || lp > supply {
+        assert_eq!(r, None, "over-burn or zero supply refused");
+    } else if lp == supply {
+        assert_eq!(r, Some(bal), "full burn pays exactly the junior balance");
+    }
+    kani::cover!(supply > 0 && lp == supply && bal > supply, "full burn with earned fees (the old N7 residual case)");
+    kani::cover!(supply > 0 && lp > supply && r.is_none(), "over-burn refused");
+    kani::cover!(supply == 0 && r.is_none(), "zero supply refused");
+    // partial arm: u16 operands
+    let ps = u16v();
+    let pb = u16v();
+    let pl = u16v();
+    kani::assume(ps > 0 && pl > 0 && pl < ps);
+    let part = calc_junior_collateral_for_withdraw(ps, pb, pl);
+    assert_eq!(part, calc_collateral_for_withdraw(ps, pb, pl), "partial burns keep the N7 formula");
+    assert!(part.map_or(true, |v| v <= pb), "never more than the junior balance");
+    kani::cover!(part.is_some_and(|v| v > 0), "partial burn pays");
+}
+
 // ── flush accounting on StakePool::total_pool_value (rev 2.1) ───────────────────────────────
 
 /// Port of `proof_flush_preserves_value` onto `StakePool::total_pool_value`: a flush of `x`
