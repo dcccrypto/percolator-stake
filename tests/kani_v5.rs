@@ -509,7 +509,9 @@ fn port_169_mode1_no_false_underflow_brick() {
 }
 
 /// Port of `proof_161_recovery_never_windfalls_protected_senior`: model-level (the #161 exit
-/// booking is modelled). Senior `sp` and junior `jb0` deposit; `nl` is flushed; the LAST junior
+/// booking is modelled); DEFENCE IN DEPTH since NEW-1 (`b83ddf9`): a junior sub-pool now always keeps
+/// 1,000 dead shares, so the full-supply last-junior burn modelled here is unreachable from fresh state
+/// (it remains the function-level guarantee for any state that reaches it). Senior `sp` and junior `jb0` deposit; `nl` is flushed; the LAST junior
 /// redeems its whole junior LP supply `jlp` and is paid the REAL production payout
 /// `calc_junior_collateral_for_withdraw(jlp, effective_junior_balance, jlp)` (as at
 /// `processor.rs` ~1523-1529); then the #161 exit booking (`total_returned += L`,
@@ -555,7 +557,9 @@ fn port_161_recovery_never_windfalls_protected_senior() {
     assert!(senior <= sp);
 }
 
-/// ST-5 (stake fix `9942a2c`, Kani review round 2 B1): `calc_junior_collateral_for_withdraw`
+/// ST-5 (stake fix `9942a2c`, Kani review round 2 B1), DEFENCE IN DEPTH since NEW-1 (`b83ddf9`): the
+/// full-burn branch is unreachable from fresh state (junior supply keeps 1,000 dead shares); this is the
+/// function-level proof of `calc_junior_collateral_for_withdraw`
 /// (`src/math.rs`): a FULL-supply junior burn pays exactly the junior balance (never more than the
 /// junior tranche's value, and no N7 residual left behind for senior); a partial burn is unchanged
 /// (the N7 formula `calc_collateral_for_withdraw`) and never exceeds the balance; a burn above the

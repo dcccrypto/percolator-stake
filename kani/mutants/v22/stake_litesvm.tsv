@@ -1,0 +1,4 @@
+id	file	line	original	replacement	target	expected_kill
+# LiteSVM (NOT Kani) rows: build the devnet .so with the mutant applied (kani/v22-run/mutant.py apply in a dedicated worktree), run cargo test --test <file> <test>; KILLED = the test fails. The processor KEY choice is not reachable by a Kani harness (AccountInfo-level).
+LS-NEW1a	src/processor.rs	3397	let junior_lp_before = pool.junior_total_lp();	let junior_lp_before = pool.total_lp_supply;	litesvm:poc_last_junior_residual::new1_first_junior_deposit_locks_dead_junior_shares	the first junior deposit after a senior genesis mints its whole supply (no dead junior shares)
+LS-NEW1b	src/processor.rs	1203	pool.senior_total_lp()	pool.total_lp_supply	litesvm:poc_last_junior_residual::new1_first_senior_after_junior_genesis_locks_dead_senior_shares	the first senior deposit after a junior genesis locks no dead senior shares
