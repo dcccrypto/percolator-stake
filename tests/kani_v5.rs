@@ -508,29 +508,40 @@ fn port_169_mode1_no_false_underflow_brick() {
     }
 }
 
-/// Port of `proof_161_recovery_never_windfalls_protected_senior` on the real pool: senior `sp`
-/// and junior `jb0` deposit; `nl` is flushed; the LAST junior exits (the #161 booking:
-/// `total_returned += L`, `realized_junior_loss += L`, junior balance 0); a later
-/// ReturnInsurance of `r <= flushed - returned` lands. Then `senior_balance() <= sp`.
-/// The exit booking and the return are the harness's model of the processor transitions.
-/// u16. Cost M.
+/// Port of `proof_161_recovery_never_windfalls_protected_senior`: model-level (the #161 exit
+/// booking is modelled). Senior `sp` and junior `jb0` deposit; `nl` is flushed; the LAST junior
+/// redeems its whole junior LP supply `jlp` and is paid the REAL production payout
+/// `calc_junior_collateral_for_withdraw(jlp, effective_junior_balance, jlp)` (as at
+/// `processor.rs` ~1523-1529); then the #161 exit booking (`total_returned += L`,
+/// `realized_junior_loss += L`, junior balance 0, `processor.rs` ~1683-1726) and a later
+/// ReturnInsurance of `r <= flushed - returned` (`processor.rs` ~3612) are applied BY THE
+/// HARNESS, not by the processor. Then `senior_balance() <= sp`. A payout of `None` is the
+/// processor's Overflow refusal (no state change), so that path is out of scope. u16. Cost M.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn port_161_recovery_never_windfalls_protected_senior() {
-    let (sp, jb0, nl) = (u16v(), u16v(), u16v());
+    let (sp, jb0, nl, jlp) = (u16v(), u16v(), u16v(), u16v());
     let deposited = sp + jb0;
     kani::assume(nl <= deposited);
+    kani::assume(jlp > 0);
     // junior-first loss on the gross balances (what effective_junior_balance computes)
     let mut p = pool(deposited, 0, nl, 0);
     p.set_tranche_enabled(true);
     p.set_junior_balance(jb0);
+    p.set_junior_total_lp(jlp);
     let ejb = p.effective_junior_balance();
     let l = jb0 - ejb; // absorbed loss
-    // last junior exit at its marked-down value
-    p.total_withdrawn = ejb;
+    // last junior exit: the production payout for redeeming the whole junior LP supply
+    let payout = match calc_junior_collateral_for_withdraw(jlp, ejb, jlp) {
+        Some(v) => v,
+        None => return, // processor: Err(Overflow), nothing booked
+    };
+    p.total_withdrawn = payout;
+    // #161 exit booking (modelled)
     p.total_returned = l;
     p.set_realized_junior_loss(l);
     p.set_junior_balance(0);
+    p.set_junior_total_lp(0);
     // later ReturnInsurance, capped by the outstanding shortfall (processor.rs:3612)
     let r = u16v();
     kani::assume(r <= p.total_flushed.saturating_sub(p.total_returned));
@@ -655,6 +666,6 @@ fn port_flush_conservation_lp_value() {
             assert!(b >= a);
             assert!(b - a <= x);
         }
-        _ => kani::cover!(true, "overflow path (unreachable at u8)"),
+        _ => unreachable!("u8 operands cannot overflow calc_collateral_for_withdraw"),
     }
 }
