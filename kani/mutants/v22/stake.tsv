@@ -1,0 +1,4 @@
+id	file	line	original	replacement	target_harness	expected_kill
+ST-M1	src/math.rs	632	let spare = liquid.saturating_sub(buffer);	let spare = liquid;	tests/kani_v5.rs::st1_sync_plan_bounded_by_target_and_buffer	assert "never below the liquid buffer" fails
+ST-M2	src/math.rs	567	(a as u128).checked_mul(units_total).map(|p| p / insurance_mint)	(a as u128).checked_mul(units_total).map(|p| p.div_ceil(insurance_mint))	kani/v5-units::proofs::st3_topup_units_match_wrapper	assert_eq stake == ins_units_for_topup fails (pro-rata arm, inexact division)
+ST-M3	src/math.rs	578	Some(p.div_ceil(insurance_free))	Some(p / insurance_free)	kani/v5-units::proofs::st3_recover_burn_matches_wrapper	assert_eq stake == ins_units_to_burn fails (inexact-division cover state)
