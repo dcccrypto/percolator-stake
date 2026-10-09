@@ -207,14 +207,33 @@ pub fn calc_senior_lp_for_deposit(
 /// Junior withdrawals are valued against the junior sub-pool only.
 /// If junior_balance has been reduced by losses, junior LPs take the hit.
 ///
+/// Last-junior exit (v2.2 Kani review, "N7 residual"): a burn of the WHOLE junior
+/// supply (`lp_amount == junior_total_lp`) returns the whole `junior_balance`.
+/// The N7 virtual-offset formula `lp * (bal + 1) / (supply + 1)` pays only
+/// `bal - (bal - supply) / (supply + 1)` on a full burn whenever `bal > supply`
+/// (i.e. once the junior tranche has earned fees), and `process_withdraw` then
+/// zeroes `junior_balance`, so the unpaid remainder (up to one junior share price;
+/// 500 of 1000 at `supply == 1`) used to fall into `senior_balance()` as a
+/// windfall. Paying `junior_balance` exactly can never exceed the junior tranche's
+/// own value, and leaves senior's value unchanged. Partial burns keep the N7
+/// formula; the junior sub-pool has no dead-share floor of its own unless the pool's
+/// genesis deposit was junior (then the dead shares sit in `junior_total_lp`, which
+/// therefore never reaches a full burn).
+///
 /// # Returns
-/// * `Some(collateral)` to return (rounds down)
-/// * `None` on overflow
+/// * `Some(collateral)` to return (rounds down; exact `junior_balance` on a full burn)
+/// * `None` on overflow, zero supply, or `lp_amount > junior_total_lp`
 pub fn calc_junior_collateral_for_withdraw(
     junior_total_lp: u64,
     junior_balance: u64,
     lp_amount: u64,
 ) -> Option<u64> {
+    if junior_total_lp == 0 || lp_amount > junior_total_lp {
+        return None;
+    }
+    if lp_amount == junior_total_lp {
+        return Some(junior_balance);
+    }
     calc_collateral_for_withdraw(junior_total_lp, junior_balance, lp_amount)
 }
 
@@ -1045,6 +1064,113 @@ mod tests {
         assert_eq!(
             calc_junior_collateral_for_withdraw(1000, 2000, 500),
             Some(999)
+        );
+    }
+
+    #[test]
+    fn test_last_junior_full_burn_pays_whole_balance() {
+        // The Kani port_161 counterexample: ejb 1000, jlp 1. N7 formula pays 500.
+        assert_eq!(calc_collateral_for_withdraw(1, 1000, 1), Some(500));
+        assert_eq!(calc_junior_collateral_for_withdraw(1, 1000, 1), Some(1000));
+        // Partial burns are unchanged.
+        assert_eq!(
+            calc_junior_collateral_for_withdraw(2, 1000, 1),
+            calc_collateral_for_withdraw(2, 1000, 1)
+        );
+        // Over-burn and zero supply refuse.
+        assert_eq!(calc_junior_collateral_for_withdraw(1, 1000, 2), None);
+        assert_eq!(calc_junior_collateral_for_withdraw(0, 0, 0), None);
+    }
+
+    /// Exhaustive on a small grid: the full-burn payout is exactly the balance, the
+    /// extra over the N7 formula is under one junior share price `ceil((bal+1)/(supply+1))`,
+    /// and every partial burn is still bounded by the formula (never above the balance).
+    #[test]
+    fn test_last_junior_extra_bounded_by_one_share_price() {
+        for supply in 1u64..=64 {
+            for bal in 0u64..=2_048 {
+                let full = calc_junior_collateral_for_withdraw(supply, bal, supply).unwrap();
+                assert_eq!(full, bal);
+                let n7 = calc_collateral_for_withdraw(supply, bal, supply).unwrap();
+                assert!(n7 <= bal);
+                let price = (bal + 1).div_ceil(supply + 1);
+                assert!(full - n7 <= price, "extra {} > price {price}", full - n7);
+                for lp in 1..supply {
+                    let part = calc_junior_collateral_for_withdraw(supply, bal, lp).unwrap();
+                    assert_eq!(part, calc_collateral_for_withdraw(supply, bal, lp).unwrap());
+                    assert!(part <= bal);
+                }
+            }
+        }
+    }
+
+    /// Native replay of stake `tests/kani_v5.rs::port_161_recovery_never_windfalls_protected_senior`
+    /// (kani/v22-final a126448) on the fixed payout, over a dense grid. Pre-fix this fails
+    /// at `sp=0, jb0=1000, nl=0, jlp=1` (senior 500 > 0; the reviewed instance is
+    /// `sp=1000` -> senior 1500).
+    #[test]
+    fn test_port_161_native_replay_with_fixed_payout() {
+        use crate::state::StakePool;
+        use bytemuck::Zeroable;
+        let vals = [0u64, 1, 2, 3, 7, 100, 999, 1_000, 1_001, 4_095];
+        let mut checked = 0u64;
+        for &sp in &vals {
+            for &jb0 in &vals {
+                for &nl in &vals {
+                    for &jlp in &[1u64, 2, 3, 10, 1_000, 5_000] {
+                        let deposited = sp + jb0;
+                        if nl > deposited {
+                            continue;
+                        }
+                        let mut p = StakePool::zeroed();
+                        p.total_deposited = deposited;
+                        p.total_flushed = nl;
+                        p.set_tranche_enabled(true);
+                        p.set_junior_balance(jb0);
+                        p.set_junior_total_lp(jlp);
+                        let ejb = p.effective_junior_balance();
+                        let l = jb0 - ejb;
+                        let payout = calc_junior_collateral_for_withdraw(jlp, ejb, jlp).unwrap();
+                        p.total_withdrawn = payout;
+                        p.total_returned = l;
+                        p.set_realized_junior_loss(l);
+                        p.set_junior_balance(0);
+                        p.set_junior_total_lp(0);
+                        let max_r = p.total_flushed.saturating_sub(p.total_returned);
+                        for r in [0, max_r / 2, max_r] {
+                            let mut q = p;
+                            q.total_returned += r;
+                            if let Some(senior) = q.senior_balance() {
+                                assert!(
+                                    senior <= sp,
+                                    "windfall: sp={sp} jb0={jb0} nl={nl} jlp={jlp} r={r} s={senior}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 1_000,
+            "replay must actually check states ({checked})"
+        );
+        // The reviewed counterexample itself: jb0=1000, nl=0, jlp=1, sp=1000.
+        let mut p = StakePool::zeroed();
+        p.total_deposited = 2_000;
+        p.set_tranche_enabled(true);
+        p.set_junior_balance(1_000);
+        p.set_junior_total_lp(1);
+        let payout =
+            calc_junior_collateral_for_withdraw(1, p.effective_junior_balance(), 1).unwrap();
+        p.total_withdrawn = payout;
+        p.set_junior_balance(0);
+        p.set_junior_total_lp(0);
+        assert_eq!(
+            p.senior_balance(),
+            Some(1_000),
+            "senior == sp, no 1500 windfall"
         );
     }
 

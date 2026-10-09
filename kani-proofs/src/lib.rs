@@ -160,7 +160,12 @@ pub fn calc_subpool_lp_for_deposit(sub_lp: u32, sub_balance: u32, deposit: u32) 
     calc_lp_for_deposit(sub_lp, sub_balance, deposit)
 }
 
-/// Mirror of calc_senior/junior_collateral_for_withdraw (delegate to global).
+/// Mirror of calc_senior_collateral_for_withdraw (delegates to global), and of
+/// calc_junior_collateral_for_withdraw for PARTIAL burns only. Since the last-junior
+/// residual fix, a junior burn of the whole junior supply returns the whole junior
+/// balance instead (see `percolator_stake::math::calc_junior_collateral_for_withdraw`);
+/// the one proof using this mirror burns `lp` of `sub_lp + lp`, a partial burn whenever
+/// `sub_lp > 0`, and the full-burn case (`sub_lp == 0`) pays at most the deposit either way.
 pub fn calc_subpool_collateral_for_withdraw(sub_lp: u32, sub_balance: u32, lp: u32) -> Option<u32> {
     calc_collateral_for_withdraw(sub_lp, sub_balance, lp)
 }
