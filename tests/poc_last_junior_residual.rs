@@ -13,6 +13,15 @@
 //! pays the whole effective junior balance. It never pays more than `ejb`, and `ejb` is
 //! the junior tranche's own value, so senior's value is unchanged by the exit.
 //!
+//! NEW-1 (security review of 9942a2c): with a SENIOR genesis the junior sub-pool had no
+//! dead-share floor, so a 1-LP first junior could inflate the junior share price and take
+//! a later junior's round-down. The first deposit into an empty junior sub-pool now locks
+//! `MINIMUM_LIQUIDITY` dead junior shares (and, mirrored, the first deposit into an empty
+//! senior sub-pool after a junior genesis locks senior ones). The junior supply then never
+//! reaches 0, so the full-burn branch above is defence in depth; the original
+//! `ejb = 1000, jlp = 1` state is unreachable and the tests below show the last REAL
+//! junior exit still never windfalls senior.
+//!
 //! Drives the real `percolator_stake.so` (+ the real wrapper `.so` for `InitMarket`)
 //! through LiteSVM. Pool is a mode-1 (`InitTradingPool`) tranche pool, the mode in which
 //! a vault surplus books as fees (mode 0 books only wrapper tag-87 payouts, #290); the
@@ -28,11 +37,11 @@ use percolator_stake::state::{
 };
 use solana_sdk::{
     account::Account,
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
     pubkey::Pubkey,
     signer::{keypair::Keypair, Signer},
     system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -427,6 +436,10 @@ struct World {
 
 /// Real InitMarket -> real InitTradingPool (mode 1) -> real AdminSetTrancheConfig.
 fn world() -> World {
+    world_mult(JUNIOR_MULT_BPS)
+}
+
+fn world_mult(junior_mult_bps: u16) -> World {
     assert!(
         stake_so().exists(),
         "missing {} — run `cargo build-sbf` first. Without this the suite would report \
@@ -482,7 +495,7 @@ fn world() -> World {
         &mut svm,
         &payer,
         &[&admin],
-        set_tranche_config_ix(&c, &admin.pubkey(), JUNIOR_MULT_BPS),
+        set_tranche_config_ix(&c, &admin.pubkey(), junior_mult_bps),
     )
     .expect("AdminSetTrancheConfig");
     svm.expire_blockhash();
@@ -563,18 +576,23 @@ fn assert_vault_matches_books(w: &World) {
     );
 }
 
-/// Builds: senior genesis 2,000 -> junior deposits 1 atom (junior LP = 1) -> fees booked
-/// until the junior tranche holds ~1,000 (the Kani counterexample's `jb0 = 1000, jlp = 1`).
-/// Returns (world, junior user).
-fn one_lp_junior_worth_1000(fee: u64) -> (World, User) {
+/// Builds: senior genesis 2,000 -> first junior deposits `MINIMUM_LIQUIDITY + 1` (1 real
+/// junior LP; since NEW-1 the other 1,000 are dead junior shares) -> a real donation +
+/// AccrueFees books fee income to both tranches. Returns (world, junior user).
+fn one_real_lp_junior_with_fees(fee: u64) -> (World, User) {
     let mut w = world();
     let sen = new_user(&mut w, SENIOR_GENESIS);
     deposit_senior(&mut w, &sen, SENIOR_GENESIS);
-    let jun = new_user(&mut w, 1);
-    deposit_junior(&mut w, &jun, 1);
+    let first = percolator_stake::state::MINIMUM_LIQUIDITY + 1;
+    let jun = new_user(&mut w, first);
+    deposit_junior(&mut w, &jun, first);
     let p = pool(&w);
-    assert_eq!(p.junior_total_lp(), 1, "junior LP supply is one share");
-    assert_eq!(p.junior_balance(), 1);
+    assert_eq!(
+        p.junior_total_lp(),
+        first,
+        "junior supply counts the dead shares"
+    );
+    assert_eq!(token_amount(&w.svm, &jun.lp_ata), 1, "one real junior LP");
 
     let donor = new_user(&mut w, fee);
     donate_and_accrue(&mut w, &donor, fee);
@@ -584,145 +602,302 @@ fn one_lp_junior_worth_1000(fee: u64) -> (World, User) {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-/// The repro. Junior weight 1 * 20_000 vs senior 2_000 * 10_000 = 1/1001 of each fee, so a
-/// 999,999 fee books 999 to junior: `ejb = 1000`, `jlp = 1`. Burning the single junior LP
-/// must pay all 1,000 and leave senior exactly where it was. Pre-fix: pays
-/// `1 * (1000 + 1) / (1 + 1) = 500`, and senior_balance jumps by 500.
+/// The original repro (9942a2c) reached `ejb = 1000, jlp = 1` with a 1-atom first junior
+/// and showed the last junior paid 500 with senior +500. Since the NEW-1 junior dead-share
+/// floor that state is unreachable: junior supply never drops below MINIMUM_LIQUIDITY, so
+/// the last REAL junior's burn is a partial burn priced by the N7 formula, and its rounding
+/// remainder stays in the junior tranche (held by the dead shares). Senior never gains.
 #[test]
-fn last_junior_exit_pays_the_whole_junior_balance() {
-    let (mut w, jun) = one_lp_junior_worth_1000(999_999);
+fn last_real_junior_exit_never_windfalls_senior() {
+    let (mut w, jun) = one_real_lp_junior_with_fees(9_991_000);
     let p = pool(&w);
-    let ejb = p.effective_junior_balance();
-    let jlp = p.junior_total_lp();
-    assert_eq!(
-        (ejb, jlp),
-        (1_000, 1),
-        "the Kani counterexample state, reached for real"
-    );
+    let (ejb, jlp) = (p.effective_junior_balance(), p.junior_total_lp());
+    assert!(ejb > jlp, "junior earned fees (ejb {ejb} > jlp {jlp})");
     let senior_before = p.senior_balance().unwrap();
-    let pre_fix_payout =
-        percolator_stake::math::calc_collateral_for_withdraw(jlp, ejb, jlp).unwrap();
-    assert_eq!(pre_fix_payout, 500, "the plain N7 formula on a full burn");
+    let expect = percolator_stake::math::calc_collateral_for_withdraw(jlp, ejb, 1).unwrap();
 
     let paid = withdraw_all(&mut w, &jun);
     let p = pool(&w);
-    let senior_after = p.senior_balance().unwrap();
     println!(
-        "last junior: ejb={ejb} jlp={jlp} paid={paid} (N7 formula {pre_fix_payout}); \
-         senior {senior_before} -> {senior_after}"
+        "last real junior: ejb={ejb} jlp={jlp} paid={paid}; junior left {} on {} dead shares; \
+         senior {senior_before} -> {}",
+        p.junior_balance(),
+        p.junior_total_lp(),
+        p.senior_balance().unwrap()
     );
+    assert_eq!(paid, expect, "a partial burn: N7 formula");
     assert_eq!(
-        paid, ejb,
-        "last junior must receive the whole effective junior balance"
+        p.junior_total_lp(),
+        percolator_stake::state::MINIMUM_LIQUIDITY
     );
+    assert_eq!(p.junior_balance(), ejb - paid, "remainder stays junior");
     assert_eq!(
-        senior_after, senior_before,
-        "senior must not gain the junior's residual"
+        p.senior_balance().unwrap(),
+        senior_before,
+        "senior gains nothing"
     );
-    assert_eq!(p.junior_total_lp(), 0);
-    assert_eq!(p.junior_balance(), 0);
     assert_vault_matches_books(&w);
 }
 
-/// Non-last junior exits are untouched: with two juniors, the first to leave is still
-/// priced by the N7 formula (it does NOT burn the whole junior supply), and only the
-/// last one picks up the rounding remainder — which is junior money either way.
-/// Across both exits the junior tranche pays out exactly its value and senior is flat.
+/// Two real juniors exit; every payout is the N7 formula, the junior tranche keeps the
+/// remainder on its dead shares, and senior is flat across both exits.
 #[test]
-fn only_the_full_supply_burn_changes() {
-    let (mut w, a) = one_lp_junior_worth_1000(999_999);
-    // B buys in at the junior price (~1000/LP): 2_500 * 2 / 1_001 = 4 LP (rounds down).
-    let b = new_user(&mut w, 2_500);
-    deposit_junior(&mut w, &b, 2_500);
+fn junior_exits_conserve_junior_value_and_leave_senior_flat() {
+    let (mut w, a) = one_real_lp_junior_with_fees(9_991_000);
+    let b = new_user(&mut w, 25_000);
+    deposit_junior(&mut w, &b, 25_000); // ~5,000/LP -> 5 LP
     let p = pool(&w);
     let (jlp, ejb) = (p.junior_total_lp(), p.effective_junior_balance());
     let b_lp = token_amount(&w.svm, &b.lp_ata);
-    assert_eq!(jlp, 1 + b_lp);
     let senior_before = p.senior_balance().unwrap();
 
     let expect_b = percolator_stake::math::calc_collateral_for_withdraw(jlp, ejb, b_lp).unwrap();
     let paid_b = withdraw_all(&mut w, &b);
-    assert_eq!(
-        paid_b, expect_b,
-        "a partial junior burn keeps the N7 formula"
-    );
-    let left = pool(&w).effective_junior_balance();
+    assert_eq!(paid_b, expect_b);
     let paid_a = withdraw_all(&mut w, &a);
+    let p = pool(&w);
     assert_eq!(
-        paid_a, left,
-        "the last junior takes what is left of the junior tranche"
-    );
-    assert_eq!(
-        paid_a + paid_b,
+        paid_a + paid_b + p.junior_balance(),
         ejb,
-        "junior tranche paid out exactly its value"
+        "junior value conserved"
     );
-    assert_eq!(
-        pool(&w).senior_balance().unwrap(),
-        senior_before,
-        "senior flat"
-    );
+    assert_eq!(p.senior_balance().unwrap(), senior_before, "senior flat");
     assert_vault_matches_books(&w);
 }
 
-/// Inflation / donation check. The N7 offsets exist so a donation that pumps a tiny
-/// share's price cannot be recovered for free. Here the attacker A is a 1-LP junior who
-/// pumps the junior price with a donation (booked as fees), victim V buys in, V leaves,
-/// then A leaves LAST and (with the fix) collects the whole junior remainder.
-///
-/// What the fix must NOT allow, asserted below:
-/// - paying any junior more than the junior tranche holds (sum of junior payouts ==
-///   junior value; vault == books);
-/// - touching senior (senior_balance unchanged across both junior exits);
-/// - a profitable attack: A's gain on the junior side is bounded by V's rounding loss,
-///   which is under one junior share price per V operation, while the donation that
-///   created that price is split by `distribute_fees` and ~1000/1001 of it is booked to
-///   senior, unrecoverable by A. A's net is deeply negative.
-#[test]
-fn donation_pumped_one_lp_junior_cannot_profit() {
-    let fee = 999_999;
-    let (mut w, attacker) = one_lp_junior_worth_1000(fee);
-    let price_before_v = {
-        let p = pool(&w);
-        (p.effective_junior_balance() + 1).div_ceil(p.junior_total_lp() + 1)
+// ── NEW-1: junior sub-pool share inflation (security review of 9942a2c) ─────────
+//
+// When a tranche pool's genesis deposit is SENIOR, the N7 MINIMUM_LIQUIDITY lock went to
+// the senior side and the junior sub-pool started with no dead shares. A first junior
+// with 1 LP pumps the junior share price (donation + AccrueFees, mode 1), a victim's
+// junior deposit rounds down by up to one share price, and the attacker collects it.
+// Fix: the first deposit into an EMPTY junior sub-pool locks MINIMUM_LIQUIDITY dead
+// junior shares, exactly as the pool-genesis deposit does.
+
+/// `StakeError::DepositBelowMinimumLiquidity`.
+const ERR_DEPOSIT_BELOW_MIN_LIQUIDITY: u32 = 28;
+
+fn custom_code(err: &litesvm::types::FailedTransactionMetadata) -> Option<u32> {
+    match err.err {
+        TransactionError::InstructionError(_, InstructionError::Custom(c)) => Some(c),
+        _ => None,
+    }
+}
+
+struct AttackOutcome {
+    attacker_net: i128,
+    victim_in: u64,
+    victim_out: u64,
+    /// One junior share price, rounded up, when the victim deposited.
+    price_at_victim: u64,
+    attacker_entry: u64,
+    rounds: u32,
+}
+
+/// The reviewer's attack, on real instructions. `own_senior`: the attacker also funds the
+/// senior genesis `g` (and withdraws it at the end); otherwise `g` is an honest senior.
+/// The attacker enters the junior sub-pool as cheaply as the program allows (1 atom; if
+/// that is refused as below the dead-share floor, `MINIMUM_LIQUIDITY + 1`), donates the
+/// whole pool value each round and cranks AccrueFees until the junior tranche holds
+/// `target`, then a victim deposits `ejb` into the junior tranche, the victim exits, and
+/// the attacker exits.
+fn run_attack(mult: u16, own_senior: bool, g: u64, target: u64) -> AttackOutcome {
+    let mut w = world_mult(mult);
+    let payer = w.payer.insecure_clone();
+    let sen = new_user(&mut w, g);
+    deposit_senior(&mut w, &sen, g);
+
+    let floor = percolator_stake::state::MINIMUM_LIQUIDITY + 1;
+    let att = new_user(&mut w, floor);
+    let ix = deposit_junior_ix(&w.c, &att.kp.pubkey(), att.ata, att.lp_ata, 1);
+    let attacker_entry = match send(&mut w.svm, &payer, &[&att.kp], ix) {
+        Ok(()) => 1,
+        Err(e) => {
+            assert_eq!(
+                custom_code(&e),
+                Some(ERR_DEPOSIT_BELOW_MIN_LIQUIDITY),
+                "a 1-atom first junior deposit is refused only by the dead-share floor"
+            );
+            w.svm.expire_blockhash();
+            deposit_junior(&mut w, &att, floor);
+            floor
+        }
     };
-    let senior_start = pool(&w).senior_balance().unwrap();
+    w.svm.expire_blockhash();
 
-    let v_in = 1_500;
-    let victim = new_user(&mut w, v_in);
-    deposit_junior(&mut w, &victim, v_in);
-    let junior_value = pool(&w).effective_junior_balance();
-    let v_out = withdraw_all(&mut w, &victim);
-    let a_out = withdraw_all(&mut w, &attacker);
-    let p = pool(&w);
-
-    let v_loss = v_in - v_out;
-    let a_cost = 1 + fee; // A's junior deposit + its donation
-    println!(
-        "inflation: price~{price_before_v}/LP; victim in {v_in} out {v_out} (loss {v_loss}); \
-         attacker cost {a_cost} out {a_out}; senior {senior_start} -> {}",
-        p.senior_balance().unwrap()
-    );
-    assert_eq!(
-        a_out + v_out,
-        junior_value,
-        "junior payouts == junior tranche value"
-    );
-    assert_eq!(
-        p.senior_balance().unwrap(),
-        senior_start,
-        "senior untouched"
-    );
-    assert_eq!((p.junior_total_lp(), p.junior_balance()), (0, 0));
+    let donor = new_user(&mut w, 1u64 << 62);
+    let mut donated: u128 = 0;
+    let mut rounds = 0;
+    while pool(&w).effective_junior_balance() < target {
+        let p = pool(&w);
+        let d = p.senior_balance().unwrap() + p.effective_junior_balance();
+        donate_and_accrue(&mut w, &donor, d);
+        donated += d as u128;
+        rounds += 1;
+        assert!(rounds < 80, "pump did not converge");
+    }
     assert_vault_matches_books(&w);
-    // A's junior-side gain over the value booked to its share is exactly V's loss.
-    assert_eq!(a_out, 1_000 + v_loss);
-    assert!(
-        v_loss < 2 * price_before_v,
-        "V loses under one share price per operation"
+
+    let p = pool(&w);
+    let ejb = p.effective_junior_balance();
+    let price_at_victim = (ejb + 1).div_ceil(p.junior_total_lp() + 1);
+    let victim_in = ejb;
+    let victim = new_user(&mut w, victim_in);
+    deposit_junior(&mut w, &victim, victim_in);
+    let victim_out = withdraw_all(&mut w, &victim);
+    let a_out = withdraw_all(&mut w, &att);
+
+    let mut a_in = attacker_entry as i128 + donated as i128;
+    let mut a_got = a_out as i128;
+    if own_senior {
+        a_in += g as i128;
+        a_got += withdraw_all(&mut w, &sen) as i128;
+    }
+    assert_vault_matches_books(&w);
+    AttackOutcome {
+        attacker_net: a_got - a_in,
+        victim_in,
+        victim_out,
+        price_at_victim,
+        attacker_entry,
+        rounds,
+    }
+}
+
+fn assert_attack_fails(o: &AttackOutcome, label: &str) {
+    let victim_loss = o.victim_in.saturating_sub(o.victim_out);
+    println!(
+        "NEW-1 {label}: entry {} rounds {} | attacker net {} | victim in {} out {} (loss {}, \
+         share price {})",
+        o.attacker_entry,
+        o.rounds,
+        o.attacker_net,
+        o.victim_in,
+        o.victim_out,
+        victim_loss,
+        o.price_at_victim
     );
     assert!(
-        a_out < a_cost / 100,
-        "the donation is not recoverable: attacker nets a loss"
+        o.attacker_net < 0,
+        "{label}: the inflation attack must lose money"
     );
+    // Rounding bound: under one share price on the deposit, under one on the withdraw.
+    assert!(
+        victim_loss <= 2 * o.price_at_victim,
+        "{label}: victim loss {victim_loss} > 2 share prices ({})",
+        o.price_at_victim
+    );
+}
+
+/// Reviewer's main setup: 5x junior multiplier, attacker funds the senior side (1e6).
+#[test]
+fn new1_inflation_attacker_funded_senior_loses() {
+    let o = run_attack(50_000, true, 1_000_000, 1_000_000_000);
+    assert_attack_fails(&o, "5x, attacker senior 1e6, target 1e9");
+}
+
+/// Honest small senior (2,000): the case where 9942a2c alone turned a loss into a profit.
+#[test]
+fn new1_inflation_honest_small_senior_loses() {
+    let o = run_attack(50_000, false, 2_000, 1_000_000_000);
+    assert_attack_fails(&o, "5x, honest senior 2000, target 1e9");
+}
+
+/// The junior dead-share floor: a pool with a senior genesis still locks MINIMUM_LIQUIDITY
+/// junior shares on the first junior deposit, they stay in `junior_total_lp` for good,
+/// and so a real burn can never take the junior supply to 0.
+#[test]
+fn new1_first_junior_deposit_locks_dead_junior_shares() {
+    let mut w = world();
+    let sen = new_user(&mut w, SENIOR_GENESIS);
+    deposit_senior(&mut w, &sen, SENIOR_GENESIS);
+    let total_before = pool(&w).total_lp_supply;
+    let senior_lp_before = pool(&w).senior_total_lp();
+
+    let floor = percolator_stake::state::MINIMUM_LIQUIDITY;
+    let small = new_user(&mut w, floor);
+    let payer = w.payer.insecure_clone();
+    let ix = deposit_junior_ix(&w.c, &small.kp.pubkey(), small.ata, small.lp_ata, floor);
+    let err = send(&mut w.svm, &payer, &[&small.kp], ix).expect_err("at the floor");
+    assert_eq!(custom_code(&err), Some(ERR_DEPOSIT_BELOW_MIN_LIQUIDITY));
+    w.svm.expire_blockhash();
+
+    let j = new_user(&mut w, 5_000);
+    deposit_junior(&mut w, &j, 5_000);
+    let p = pool(&w);
+    assert_eq!(
+        p.junior_total_lp(),
+        5_000,
+        "full amount counted in junior supply"
+    );
+    assert_eq!(
+        token_amount(&w.svm, &j.lp_ata),
+        5_000 - floor,
+        "dead shares not minted"
+    );
+    assert_eq!(p.total_lp_supply, total_before + 5_000);
+    assert_eq!(
+        p.senior_total_lp(),
+        senior_lp_before,
+        "senior supply untouched"
+    );
+
+    // A second junior is priced normally (no second lock).
+    let j2 = new_user(&mut w, 3_000);
+    deposit_junior(&mut w, &j2, 3_000);
+    assert_eq!(
+        token_amount(&w.svm, &j2.lp_ata),
+        3_000,
+        "N7 pro-rata at 1:1 (3000 * 5001 / 5001), no extra lock"
+    );
+
+    withdraw_all(&mut w, &j2);
+    withdraw_all(&mut w, &j);
+    let p = pool(&w);
+    assert_eq!(
+        p.junior_total_lp(),
+        floor,
+        "dead junior shares survive every real exit"
+    );
+    assert!(p.junior_balance() > 0, "and keep their (tiny) junior value");
+    assert_vault_matches_books(&w);
+}
+
+/// NEW-1 mirror: junior genesis, then the first SENIOR deposit locks the senior
+/// sub-pool's own dead shares (it used to start 1:1 with none).
+#[test]
+fn new1_first_senior_after_junior_genesis_locks_dead_senior_shares() {
+    let mut w = world();
+    let floor = percolator_stake::state::MINIMUM_LIQUIDITY;
+    let j = new_user(&mut w, 5_000);
+    deposit_junior(&mut w, &j, 5_000);
+    let p = pool(&w);
+    assert_eq!((p.junior_total_lp(), p.senior_total_lp()), (5_000, 0));
+    assert_eq!(
+        token_amount(&w.svm, &j.lp_ata),
+        5_000 - floor,
+        "junior genesis lock"
+    );
+
+    let s = new_user(&mut w, 3_000);
+    deposit_senior(&mut w, &s, 3_000);
+    let p = pool(&w);
+    assert_eq!(
+        p.senior_total_lp(),
+        3_000,
+        "full amount counted in senior supply"
+    );
+    assert_eq!(
+        token_amount(&w.svm, &s.lp_ata),
+        3_000 - floor,
+        "dead senior shares not minted"
+    );
+    assert_eq!(p.junior_total_lp(), 5_000, "junior supply untouched");
+    withdraw_all(&mut w, &s);
+    assert_eq!(
+        pool(&w).senior_total_lp(),
+        floor,
+        "dead senior shares survive the exit"
+    );
+    assert_vault_matches_books(&w);
 }

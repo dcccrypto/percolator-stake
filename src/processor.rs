@@ -1192,8 +1192,19 @@ fn process_deposit(
     // genesis deposit. `lp_to_mint` (full, pre-lock) is what pool.total_lp_supply
     // is incremented by below; `mint_amount` (post-lock) is what actually gets
     // SPL-minted to the depositor.
-    let total_lp_supply_before = pool.total_lp_supply;
-    let mint_amount = apply_minimum_liquidity_lock(total_lp_supply_before, lp_to_mint)?;
+    //
+    // NEW-1 mirror (2026-10-09): on a tranche pool this is a SENIOR deposit into the
+    // senior sub-pool (priced on senior_balance / senior_total_lp), so the floor is keyed
+    // on the senior supply. If the pool's genesis was a junior deposit (whose floor sits
+    // in junior_total_lp), the first senior deposit locks the senior sub-pool's own floor
+    // here instead of starting it at 1:1 with no dead shares. Without tranches
+    // senior_total_lp() == total_lp_supply, so nothing changes for those pools.
+    let supply_before = if pool.tranche_enabled() {
+        pool.senior_total_lp()
+    } else {
+        pool.total_lp_supply
+    };
+    let mint_amount = apply_minimum_liquidity_lock(supply_before, lp_to_mint)?;
 
     // Transfer collateral: user ATA → stake vault
     invoke(
@@ -2539,8 +2550,12 @@ fn process_rotate_insurance_authority(
 // N7: MINIMUM_LIQUIDITY dead-share lock (CONSOLIDATED-PLAN §2.2)
 // ============================================================================
 
-/// Applies the `state::MINIMUM_LIQUIDITY` dead-share lock at the pool's TRUE
-/// genesis deposit. Shared by `process_deposit` (senior/global bootstrap) and
+/// Applies the `state::MINIMUM_LIQUIDITY` dead-share lock at the genesis deposit of
+/// a (sub-)pool: the first deposit into an empty pool, or on a tranche pool the
+/// first deposit into the empty junior (`DepositJunior`, keyed on
+/// `junior_total_lp`) or senior (`Deposit`, keyed on `senior_total_lp`) sub-pool
+/// (NEW-1, 2026-10-09). The first parameter is that (sub-)pool's supply before
+/// this deposit. The original text below describes the whole-pool case. Shared by `process_deposit` (senior/global bootstrap) and
 /// `process_deposit_junior` (junior bootstrap) — both mutate the SAME
 /// `pool.total_lp_supply` counter, so whichever instruction is called FIRST on a
 /// freshly-initialized pool is the genesis deposit, regardless of which entry
@@ -3366,12 +3381,21 @@ fn process_deposit_junior(
         return Err(StakeError::ZeroSharesMinted.into());
     }
 
-    // N7: same MINIMUM_LIQUIDITY dead-share lock as process_deposit, keyed off the
-    // SAME pool.total_lp_supply counter — if a pool's very first-ever deposit
-    // happens to arrive via DepositJunior rather than Deposit, it must be treated
-    // as genesis too (see apply_minimum_liquidity_lock doc comment).
-    let total_lp_supply_before = pool.total_lp_supply;
-    let mint_amount = apply_minimum_liquidity_lock(total_lp_supply_before, lp_to_mint)?;
+    // N7: same MINIMUM_LIQUIDITY dead-share lock as process_deposit, but keyed off the
+    // JUNIOR sub-pool supply (NEW-1, v2.2 security review 2026-10-09). The junior
+    // sub-pool is priced on its own (junior_balance / junior_total_lp), so it needs its
+    // own dead-share floor: keying on pool.total_lp_supply locked the floor only when
+    // the pool's genesis deposit happened to be junior. With a SENIOR genesis the first
+    // junior could hold the whole junior supply as 1 LP, pump the junior share price
+    // (donation + AccrueFees, mode 1) and collect a later junior's round-down. Since
+    // junior_total_lp <= total_lp_supply, junior_total_lp == 0 also covers the
+    // pool-genesis case, so the floor is locked exactly once per pool, in junior supply
+    // (and total supply), never minted. Those dead shares are never burnable (Withdraw
+    // burns only SPL-minted LP), so junior_total_lp can never return to 0 afterwards and
+    // this lock cannot re-arm; the full-burn branch of
+    // calc_junior_collateral_for_withdraw is then defence in depth only.
+    let junior_lp_before = pool.junior_total_lp();
+    let mint_amount = apply_minimum_liquidity_lock(junior_lp_before, lp_to_mint)?;
 
     invoke(
         &crate::spl_token::transfer(
