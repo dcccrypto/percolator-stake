@@ -827,6 +827,10 @@ mod kani_proofs {
         kani::cover!(!armed && a > 0);
     }
 
+    /// SCOPE (R-1, aebbff6): this proves the SINGLE-floor helper `math::has_real_lp_holders`,
+    /// which is exact for NON-TRANCHE and LEGACY pools only. The production gate is now
+    /// `StakePool::has_real_lp_holders()` (per-sub-pool floors); its tranche-aware proof is
+    /// `processor::kani_v22_r1::kani_v22_st7a_real_gate_tranche_aware`.
     /// PROOF (F3, fee-flow audit 2026-09-29): the accrual guard admits a pool iff it
     /// holds at least one REAL LP share above the N7 dead-share floor. Over ALL u64
     /// supplies (the real function, full width): `has_real_lp_holders(s)` is exactly

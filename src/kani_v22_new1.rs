@@ -8,7 +8,8 @@ use crate::math::{
     calc_junior_collateral_for_withdraw, calc_junior_lp_for_deposit, calc_senior_collateral_for_withdraw,
     calc_senior_lp_for_deposit,
 };
-use crate::state::MINIMUM_LIQUIDITY;
+use crate::state::{StakePool, MINIMUM_LIQUIDITY};
+use bytemuck::Zeroable;
 
 /// ST-6a: the real lock. Not a (sub-)pool genesis (`supply_before != 0`) => the full amount is
 /// minted; at a genesis a computed mint <= MINIMUM_LIQUIDITY is refused (error 28) and a larger one
@@ -46,6 +47,11 @@ struct Sub {
 /// either empty (supply == held == 0) or its supply is >= 1,000 with exactly 1,000 dead shares
 /// (`supply - held == 1,000`), so once set the floor never decreases and a sub-pool never returns
 /// to supply 0; a first deposit whose computed mint is <= 1,000 is refused. u16 amounts, 3 steps.
+/// R-1 (`aebbff6`) extension: a REAL `StakePool` mirrors the two sub-pools (tranches on, fresh:
+/// flags 0); `record_floor_lock(junior)` runs exactly when the lock fires (sub-pool supply 0), before
+/// the supply increments, as in `processor.rs`. After every step the floor flags equal the floors
+/// (`dead_lp() == Some((senior floor, junior floor))`, `None` only while both are empty) and
+/// `real_senior_lp / real_junior_lp / real_lp_supply` equal the users' held LP.
 /// Mutant ST-M5 (lock disabled). The processor's KEY choice (junior_total_lp / senior_total_lp vs
 /// total_lp_supply) is processor code this model does not execute: its revert is the LiteSVM
 /// mutant LS-NEW1a/b (`kani/mutants/v22/stake_litesvm.tsv`). Cost M.
@@ -54,6 +60,8 @@ struct Sub {
 #[kani::solver(cadical)]
 fn kani_v22_st6b_tranche_floor_never_decreases() {
     let mut subs = [Sub { supply: 0, held: 0, bal: 0 }; 2]; // [junior, senior]
+    let mut p = StakePool::zeroed();
+    p.set_tranche_enabled(true);
     let mut refused_small_genesis = false;
     let mut floor_set_then_drained = false;
     let mut senior_after_junior = false;
@@ -77,6 +85,13 @@ fn kani_v22_st6b_tranche_floor_never_decreases() {
                             if i == 1 && subs[0].supply != 0 && s.supply == 0 {
                                 senior_after_junior = true;
                             }
+                            if s.supply == 0 {
+                                p.record_floor_lock(i == 0);
+                            }
+                            p.total_lp_supply += lp;
+                            if i == 0 {
+                                p.set_junior_total_lp(p.junior_total_lp() + lp);
+                            }
                             subs[i] = Sub { supply: s.supply + lp, held: s.held + minted, bal: s.bal + amt };
                         }
                         Err(_) => {
@@ -95,6 +110,10 @@ fn kani_v22_st6b_tranche_floor_never_decreases() {
             };
             if let Some(pay) = pay {
                 if burn > 0 && pay <= s.bal {
+                    p.total_lp_supply -= burn;
+                    if i == 0 {
+                        p.set_junior_total_lp(p.junior_total_lp() - burn);
+                    }
                     subs[i] = Sub { supply: s.supply - burn, held: s.held - burn, bal: s.bal - pay };
                     if subs[i].held == 0 {
                         floor_set_then_drained = true;
@@ -108,6 +127,11 @@ fn kani_v22_st6b_tranche_floor_never_decreases() {
                 "a sub-pool is empty or carries exactly the 1,000 dead shares"
             );
         }
+        let floor = |t: &Sub| if t.supply == 0 { 0 } else { MINIMUM_LIQUIDITY };
+        let expect = if subs[0].supply == 0 && subs[1].supply == 0 { None } else { Some((floor(&subs[1]), floor(&subs[0]))) };
+        assert_eq!(p.dead_lp(), expect, "R-1 flags equal the floors");
+        assert_eq!((p.real_junior_lp(), p.real_senior_lp()), (subs[0].held, subs[1].held));
+        assert_eq!(p.real_lp_supply(), subs[0].held + subs[1].held);
         k += 1;
     }
     kani::cover!(refused_small_genesis, "first sub-pool deposit <= 1,000 refused");

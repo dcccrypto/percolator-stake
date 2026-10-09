@@ -5917,3 +5917,7 @@ mod tests {
 #[cfg(kani)]
 #[path = "kani_v22_new1.rs"]
 mod kani_v22_new1;
+
+#[cfg(kani)]
+#[path = "kani_v22_r1.rs"]
+mod kani_v22_r1;
