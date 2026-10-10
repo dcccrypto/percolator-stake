@@ -572,6 +572,9 @@ fn st5_last_junior_full_burn_pays_exactly_ejb() {
     let supply: u64 = kani::any();
     let bal: u64 = kani::any();
     let lp: u64 = kani::any();
+    // review round 3 T1: the full-width half covers only the refusal and full-burn arms; the partial
+    // arm (0 < lp < supply, a u128 mul-div) is proved below at u16, so it is excluded here.
+    kani::assume(supply == 0 || lp >= supply);
     let r = calc_junior_collateral_for_withdraw(supply, bal, lp);
     if supply == 0 || lp > supply {
         assert_eq!(r, None, "over-burn or zero supply refused");

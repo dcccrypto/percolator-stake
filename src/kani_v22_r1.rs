@@ -221,10 +221,13 @@ fn kani_v22_st7c_no_real_lp_nothing_booked() {
         assert_eq!(q.total_pool_value(), pv0);
     }
     let mut t = p;
-    if let Ok((_, to_fees)) = t.book_terminal_recovery(bal) {
+    let tr = t.book_terminal_recovery(bal);
+    let t_ok = tr.is_ok();
+    if let Ok((_, to_fees)) = tr {
         assert_eq!(to_fees, 0, "F-9 books no fee leg without real LP");
         assert_eq!((t.total_fees_earned, t.junior_balance()), (fees0, jb0));
     }
+    kani::cover!(t_ok, "F-9 Ok reached (review round 3 T2)");
     let two = !g.legacy && g.ds == M && g.dj == M;
     kani::cover!(two && p.pool_mode == 1 && r.is_ok() && bal > pv0.unwrap(), "two floors, mode-1 surplus, skipped");
     kani::cover!(
