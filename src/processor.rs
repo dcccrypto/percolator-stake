@@ -611,7 +611,7 @@ fn process_init_pool(
         // GnwdeQr… markets are abandoned; GnwdeQr… is no longer trusted.
         #[cfg(feature = "devnet")]
         const PERCOLATOR_DEVNET: Pubkey =
-            solana_program::pubkey!("5NGgnU2j315Ci2tso8VJDEthaVExuiKG3tn4xnur28xe");
+            solana_program::pubkey!("6kpg2wi7vwkn7E9rvodXSktYRhna8TWjiZrC1dBek6NM");
         let is_valid = *percolator_program.key == PERCOLATOR_MAINNET;
         #[cfg(feature = "devnet")]
         let is_valid = is_valid || *percolator_program.key == PERCOLATOR_DEVNET;
