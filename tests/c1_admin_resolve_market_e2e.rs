@@ -64,7 +64,7 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 // Associated Token Program ID (used for canonical wrapper-vault ATA computation).
 // Source: v16_program.rs:13530-13531 (mirrors v17_stake_insurance_e2e.rs).
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Was 3067 when WRAPPER_CONFIG_LEN was 496; the 2026-07-19 fee-split fields grew
@@ -890,6 +890,7 @@ fn read_pool_state(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
 /// reject, proving an admin cannot use ReturnInsurance alone to unlock
 /// resolution while flushed capital sits stranded in the wrapper.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
     let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
     else {
@@ -1011,6 +1012,7 @@ fn admin_resolve_market_h1_blocked_by_real_return_insurance_call() {
 /// instruction allowed to advance `total_recovered_from_wrapper`. Only once
 /// that real recovery has run does `AdminResolveMarket` succeed.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn admin_resolve_market_h1_unblocked_only_after_real_recover_flushed_insurance() {
     let Some((mut svm, stake_id, wrapper_id, token_program, admin, payer)) = common_svm_setup()
     else {

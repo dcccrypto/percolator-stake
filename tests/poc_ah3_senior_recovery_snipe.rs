@@ -38,7 +38,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 /// `StakeError::InsuranceLossOutstanding` (src/error.rs).
@@ -282,6 +282,12 @@ fn init_pool_ix(c: &Ctx, admin: &Pubkey, cooldown_slots: u64, deposit_cap: u64) 
     let mut data = vec![0u8];
     data.extend_from_slice(&cooldown_slots.to_le_bytes());
     data.extend_from_slice(&deposit_cap.to_le_bytes());
+    // v5: the 16-byte InitPool creates a FIRST_LOSS pool (consent-gated deposits, no tranches). This
+    // PoC suite tests the pre-v5 fee-only pool, which is v5 risk mode FEE_ONLY (no deployment).
+    data.push(2u8); // risk_mode FEE_ONLY
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&3_000u16.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
     Instruction {
         program_id: c.stake_id,
         accounts: vec![
@@ -670,6 +676,7 @@ fn admin_returns(w: &mut World, amount: u64) {
 /// the hole even on a build where the gate is missing), then asserts the deposit is
 /// refused.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_poc_senior_snipe_is_blocked() {
     let mut w = world(1);
     tranched_pool_with_flush(&mut w, FLUSH_ABSORBED);
@@ -756,6 +763,7 @@ fn ah3_poc_senior_snipe_is_blocked() {
 ///
 /// This test FAILS if the gate is ever simplified to `wrapper_recoverable() > 0`.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_junior_absorbed_loss_does_not_gate_senior() {
     let mut w = world(1);
     tranched_pool_with_flush(&mut w, FLUSH_ABSORBED);
@@ -841,6 +849,7 @@ fn ah3_junior_absorbed_loss_does_not_gate_senior() {
 /// the old gate and a `net_loss == 0` special case stay open — yet `total_returned`
 /// can now be pushed PAST `total_flushed`, and the overshoot lands on senior.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_partial_return_insurance_still_exposes_senior() {
     const PARTIAL: u64 = 50_000;
     let mut w = world(1);
@@ -882,6 +891,7 @@ fn ah3_partial_return_insurance_still_exposes_senior() {
 /// deposits, for the original reason (senior is marked down and a recovery un-marks
 /// it).
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_spilled_loss_still_blocks_senior_deposits() {
     let mut w = world(1);
     tranched_pool_with_flush(&mut w, FLUSH_SPILL);
@@ -911,6 +921,7 @@ fn ah3_spilled_loss_still_blocks_senior_deposits() {
 /// the blocked party prepends the permissionless recover and the deposit then prices
 /// against the restored, honest basis.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_recover_then_deposit_senior_succeeds_and_prices_fairly() {
     let mut w = world(1);
     let (_jun, (_sen, sen_lp)) = tranched_pool_with_flush(&mut w, FLUSH_ABSORBED);
@@ -963,6 +974,7 @@ fn ah3_recover_then_deposit_senior_succeeds_and_prices_fairly() {
 /// **Withdrawals must never be frozen.** While the gate is shut, every exit path
 /// stays open — senior and junior alike.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_gate_never_freezes_withdrawals() {
     let mut w = world(1);
     let ((jun, jun_lp), (sen, sen_lp)) = tranched_pool_with_flush(&mut w, FLUSH_ABSORBED);
@@ -1097,6 +1109,7 @@ fn senior_gate_reduces_to_nontranche_gate_when_junior_is_empty() {
 /// `wrapper_recoverable()` exactly when `junior_balance() == 0` — the two arms agree
 /// on the empty-junior boundary instead of disagreeing across it.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah3_enabling_tranches_must_not_reopen_the_ah2_gate() {
     // A pool that starts life WITHOUT tranches, in the A-H2-gated state.
     let mut w = world_untranched(1);

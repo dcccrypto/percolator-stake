@@ -38,7 +38,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V17_CAP1: usize = 3147;
+const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 /// `StakeError::InsuranceLossOutstanding` (src/error.rs).
@@ -279,6 +279,12 @@ fn init_pool_ix(c: &Ctx, admin: &Pubkey, cooldown_slots: u64, deposit_cap: u64) 
     let mut data = vec![0u8];
     data.extend_from_slice(&cooldown_slots.to_le_bytes());
     data.extend_from_slice(&deposit_cap.to_le_bytes());
+    // v5: the 16-byte InitPool creates a FIRST_LOSS pool (consent-gated deposits, no tranches). This
+    // PoC suite tests the pre-v5 fee-only pool, which is v5 risk mode FEE_ONLY (no deployment).
+    data.push(2u8); // risk_mode FEE_ONLY
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&3_000u16.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
     Instruction {
         program_id: c.stake_id,
         accounts: vec![
@@ -527,6 +533,7 @@ fn genesis_and_flush(w: &mut World) -> (Keypair, Pubkey) {
 /// Post-fix the `Deposit` half is refused with `InsuranceLossOutstanding`, which
 /// reverts the whole transaction, so no LP is minted and no tokens move.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah2_poc_snipe_is_blocked() {
     let mut w = world(1, 0);
     let (_lp, _lp_ata) = genesis_and_flush(&mut w);
@@ -569,6 +576,7 @@ fn ah2_poc_snipe_is_blocked() {
 /// Non-atomic is equally refused — the attacker does not need to own the recover.
 /// This is why permissioning tag 23 would not have been a fix.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah2_snipe_is_blocked_without_atomicity() {
     let mut w = world(1, 0);
     genesis_and_flush(&mut w);
@@ -592,6 +600,7 @@ fn ah2_snipe_is_blocked_without_atomicity() {
 /// priced against the restored basis — so the depositor breaks even instead of
 /// capturing 5.5x, and the incumbent is made whole.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah2_recover_then_deposit_prices_fairly() {
     let mut w = world(1, 0);
     let (_lp, lp_ata) = genesis_and_flush(&mut w);
@@ -642,6 +651,7 @@ fn ah2_recover_then_deposit_prices_fairly() {
 /// injection is still armed. A gate written against `flushed - returned` would open
 /// here and the snipe would be live again.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah2_gate_tracks_wrapper_recoverable_not_flushed_minus_returned() {
     let mut w = world(1, 0);
     genesis_and_flush(&mut w);
@@ -686,6 +696,7 @@ fn ah2_gate_tracks_wrapper_recoverable_not_flushed_minus_returned() {
 
 /// Not a permanent freeze: once the recovery is complete, deposits reopen.
 #[test]
+#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
 fn ah2_deposits_reopen_after_full_recovery() {
     let mut w = world(1, 0);
     genesis_and_flush(&mut w);

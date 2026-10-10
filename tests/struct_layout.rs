@@ -6,15 +6,33 @@
 use percolator_stake::state::{StakeDeposit, StakePool, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
 
 #[test]
-fn test_stake_pool_size_is_408() {
+fn test_stake_pool_size_is_480_v5() {
+    // v5 (Phase 4 item 6): v4's 408 + 72 bytes of APPENDED first-loss fields (risk_mode@408
+    // .. _v5_reserved@456..480). Pools are re-seeded fresh for v2.2 (no migration).
+    assert_eq!(STAKE_POOL_SIZE, 480);
+    assert_eq!(std::mem::size_of::<StakePool>(), 480);
+    assert_eq!(std::mem::offset_of!(StakePool, risk_mode), 408);
+    assert_eq!(std::mem::offset_of!(StakePool, consent_version), 409);
+    assert_eq!(std::mem::offset_of!(StakePool, deploy_target_bps), 410);
+    assert_eq!(std::mem::offset_of!(StakePool, liquid_buffer_bps), 412);
+    assert_eq!(std::mem::offset_of!(StakePool, hysteresis_bps), 414);
+    assert_eq!(std::mem::offset_of!(StakePool, last_sync_slot), 416);
+    assert_eq!(std::mem::offset_of!(StakePool, pending_target_bps), 424);
+    assert_eq!(std::mem::offset_of!(StakePool, pending_target_slot), 432);
+    assert_eq!(std::mem::offset_of!(StakePool, sync_cooldown_slots), 440);
+    assert_eq!(std::mem::offset_of!(StakePool, creator_forwarded_atoms), 448);
+    assert_eq!(StakePool::CURRENT_VERSION, 5);
+}
+
+#[allow(dead_code)]
+fn test_stake_pool_size_is_408_v4_history() {
     // v4 layout: v3's 392 + pending_cooldown_slots[8] + cooldown_proposed_at_slot[8]
     // = 408. The two #242 timelock values were promoted out of `_reserved[10..26]`,
     // where they aliased the PERC-313 HWM fields on the deployed v3 program.
     // If this changes, existing on-chain data becomes unreadable.
     // NEVER change this without a version bump + (if not fresh-start) a migration.
     // Pools are being re-seeded fresh for v4, so no migration path is needed.
-    assert_eq!(STAKE_POOL_SIZE, 408);
-    assert_eq!(std::mem::size_of::<StakePool>(), 408);
+    // v4 history: 408. Superseded by v5 (480) above.
 }
 
 /// The new fields must be APPENDED after `total_recovered_from_wrapper` (offset 384),

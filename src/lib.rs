@@ -107,6 +107,7 @@ pub mod math;
 pub mod processor;
 pub mod spl_token;
 pub mod state;
+pub mod wrapper_layout;
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint;

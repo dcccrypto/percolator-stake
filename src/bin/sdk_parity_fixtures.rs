@@ -67,8 +67,11 @@ fn probe_offset<F: FnOnce(&mut StakePool)>(field: &str, write: F) -> usize {
 /// here. A renamed variant fails to compile, which is its own alarm.
 fn variant_name(ix: &StakeInstruction) -> &'static str {
     match ix {
-        StakeInstruction::InitPool { .. } => "InitPool",
-        StakeInstruction::Deposit { .. } => "Deposit",
+        // v5: the 23-byte InitPool / 9-byte Deposit are the SAME tags (0 / 1), same names.
+        StakeInstruction::InitPool { .. } | StakeInstruction::InitPoolV5 { .. } => "InitPool",
+        StakeInstruction::Deposit { .. } | StakeInstruction::DepositWithConsent { .. } => {
+            "Deposit"
+        }
         StakeInstruction::Withdraw { .. } => "Withdraw",
         StakeInstruction::FlushToInsurance { .. } => "FlushToInsurance",
         StakeInstruction::UpdateConfig { .. } => "UpdateConfig",
@@ -98,6 +101,9 @@ fn variant_name(ix: &StakeInstruction) -> &'static str {
         }
         StakeInstruction::AdminUpdateBackingFeePolicy { .. } => "AdminUpdateBackingFeePolicy",
         StakeInstruction::AdminUpdateTradeFeePolicy { .. } => "AdminUpdateTradeFeePolicy",
+        StakeInstruction::SyncInsuranceDeployment => "SyncInsuranceDeployment",
+        StakeInstruction::ProposeDeployTarget { .. } => "ProposeDeployTarget",
+        StakeInstruction::CommitDeployTarget => "CommitDeployTarget",
     }
 }
 

@@ -69,6 +69,12 @@
 //! `require_newer_control_sequence`).
 #![allow(clippy::too_many_arguments)]
 
+// v2.2: every wrapper-slab offset is derived in ONE module (see its header).
+pub use crate::wrapper_layout::{
+    ASSET0_AUTHORITY_EPOCH_OFF, ASSET0_BACKING_FEE_LONG_OFF, ASSET0_BACKING_FEE_SHORT_OFF,
+    ASSET0_INSURANCE_TOP_UP_OFF, ASSET0_MARKET_ID_OFF, ASSET0_TRADE_FEE_OFF,
+    ASSET0_WRAPPER_START, MARKET_ASSET_GENERATION_FRONTIER_OFF,
+};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
@@ -145,7 +151,7 @@ const ASSET_AUTH_ADMIN: u8 = 0;
 // wrapper's header size. This is the post-F-01-migration layout this HELD
 // branch targets; re-verify against the probe above if the header changes
 // again before the coordinated migration deploy.
-const ASSET0_WRAPPER_START: usize = 1350;
+
 
 /// `AssetStateV16.market_id` (engine, asset 0's per-asset generation
 /// counter) — the value BOTH tag 9's and tag 65's `market_id` wire field is
@@ -155,7 +161,7 @@ const ASSET0_WRAPPER_START: usize = 1350;
 /// `EngineAssetSlotV16Account` (`Market<T>.engine`), which sits immediately
 /// after `Market<T>.wrapper: [u8; ASSET_ORACLE_WRAPPER_LEN(1024)]`. Offset:
 /// `wrapper_start + 1024 + 0`.
-const ASSET0_MARKET_ID_OFF: usize = ASSET0_WRAPPER_START + 1024; // 2374
+
 
 /// `AssetControlSequencesV16.authority_epoch` for asset 0 — the strict CAS
 /// lane `UpdateAssetAuthority` advances (`advance_authority_epoch_view`,
@@ -166,7 +172,7 @@ const ASSET0_MARKET_ID_OFF: usize = ASSET0_WRAPPER_START + 1024; // 2374
 /// `AssetControlSequencesV16`: oracle_observation, backing_fee_long,
 /// backing_fee_short, trade_fee, liquidation_fee, maintenance_fee,
 /// fee_redirect, market_init_fee, permissionless_resolve).
-const ASSET0_AUTHORITY_EPOCH_OFF: usize = ASSET0_WRAPPER_START + 512 + 72; // 1934
+
 
 /// `AssetOracleProfileV16.insurance_top_up` — the one-shot strictly-
 /// increasing `intent_id` watermark tag 9 validates with
@@ -176,11 +182,17 @@ const ASSET0_AUTHORITY_EPOCH_OFF: usize = ASSET0_WRAPPER_START + 512 + 72; // 19
 /// 496 within the 512-byte profile (TB-3 tail field, immediately after
 /// TB-1a's `next_portfolio_id`/`_padding2`, immediately before
 /// `backing_top_up` at 504 — this program never touches `backing_top_up`).
-const ASSET0_INSURANCE_TOP_UP_OFF: usize = ASSET0_WRAPPER_START + 496; // 1846
+
 
 #[inline]
 fn read_market_u64(market: &AccountInfo, off: usize) -> Result<u64, ProgramError> {
     let data = market.try_borrow_data()?;
+    // v2.2 (W-M3): refuse any slab that is not the pinned layout BEFORE reading a single
+    // offset. A v2.1 (VERSION 18) slab read at v2.2 offsets lands 32 B off: a CAS on coincident
+    // zeros and a monotone watermark can both silently succeed.
+    if !crate::wrapper_layout::header_is_pinned(&data) {
+        return Err(crate::error::StakeError::UnsupportedWrapperLayout.into());
+    }
     let bytes = data
         .get(off..off + 8)
         .ok_or(ProgramError::InvalidAccountData)?;
@@ -234,7 +246,7 @@ fn next_asset0_intent_id(market: &AccountInfo) -> Result<u64, ProgramError> {
 /// a9318945` (a throwaway probe test appended to a scratch wrapper worktree,
 /// run once, reverted — never committed): `MARKET_GROUP_OFF(592) +
 /// offset_of!(MarketGroupV16HeaderAccount, next_market_id)(581) = 1173`.
-const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = 1173;
+
 
 /// `AssetControlSequencesV16.backing_fee_long` for asset 0 — the strictly-
 /// increasing `policy_sequence` watermark `UpdateBackingFeePolicy` (tag 51)
@@ -247,18 +259,18 @@ const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = 1173;
 /// `AssetControlSequencesV16` struct at `ASSET_CONTROL_SEQUENCES_OFF(512)`
 /// (both values reconfirmed by the SAME probe that reconfirmed the
 /// already-shipped `authority_epoch @ +72`, cross-validating the method).
-const ASSET0_BACKING_FEE_LONG_OFF: usize = ASSET0_WRAPPER_START + 512 + 8; // 1870
+
 /// `AssetControlSequencesV16.backing_fee_short` for asset 0 — same as
 /// `ASSET0_BACKING_FEE_LONG_OFF` but for the SHORT domain (`domain` odd,
 /// `ControlSequenceLane::BackingFeeShort`). `offset_of!(..., backing_fee_short)
 /// == 16`.
-const ASSET0_BACKING_FEE_SHORT_OFF: usize = ASSET0_WRAPPER_START + 512 + 16; // 1878
+
 /// `AssetControlSequencesV16.trade_fee` for asset 0 — the strictly-increasing
 /// `policy_sequence` watermark `UpdateTradeFeePolicy` (tag 55) advances
 /// (`ControlSequenceLane::TradeFee`; the wrapper hardcodes asset 0 for this
 /// tag, matching every other asset-0-scoped read in this file).
 /// `offset_of!(..., trade_fee) == 24`.
-const ASSET0_TRADE_FEE_OFF: usize = ASSET0_WRAPPER_START + 512 + 24; // 1886
+
 
 /// Live market-wide asset-generation frontier — the `asset_generation_frontier`
 /// field `ResolveMarket` (tag 19) sends on the wire. See
@@ -1410,6 +1422,169 @@ pub fn cpi_update_trade_fee_policy<'a>(
     invoke_signed(&ix, &[pool_pda.clone(), slab.clone()], &[pool_seeds])
 }
 
+// ═══════════════════════════════════════════════════════════════
+// v5 (Phase 4 item 6): the wrapper's insurance-unit ledger.
+// ═══════════════════════════════════════════════════════════════
+//
+// Wrapper tag 116 `InitInsuranceUnits` (permissionless): creates the market's
+// `InsuranceUnitsV20` if missing, else refreshes its snapshot (`snap_slot = now`).
+// Accounts `[payer (signer, w), market (w), ins_units (w), system program]`, data `[116]`.
+// Stake v5 runs it before reading the deployed value, so the reading is from THIS slot.
+//
+// On a units market the wrapper REQUIRES the ledger on every asset-0 insurance path
+// (tags 9 / 57 / 41) and finds it by its PDA after the fixed accounts, so the v5
+// builders below append it as the last account.
+const TAG_INIT_INSURANCE_UNITS: u8 = 116;
+
+pub fn cpi_refresh_ins_units<'a>(
+    percolator_program: &AccountInfo<'a>,
+    payer: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+) -> ProgramResult {
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new(*payer.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*ins_units.key, false),
+            AccountMeta::new_readonly(*system_program.key, false),
+        ],
+        data: vec![TAG_INIT_INSURANCE_UNITS],
+    };
+    solana_program::program::invoke(
+        &ix,
+        &[payer.clone(), market.clone(), ins_units.clone(), system_program.clone()],
+    )
+}
+
+/// v5 tag-9 top-up from the pool vault (vault_auth PDA signs), units ledger appended.
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_top_up_insurance_v5<'a>(
+    percolator_program: &AccountInfo<'a>,
+    signer: &AccountInfo<'a>,
+    slab: &AccountInfo<'a>,
+    signer_ata: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let data = build_top_up_insurance_data(slab, amount)?;
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*signer.key, true),
+            AccountMeta::new(*slab.key, false),
+            AccountMeta::new(*signer_ata.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*ins_units.key, false),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            signer.clone(),
+            slab.clone(),
+            signer_ata.clone(),
+            wrapper_vault.clone(),
+            token_program.clone(),
+            ins_units.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+/// v5 tag-57 live withdrawal into the pool vault (vault_auth PDA = insurance operator signs),
+/// units ledger appended (the wrapper burns stake-class units at its EXIT reading).
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_withdraw_insurance_asset_v5<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    dest_token: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let data = build_withdraw_insurance_asset_data(market, amount)?;
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*ins_units.key, false),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            vault_auth.clone(),
+            market.clone(),
+            dest_token.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            token_program.clone(),
+            ins_units.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+/// v5 tag-41 terminal withdrawal into the pool vault, units ledger appended.
+#[allow(clippy::too_many_arguments)]
+pub fn cpi_withdraw_insurance_terminal_v5<'a>(
+    percolator_program: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    dest_token: &AccountInfo<'a>,
+    wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    ins_units: &AccountInfo<'a>,
+    amount: u64,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let ix = Instruction {
+        program_id: *percolator_program.key,
+        accounts: vec![
+            AccountMeta::new_readonly(*vault_auth.key, true),
+            AccountMeta::new(*market.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_auth.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new(*ins_units.key, false),
+        ],
+        data: build_withdraw_insurance_data(amount),
+    };
+    invoke_signed(
+        &ix,
+        &[
+            vault_auth.clone(),
+            market.clone(),
+            dest_token.clone(),
+            wrapper_vault.clone(),
+            wrapper_vault_auth.clone(),
+            token_program.clone(),
+            ins_units.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
 #[cfg(test)]
 mod tag_tests {
     use super::*;
@@ -1437,6 +1612,8 @@ mod tag_tests {
     fn synthetic_market_data(market_id: u64, authority_epoch: u64, insurance_top_up: u64) -> Vec<u8> {
         let len = ASSET0_MARKET_ID_OFF + 8;
         let mut data = vec![0u8; len];
+        data[0..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+        data[8..10].copy_from_slice(&crate::wrapper_layout::WRAPPER_VERSION.to_le_bytes());
         data[ASSET0_MARKET_ID_OFF..ASSET0_MARKET_ID_OFF + 8]
             .copy_from_slice(&market_id.to_le_bytes());
         data[ASSET0_AUTHORITY_EPOCH_OFF..ASSET0_AUTHORITY_EPOCH_OFF + 8]
@@ -1481,17 +1658,19 @@ mod tag_tests {
     /// when it happens to also break a wire-shape test.
     #[test]
     fn test_asset0_offset_constants_are_pinned() {
-        assert_eq!(ASSET0_WRAPPER_START, 1350);
-        assert_eq!(ASSET0_MARKET_ID_OFF, 2374);
-        assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1934);
-        assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1846);
+        // v2.2 (wrapper 92a09c23 / engine 30b2ec20): every asset slot sits +40 B later
+        // (engine config grew). v2.1 values were 1350 / 2374 / 1934 / 1846.
+        assert_eq!(ASSET0_WRAPPER_START, 1398);
+        assert_eq!(ASSET0_MARKET_ID_OFF, 2422);
+        assert_eq!(ASSET0_AUTHORITY_EPOCH_OFF, 1982);
+        assert_eq!(ASSET0_INSURANCE_TOP_UP_OFF, 1894);
         // Systematic-sweep additions (tags 19/51/55) — ground-truthed via
         // core::mem::offset_of! against the real wrapper Pod types at
         // sync/integration-v16 @ a9318945 (throwaway probe, reverted).
-        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1173);
-        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1870);
-        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1878);
-        assert_eq!(ASSET0_TRADE_FEE_OFF, 1886);
+        assert_eq!(MARKET_ASSET_GENERATION_FRONTIER_OFF, 1221); // v2.1: 1173
+        assert_eq!(ASSET0_BACKING_FEE_LONG_OFF, 1918);
+        assert_eq!(ASSET0_BACKING_FEE_SHORT_OFF, 1926);
+        assert_eq!(ASSET0_TRADE_FEE_OFF, 1934);
     }
 
     #[test]
@@ -1515,6 +1694,42 @@ mod tag_tests {
         assert_eq!(read_asset0_authority_epoch(&market).unwrap(), 77);
         // intent_id must be the watermark PLUS ONE (strictly greater, not CAS).
         assert_eq!(next_asset0_intent_id(&market).unwrap(), 101);
+    }
+
+    /// W-M3: a v2.1 (VERSION 18) or unstamped slab is refused BEFORE any offset read, for every
+    /// raw reader. On a fresh v2.1 slab the v2.2 offsets would read coincident zeros (CAS) or an
+    /// unrelated lane (watermark), i.e. silently succeed. Control: the same bytes stamped 19 read.
+    #[test]
+    fn test_v21_stamped_slab_is_refused_by_every_reader() {
+        use crate::error::StakeError;
+        let refused: ProgramError = StakeError::UnsupportedWrapperLayout.into();
+        for bad in [18u16, 17, 20, 0] {
+            let mut data = synthetic_market_data_full(7, 5, 9, 11, 1, 2, 3);
+            data[8..10].copy_from_slice(&bad.to_le_bytes());
+            let key = Pubkey::new_from_array([3u8; 32]);
+            let owner = Pubkey::new_from_array([4u8; 32]);
+            let mut lamports = 0u64;
+            let m = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+            assert_eq!(read_asset0_market_id(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(read_asset0_authority_epoch(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(next_asset0_intent_id(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(read_market_asset_generation_frontier(&m).unwrap_err(), refused, "v{bad}");
+            assert_eq!(next_asset0_trade_fee_policy_sequence(&m).unwrap_err(), refused, "v{bad}");
+        }
+        // wrong magic
+        let mut data = synthetic_market_data_full(7, 5, 9, 11, 1, 2, 3);
+        data[0] ^= 0xff;
+        let key = Pubkey::new_from_array([3u8; 32]);
+        let owner = Pubkey::new_from_array([4u8; 32]);
+        let mut lamports = 0u64;
+        let m = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+        assert_eq!(read_asset0_market_id(&m).unwrap_err(), refused);
+        // control
+        let mut data = synthetic_market_data_full(7, 5, 9, 11, 1, 2, 3);
+        let mut lamports = 0u64;
+        let m = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+        assert_eq!(read_asset0_market_id(&m).unwrap(), 7);
+        assert_eq!(read_market_asset_generation_frontier(&m).unwrap(), 11);
     }
 
     #[test]

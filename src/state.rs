@@ -24,6 +24,11 @@ pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 
 /// USDC=6, SOL=9) without materially raising the practical minimum pool size.
 pub const MINIMUM_LIQUIDITY: u64 = 1_000;
 
+/// R-1 floor flag: the senior sub-pool supply holds a MINIMUM_LIQUIDITY dead floor.
+pub const FLOOR_SENIOR: u8 = 0x01;
+/// R-1 floor flag: `junior_total_lp` holds a MINIMUM_LIQUIDITY dead floor.
+pub const FLOOR_JUNIOR: u8 = 0x02;
+
 /// Stake pool state — one per slab (market).
 /// PDA seeds: [b"stake_pool", slab_pubkey]
 ///
@@ -189,6 +194,44 @@ pub struct StakePool {
     /// Real struct field (offset 400) — see [`StakePool::pending_cooldown_slots`]
     /// for why these are no longer packed into `_reserved`.
     pub cooldown_proposed_at_slot: u64,
+
+    // ════════════════════════════════════════════════════════════════
+    // v5 (Phase 4 item 6, 2026-10-05): staking as real first-loss insurance.
+    //
+    // APPENDED real fields (408..480), NOT carved from `_reserved`: every byte of
+    // `_reserved[64]` is already owned (discriminator/version, PERC-303 tranche
+    // state, PERC-313 HWM, #290 attribution flag). The design note's v5 map put
+    // these in `_reserved[0..64]`, which would have repeated the #242/PERC-313
+    // aliasing bug (see `tests/poc_cooldown_timelock_hwm_overlap.rs`).
+    // ════════════════════════════════════════════════════════════════
+    /// 0 = legacy (pre-v5, never created by this build), 1 = FIRST_LOSS (stake is
+    /// deployed into the market's insurance and absorbs losses pro rata through the
+    /// wrapper's `InsuranceUnitsV20`; earns the 16% insurance fee leg), 2 = FEE_ONLY
+    /// (never deployed; earns nothing: the wrapper pays tag 87 to first-loss pools only).
+    pub risk_mode: u8, // 408
+    /// The consent version a first-loss deposit must carry (`RISK_TEXT_V*` in the
+    /// app: the version of the one-paragraph risk text the staker signs over).
+    pub consent_version: u8, // 409
+    /// Share of pool value kept deployed in the wrapper's insurance (bps, <= 8,000).
+    pub deploy_target_bps: u16, // 410..412
+    /// Share of pool value kept liquid in the vault by a sync top-up (bps).
+    pub liquid_buffer_bps: u16, // 412..414
+    /// No sync while |deployed - target| <= hysteresis (bps of pool value).
+    pub hysteresis_bps: u16, // 414..416
+    /// Slot of the last `SyncInsuranceDeployment` (rate limit).
+    pub last_sync_slot: u64, // 416..424
+    /// Proposed `deploy_target_bps` awaiting commit (meaningful while
+    /// `pending_target_slot != 0`).
+    pub pending_target_bps: u64, // 424..432
+    /// Slot of the pending proposal; 0 = none.
+    pub pending_target_slot: u64, // 432..440
+    /// Minimum slots between two syncs.
+    pub sync_cooldown_slots: u64, // 440..448
+    /// S1: creator-class insurance value the wrapper paid into this vault at
+    /// terminal (`InsuranceUnitsV20::creator_paid_to_stake_atoms`) that has already
+    /// been forwarded to `admin`. Never decreases.
+    pub creator_forwarded_atoms: u64, // 448..456
+    pub _v5_reserved: [u8; 24], // 456..480
 }
 
 /// Size of StakePool in bytes
@@ -245,8 +288,148 @@ const _: () = {
     // Shipping v4 therefore REQUIRES a coordinated wrapper bump to
     // STAKE_POOL_VERSION = 4 / STAKE_POOL_LEN = 408 and a wrapper redeploy, or
     // tag-87 stops paying the insurance fee leg to every stake pool.
-    assert!(STAKE_POOL_SIZE == 408);
+    // v5 appends 72 bytes (408 -> 480). The wrapper reads `risk_mode` at 408 to pay the
+    // tag-87 insurance fee leg to FIRST_LOSS pools only, and checks VERSION == 5 and
+    // LEN >= 480 (`percolator-prog` `constants::STAKE_POOL_*`). Deploy together.
+    assert!(offset_of!(StakePool, risk_mode) == 408);
+    assert!(offset_of!(StakePool, deploy_target_bps) == 410);
+    assert!(offset_of!(StakePool, last_sync_slot) == 416);
+    assert!(offset_of!(StakePool, creator_forwarded_atoms) == 448);
+    assert!(STAKE_POOL_SIZE == 480);
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// v5 (Phase 4 item 6) risk modes, consent and deployment bounds.
+// ════════════════════════════════════════════════════════════════════════════
+pub const RISK_MODE_LEGACY: u8 = 0;
+pub const RISK_MODE_FIRST_LOSS: u8 = 1;
+pub const RISK_MODE_FEE_ONLY: u8 = 2;
+/// Version of the first-loss risk text a depositor signs over (the app shows it and
+/// passes this byte; a mismatch is refused with `ConsentRequired`). Bumping it is a
+/// program upgrade, so a staker always consents to the text the program enforces.
+///
+/// Version 2 (security review 2026-10-05, W-2 / S-4 / S-5). The text MUST say, in substance:
+/// * Up to `deploy_target_bps` of the pool (the target signed in the consent, including a
+///   pending raise) is deployed into the market's insurance fund and absorbs trading losses pro
+///   rata with every other insurance unit (stake and creator class alike).
+/// * The insurance backstop (wrapper tag 111, G9) can lend insurance to the market's vault LP
+///   once its Earn seniors are exhausted, **up to the seniors' own loss that is still
+///   outstanding**, and never more than 50% of the fund (at most 20% per ~day). It is announced on
+///   chain at least 9,000 slots (~1 hour) before it can execute. On mainnet builds it runs only
+///   on a market priced by an external oracle (an authenticated Hybrid whose legs are Chainlink
+///   or allowlisted Switchboard feeds); on devnet any market can use it for testing. The loan is
+///   repaid first from any vault-LP recovery, but repayment is not guaranteed.
+/// * Withdrawals are paid only from the liquid part of the pool, first come first served; the
+///   deployed part returns over successive syncs while the market is healthy.
+pub const CONSENT_VERSION_FIRST_LOSS: u8 = 2;
+
+/// S-5: the 7 consent bytes a FIRST_LOSS `Deposit` appends after the amount:
+/// `[version u8][target_bps u16][buffer_bps u16][hysteresis_bps u16]` (little endian), with the
+/// CURRENT version. `target_bps` is the larger of the committed and a pending target.
+pub fn deposit_consent_bytes(target_bps: u16, buffer_bps: u16, hysteresis_bps: u16) -> [u8; 7] {
+    let (t, b, h) = (
+        target_bps.to_le_bytes(),
+        buffer_bps.to_le_bytes(),
+        hysteresis_bps.to_le_bytes(),
+    );
+    [CONSENT_VERSION_FIRST_LOSS, t[0], t[1], b[0], b[1], h[0], h[1]]
+}
+/// Protocol bounds and defaults (founder decision 5: target 50%, buffer 30%).
+pub const DEPLOY_TARGET_MAX_BPS: u16 = 8_000;
+pub const DEPLOY_TARGET_DEFAULT_BPS: u16 = 5_000;
+pub const LIQUID_BUFFER_DEFAULT_BPS: u16 = 3_000;
+pub const HYSTERESIS_DEFAULT_BPS: u16 = 500;
+pub const HYSTERESIS_MAX_BPS: u16 = 2_000;
+/// One sync per 150 slots (~1 minute) by default.
+pub const SYNC_COOLDOWN_DEFAULT_SLOTS: u64 = 150;
+/// S-6 (security review 2026-10-05): a deploy-target change commits no earlier than this many
+/// slots (~1 day) after its proposal, whatever the creator-chosen pool cooldown (min 1 slot):
+/// the stakers' exit window is a protocol constant.
+pub const DEPLOY_TARGET_TIMELOCK_MIN_SLOTS: u64 = 216_000;
+/// S-6: `_v5_reserved[0]` (byte 456) = 1 while the pending target was proposed by the protocol
+/// authority (an admin proposal may not overwrite it).
+pub const V5_RESERVED_IDX_PENDING_BY_PROTOCOL: usize = 0;
+
+// ════════════════════════════════════════════════════════════════════════════
+// v5 CROSS-PROGRAM LAYOUT CONTRACT: the wrapper's `InsuranceUnitsV20`
+// (`percolator-prog` `state::InsuranceUnitsV20`, PDA `["ins_units", market]`
+// under the wrapper, header kind 13, record version 1, 16 + 192 bytes; 160..192 are the
+// wrapper's G9 proposal / epoch fields, which stake does not read).
+// Mirrored here byte for byte; `tests/v5_wrapper_ins_units_pin.rs` pins them
+// against the wrapper crate's own const asserts by value. Deploy together.
+// ════════════════════════════════════════════════════════════════════════════
+pub const WRAPPER_INS_UNITS_SEED: &[u8] = b"ins_units";
+pub const WRAPPER_KIND_INSURANCE_UNITS: u8 = 13;
+pub const WRAPPER_INS_UNITS_LEN: usize = WRAPPER_HEADER_LEN + 192;
+pub const WRAPPER_INS_UNITS_OFF_MARKET: usize = WRAPPER_HEADER_LEN;
+pub const WRAPPER_INS_UNITS_OFF_UNITS_TOTAL: usize = WRAPPER_HEADER_LEN + 32;
+pub const WRAPPER_INS_UNITS_OFF_UNITS_STAKE: usize = WRAPPER_HEADER_LEN + 48;
+pub const WRAPPER_INS_UNITS_OFF_UNITS_CREATOR: usize = WRAPPER_HEADER_LEN + 64;
+pub const WRAPPER_INS_UNITS_OFF_RECEIVABLE: usize = WRAPPER_HEADER_LEN + 80;
+pub const WRAPPER_INS_UNITS_OFF_SNAP_MINT: usize = WRAPPER_HEADER_LEN + 96;
+pub const WRAPPER_INS_UNITS_OFF_SNAP_FREE: usize = WRAPPER_HEADER_LEN + 112;
+pub const WRAPPER_INS_UNITS_OFF_SNAP_SLOT: usize = WRAPPER_HEADER_LEN + 128;
+pub const WRAPPER_INS_UNITS_OFF_VERSION: usize = WRAPPER_HEADER_LEN + 136;
+pub const WRAPPER_INS_UNITS_OFF_CREATOR_PAID: usize = WRAPPER_HEADER_LEN + 144;
+pub const WRAPPER_INS_UNITS_VERSION: u8 = 1;
+
+/// The wrapper's unit ledger as stake v5 reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapperInsUnits {
+    pub units_total: u128,
+    pub units_stake: u128,
+    pub units_creator: u128,
+    pub backstop_receivable: u128,
+    pub snap_mint: u128,
+    pub snap_free: u128,
+    pub snap_slot: u64,
+    pub creator_paid_to_stake: u128,
+}
+
+fn rd_u128(d: &[u8], off: usize) -> Option<u128> {
+    Some(u128::from_le_bytes(d.get(off..off + 16)?.try_into().ok()?))
+}
+
+/// Parse a wrapper `InsuranceUnitsV20` account's RAW bytes. The caller has already
+/// checked the account's OWNER (== pool.percolator_program) and ADDRESS (the PDA);
+/// this checks the header (magic, kind), the record version, the bound market and
+/// the class invariant `units_total == units_stake + units_creator`. `None` = fail
+/// closed (wrong layout, wrong market, or a corrupt record).
+pub fn read_wrapper_ins_units(data: &[u8], market: &[u8; 32]) -> Option<WrapperInsUnits> {
+    if data.len() < WRAPPER_INS_UNITS_LEN {
+        return None;
+    }
+    if u64::from_le_bytes(data.get(0..8)?.try_into().ok()?) != WRAPPER_MAGIC
+        || *data.get(WRAPPER_OFF_KIND)? != WRAPPER_KIND_INSURANCE_UNITS
+        || *data.get(WRAPPER_INS_UNITS_OFF_VERSION)? != WRAPPER_INS_UNITS_VERSION
+        || data.get(WRAPPER_INS_UNITS_OFF_MARKET..WRAPPER_INS_UNITS_OFF_MARKET + 32)? != market
+    {
+        return None;
+    }
+    let u = WrapperInsUnits {
+        units_total: rd_u128(data, WRAPPER_INS_UNITS_OFF_UNITS_TOTAL)?,
+        units_stake: rd_u128(data, WRAPPER_INS_UNITS_OFF_UNITS_STAKE)?,
+        units_creator: rd_u128(data, WRAPPER_INS_UNITS_OFF_UNITS_CREATOR)?,
+        backstop_receivable: rd_u128(data, WRAPPER_INS_UNITS_OFF_RECEIVABLE)?,
+        snap_mint: rd_u128(data, WRAPPER_INS_UNITS_OFF_SNAP_MINT)?,
+        snap_free: rd_u128(data, WRAPPER_INS_UNITS_OFF_SNAP_FREE)?,
+        snap_slot: u64::from_le_bytes(
+            data.get(WRAPPER_INS_UNITS_OFF_SNAP_SLOT..WRAPPER_INS_UNITS_OFF_SNAP_SLOT + 8)?
+                .try_into()
+                .ok()?,
+        ),
+        creator_paid_to_stake: rd_u128(data, WRAPPER_INS_UNITS_OFF_CREATOR_PAID)?,
+    };
+    if u.units_stake.checked_add(u.units_creator)? != u.units_total {
+        return None;
+    }
+    Some(u)
+}
+
+/// Derive the wrapper's `InsuranceUnitsV20` PDA for `slab` under `wrapper`.
+pub fn derive_wrapper_ins_units(wrapper: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[WRAPPER_INS_UNITS_SEED, slab.as_ref()], wrapper)
+}
 
 /// Per-depositor state — tracks cooldown and LP amount per user.
 /// PDA seeds: [b"stake_deposit", pool_pda, user_pubkey]
@@ -364,7 +547,8 @@ impl StakePool {
     //   [51..59] = realized_junior_loss: u64 (LE)
     //   [59]     = asset_admin_burned (0=false, 1=true)
     //   [60]     = fee_attribution_armed (#290; 0=legacy, 1=armed)
-    //   [61..64] = free
+    //   [61]     = dead-share floor flags (R-1; bit0 senior, bit1 junior; 0=legacy)
+    //   [62..64] = free
     // ════════════════════════════════════════════════════════════
 
     /// Whether the market has been resolved (blocks new deposits).
@@ -508,6 +692,93 @@ impl StakePool {
         self.cooldown_proposed_at_slot = val;
     }
 
+    // ════════════════════════════════════════════════════════════
+    // R-1 (security review of b83ddf9, 2026-10-09): per-sub-pool dead-share floors.
+    //
+    // Since NEW-1 each sub-pool (senior, junior) locks its own MINIMUM_LIQUIDITY dead
+    // shares on its first deposit, so a tranche pool can carry 0, 1 or 2 floors and
+    // `total_lp_supply > MINIMUM_LIQUIDITY` no longer means "a real LP exists". The
+    // floors are recorded exactly, at lock time, in `_reserved[61]`:
+    //   bit0 (FLOOR_SENIOR) = senior supply (total - junior) holds MINIMUM_LIQUIDITY dead
+    //   bit1 (FLOOR_JUNIOR) = junior_total_lp holds MINIMUM_LIQUIDITY dead
+    // A non-tranche genesis sets FLOOR_SENIOR (that floor is the senior supply once
+    // tranches are turned on). `0` with `total_lp_supply > 0` is a LEGACY pool (created
+    // before this byte existed): it holds exactly one genesis floor in an unknown
+    // sub-pool and keeps the pre-fix semantics (see `dead_lp`).
+    // ════════════════════════════════════════════════════════════
+
+    /// Raw R-1 floor flags (`_reserved[61]`).
+    pub fn floor_flags(&self) -> u8 {
+        self._reserved[61]
+    }
+
+    /// Record that the `junior` (or senior) sub-pool just locked its dead-share floor.
+    /// Call exactly when `apply_minimum_liquidity_lock` locked (sub-pool supply was 0),
+    /// BEFORE this deposit's supply increments. For a legacy pool (flags 0, supply > 0)
+    /// the pre-fix code locked exactly one floor at pool genesis, and it cannot be in the
+    /// sub-pool being locked now (that sub-pool's supply is 0 and dead shares are never
+    /// burned), so it is recorded in the OTHER sub-pool — after which the pool is exact.
+    pub fn record_floor_lock(&mut self, junior: bool) {
+        let mut f = self._reserved[61];
+        let (mine, other) = if junior {
+            (FLOOR_JUNIOR, FLOOR_SENIOR)
+        } else {
+            (FLOOR_SENIOR, FLOOR_JUNIOR)
+        };
+        if f == 0 && self.total_lp_supply > 0 {
+            f |= other;
+        }
+        f |= mine;
+        self._reserved[61] = f;
+    }
+
+    /// Dead (never-minted, never-burnable) LP in each sub-pool: `Some((senior, junior))`,
+    /// each `0` or `MINIMUM_LIQUIDITY`. `None` for a legacy pool (flags 0): one floor of
+    /// `MINIMUM_LIQUIDITY` somewhere in `total_lp_supply` (or none if it is empty).
+    pub fn dead_lp(&self) -> Option<(u64, u64)> {
+        let f = self._reserved[61];
+        if f == 0 {
+            return None;
+        }
+        let d = |bit: u8| if f & bit != 0 { MINIMUM_LIQUIDITY } else { 0 };
+        Some((d(FLOOR_SENIOR), d(FLOOR_JUNIOR)))
+    }
+
+    /// Real (SPL-minted, redeemable) senior LP: `senior_total_lp() - senior_dead`.
+    /// Legacy pools: `senior_total_lp()` (pre-fix routing never excluded senior).
+    pub fn real_senior_lp(&self) -> u64 {
+        match self.dead_lp() {
+            Some((sd, _)) => self.senior_total_lp().saturating_sub(sd),
+            None => self.senior_total_lp(),
+        }
+    }
+
+    /// Real junior LP: `junior_total_lp() - junior_dead`. Legacy pools:
+    /// `junior_total_lp()` (pre-fix routing: any junior supply takes a fee share).
+    pub fn real_junior_lp(&self) -> u64 {
+        match self.dead_lp() {
+            Some((_, jd)) => self.junior_total_lp().saturating_sub(jd),
+            None => self.junior_total_lp(),
+        }
+    }
+
+    /// Real LP across the whole pool: `total_lp_supply - senior_dead - junior_dead`.
+    /// Legacy pools: `total_lp_supply - MINIMUM_LIQUIDITY` (saturating), i.e. exactly the
+    /// pre-fix F3 rule. Non-tranche pools: `total_lp_supply - MINIMUM_LIQUIDITY` too
+    /// (their single genesis floor is FLOOR_SENIOR), so they are unchanged.
+    pub fn real_lp_supply(&self) -> u64 {
+        match self.dead_lp() {
+            Some((sd, jd)) => self.total_lp_supply.saturating_sub(sd).saturating_sub(jd),
+            None => self.total_lp_supply.saturating_sub(MINIMUM_LIQUIDITY),
+        }
+    }
+
+    /// F3 / R-1: the pool has at least one real LP share (`real_lp_supply() > 0`). The
+    /// ONE gate for AccrueFees, the deposit/withdraw pre-accrue and F-9 recovery.
+    pub fn has_real_lp_holders(&self) -> bool {
+        self.real_lp_supply() > 0
+    }
+
     /// Loss-adjusted junior tranche balance.
     ///
     /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
@@ -607,7 +878,12 @@ impl StakePool {
         // senior_balance() derives from total_pool_value() which includes
         // total_fees_earned, so reading it post-increment would inflate the senior
         // weight in distribute_fees and systematically shortchange the junior tranche.
-        let distribute_to_junior = self.tranche_enabled() && self.junior_total_lp() > 0;
+        // R-1: route by REAL holders. A junior sub-pool holding only its dead floor takes
+        // no share (it used to whenever junior_total_lp() > 0, which since NEW-1 is
+        // forever once a junior existed); a senior sub-pool holding only its dead floor
+        // takes none either, so the whole fee goes to the junior tranche.
+        let distribute_to_junior = self.tranche_enabled() && self.real_junior_lp() > 0;
+        let junior_takes_all = distribute_to_junior && self.real_senior_lp() == 0;
         let (snapshot_junior_bal, snapshot_senior_bal) = if distribute_to_junior {
             (
                 self.junior_balance(),
@@ -627,12 +903,17 @@ impl StakePool {
         // senior_balance = total_pool_value() - junior_balance and total_fees_earned
         // was already incremented by the full fee_delta above.
         if distribute_to_junior {
-            let (junior_fee, _) = crate::math::distribute_fees(
-                snapshot_junior_bal,
-                snapshot_senior_bal,
-                self.junior_fee_mult_bps(),
-                fee_delta,
-            );
+            let junior_fee = if junior_takes_all {
+                fee_delta
+            } else {
+                crate::math::distribute_fees(
+                    snapshot_junior_bal,
+                    snapshot_senior_bal,
+                    self.junior_fee_mult_bps(),
+                    fee_delta,
+                )
+                .0
+            };
             self.set_junior_balance(
                 self.junior_balance()
                     .checked_add(junior_fee)
@@ -688,7 +969,7 @@ impl StakePool {
         let (to_returned, to_fees) = crate::math::terminal_recovery_split(
             surplus,
             self.wrapper_recoverable(),
-            crate::math::has_real_lp_holders(self.total_lp_supply),
+            self.has_real_lp_holders(),
         );
         if to_returned > 0 {
             self.total_returned = self
@@ -763,7 +1044,16 @@ impl StakePool {
     /// 3 for a 408-byte layout would let a v3 account pass the version check and
     /// then fail the length check in `pool_from_data`. Fresh-start cutover: live
     /// v3 pools are re-seeded, so no on-chain migration path is provided.
-    pub const CURRENT_VERSION: u8 = 4;
+    ///
+    /// v5 (size 408 -> 480): Phase 4 item 6 first-loss insurance (risk mode, consent,
+    /// deployment target / buffer / hysteresis, sync clock, target timelock, S1
+    /// creator forward). Fresh-start cutover (v2.2 re-seed): no v4 pool migrates.
+    pub const CURRENT_VERSION: u8 = 5;
+
+    /// v5: this pool deploys into the market's insurance (first loss).
+    pub fn is_first_loss(&self) -> bool {
+        self.risk_mode == RISK_MODE_FIRST_LOSS
+    }
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
     /// Call on init.
@@ -1019,15 +1309,15 @@ pub fn read_wrapper_insurance_reserve_withdrawn(data: &[u8]) -> Option<u128> {
 //
 //   * Resolved: kind == KIND_MARKET (1) and the engine header `mode` byte == 1.
 //     `mode` sits at MARKET_GROUP_OFF (592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN
-//     576) + offset_of!(MarketGroupV16HeaderAccount, mode) (626, engine c141d47f)
-//     = 1218. Values: 0 Live, 1 Resolved, 2 Recovery (`decode_market_mode`).
+//     576) + offset_of!(MarketGroupV16HeaderAccount, mode) (674, engine fe1a425e;
+//     626 at layout 18) = 1266. Derived in `wrapper_layout.rs`. Values: 0 Live, 1 Resolved, 2 Recovery (`decode_market_mode`).
 //     Recovery (2) is NOT terminal and is treated as not-resolved here.
 //   * Closed: kind == KIND_CLOSED_MARKET (8), the tombstone CloseSlab leaves
 //     (`state::write_closed_market_tombstone`). Our fork's value is 8, not the
 //     upstream 5.
 //
 // `tests/f9_terminal_insurance_recovery_e2e.rs` pins the mode offset against the
-// REAL deployed v18.2 wrapper .so (6377376a) and the P1 wrapper .so: byte 1218 is 0
+// REAL deployed v18.2 wrapper .so (6377376a) and the P1 wrapper .so: byte 1266 (1218 on v2.1) is 0
 // while Live and 1 after ResolveMarket. If the engine header moves, that test fails;
 // update the constant here and redeploy together.
 // ════════════════════════════════════════════════════════════════════════════
@@ -1035,13 +1325,14 @@ pub const WRAPPER_KIND_CLOSED_MARKET: u8 = 8;
 pub const WRAPPER_HEADER_LEN: usize = 16;
 pub const WRAPPER_OFF_VERSION: usize = 8;
 /// The only wrapper account VERSION whose engine header this program has pinned
-/// (`constants::VERSION` in deploy/v18.2-wrapper@6377376a AND P1 c0ffaefa).
-pub const WRAPPER_SUPPORTED_VERSION: u16 = 18;
-/// `MIN_MARKET_ACCOUNT_LEN = MARKET_GROUP_OFF (592) + MARKET_GROUP_LEN (758)` on
+/// (`constants::VERSION` = 19 in wrapper f576bffc / feat/v22-wave-b; 18 in the v2.1
+/// wrappers deploy/v18.2-wrapper@6377376a and P1 c0ffaefa, which stake v2.2 refuses).
+pub const WRAPPER_SUPPORTED_VERSION: u16 = crate::wrapper_layout::WRAPPER_VERSION;
+/// `MIN_MARKET_ACCOUNT_LEN = MARKET_GROUP_OFF (592) + MARKET_GROUP_LEN (806)` on
 /// the pinned layout. A market account shorter than this cannot hold the engine
 /// header, so the mode byte at [`WRAPPER_OFF_MODE`] is not trusted.
-pub const WRAPPER_MIN_MARKET_LEN: usize = 592 + 758;
-pub const WRAPPER_OFF_MODE: usize = 592 + 626;
+pub const WRAPPER_MIN_MARKET_LEN: usize = crate::wrapper_layout::MIN_MARKET_ACCOUNT_LEN;
+pub const WRAPPER_OFF_MODE: usize = crate::wrapper_layout::MARKET_MODE_OFF;
 pub const WRAPPER_MODE_LIVE: u8 = 0;
 pub const WRAPPER_MODE_RESOLVED: u8 = 1;
 pub const WRAPPER_MODE_RECOVERY: u8 = 2;
@@ -1059,13 +1350,13 @@ pub enum WrapperTerminal {
     /// [`WRAPPER_SUPPORTED_VERSION`], an unknown kind, a market shorter than
     /// [`WRAPPER_MIN_MARKET_LEN`], a tombstone of the wrong length, or a mode byte
     /// outside {0, 1, 2}. Callers REFUSE (`UnsupportedWrapperLayout`, 32): on an
-    /// unpinned layout, byte 1218 is not known to be the mode, so it proves nothing.
+    /// unpinned layout, byte 1266 is not known to be the mode, so it proves nothing.
     UnknownLayout,
 }
 
 /// F-9: classify a wrapper market account. The caller must already have checked
 /// the account's key (== `pool.slab`) and owner (== `pool.percolator_program`).
-/// Fails closed: only the exact pinned layout (magic, VERSION 18, kind, length)
+/// Fails closed: only the exact pinned layout (magic, VERSION 19, kind, length)
 /// is ever classified; everything else is `UnknownLayout`.
 pub fn read_wrapper_terminal(data: &[u8]) -> WrapperTerminal {
     if data.len() < WRAPPER_HEADER_LEN {
@@ -1116,7 +1407,7 @@ mod tests {
     fn wrapper_market_bytes(counter: u128) -> Vec<u8> {
         let mut d = vec![0u8; 592];
         d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
-        d[8..10].copy_from_slice(&18u16.to_le_bytes());
+        d[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
         d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
         d[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN + 16]
             .copy_from_slice(&counter.to_le_bytes());
@@ -1126,7 +1417,7 @@ mod tests {
     // ── F-9: wrapper terminal-state reader + terminal booking ──
 
     fn wrapper_market_with_mode(mode: u8) -> Vec<u8> {
-        let mut d = vec![0u8; 3675];
+        let mut d = vec![0u8; 3835]; // v2.2 cap-1 market: 592 + 806 + 2437
         d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
         d[8..10].copy_from_slice(&WRAPPER_SUPPORTED_VERSION.to_le_bytes());
         d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
@@ -1145,8 +1436,8 @@ mod tests {
     #[test]
     fn test_f9_read_wrapper_terminal() {
         use WrapperTerminal::*;
-        assert_eq!(WRAPPER_OFF_MODE, 1218);
-        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1350);
+        assert_eq!(WRAPPER_OFF_MODE, 1266); // v2.1: 1218
+        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1398);
         assert_eq!(
             read_wrapper_terminal(&wrapper_market_with_mode(0)),
             NotTerminal
@@ -1177,8 +1468,9 @@ mod tests {
         let mut t = tombstone();
         t[0] ^= 0xff;
         assert_eq!(read_wrapper_terminal(&t), UnknownLayout);
-        // Any other VERSION: 17 (v17 layout, mode elsewhere), 19 (future), 0.
-        for v in [0u16, 17, 19, u16::MAX] {
+        // Any other VERSION: 17 (v17 layout, mode elsewhere), 18 (v2.1: the mode byte is
+        // 48 B EARLIER, so trusting 1266 there would be a silent misread), 20 (future), 0.
+        for v in [0u16, 17, 18, 20, u16::MAX] {
             let mut m = wrapper_market_with_mode(1);
             m[8..10].copy_from_slice(&v.to_le_bytes());
             assert_eq!(
@@ -1226,6 +1518,64 @@ mod tests {
         // Empty / sub-header.
         assert_eq!(read_wrapper_terminal(&[]), UnknownLayout);
         assert_eq!(read_wrapper_terminal(&[0u8; 15]), UnknownLayout);
+    }
+
+    /// R-1 helper semantics, every pool history.
+    #[test]
+    fn r1_real_lp_helpers() {
+        let m = MINIMUM_LIQUIDITY;
+        let mut p = StakePool::zeroed();
+        // Empty fresh pool.
+        assert_eq!(
+            (p.dead_lp(), p.real_lp_supply(), p.has_real_lp_holders()),
+            (None, 0, false)
+        );
+
+        // Non-tranche genesis 5_000 (lock recorded before the supply increment).
+        p.record_floor_lock(false);
+        p.total_lp_supply = 5_000;
+        assert_eq!(p.dead_lp(), Some((m, 0)));
+        assert_eq!(p.real_lp_supply(), 5_000 - m);
+        p.total_lp_supply = m; // everyone out
+        assert!(!p.has_real_lp_holders());
+
+        // Tranches on later; first junior locks its own floor.
+        p.set_tranche_enabled(true);
+        p.record_floor_lock(true);
+        p.total_lp_supply = m + 3_000;
+        p.set_junior_total_lp(3_000);
+        assert_eq!(p.dead_lp(), Some((m, m)));
+        assert_eq!(
+            (p.real_senior_lp(), p.real_junior_lp(), p.real_lp_supply()),
+            (0, 2_000, 2_000)
+        );
+        p.total_lp_supply = 2 * m;
+        p.set_junior_total_lp(m);
+        assert!(!p.has_real_lp_holders(), "two floors, no real holder");
+
+        // Legacy pool (flags 0, one pre-fix floor): pre-fix F3 rule and routing.
+        let mut l = StakePool::zeroed();
+        l.set_tranche_enabled(true);
+        l.total_lp_supply = 1_500;
+        l.set_junior_total_lp(500);
+        assert_eq!(l.dead_lp(), None);
+        assert_eq!(
+            (l.real_lp_supply(), l.real_junior_lp(), l.real_senior_lp()),
+            (500, 500, 1_000)
+        );
+        // Legacy senior-genesis pool whose junior emptied: the next junior lock also
+        // records the legacy floor on the senior side, after which it is exact.
+        l.set_junior_total_lp(0);
+        l.total_lp_supply = 1_000;
+        l.record_floor_lock(true);
+        assert_eq!(l.dead_lp(), Some((m, m)));
+        // Legacy junior-genesis pool whose senior is empty: senior lock records junior's.
+        let mut k = StakePool::zeroed();
+        k.set_tranche_enabled(true);
+        k.total_lp_supply = 4_000;
+        k.set_junior_total_lp(4_000);
+        k.record_floor_lock(false);
+        assert_eq!(k.dead_lp(), Some((m, m)));
     }
 
     fn f9_pool(deposited: u64, flushed: u64, lp: u64) -> StakePool {
@@ -1329,9 +1679,9 @@ mod tests {
         // Ensure struct is packed correctly (no surprise padding)
         assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
         // v4 size: v3's 392 + pending_cooldown_slots[8] + cooldown_proposed_at_slot[8]
-        //   = 408. Both APPENDED after total_recovered_from_wrapper (384), so no
-        //   existing offset moves.
-        assert_eq!(STAKE_POOL_SIZE, 408);
+        //   = 408. v5 (Phase 4 item 6) APPENDS 72 bytes of first-loss fields at 408
+        //   = 480; no existing offset moves.
+        assert_eq!(STAKE_POOL_SIZE, 480);
     }
 
     #[test]
