@@ -377,10 +377,17 @@ mod kani_proofs {
         kani::assume(deposit <= 1_000_000_000);
 
         if let Some(lp) = calc_lp_for_deposit(supply, pv, deposit) {
-            // floor(deposit * supply / pv) * pv ≤ deposit * supply
-            let lhs = (lp as u128) * (pv as u128);
-            let rhs = (deposit as u128) * (supply as u128);
-            assert!(lhs <= rhs, "LP rounding not pool-favoring");
+            // N7 (9ec1c3a): lp = floor(deposit*(supply+1)/(pv+1)) (src/math.rs:81-83); the pool-favoring
+            // floor is lp*(pv+1) <= deposit*(supply+1) (= 2b53db6, never merged). The pre-N7 form is
+            // false for the correct code when pv > supply (e.g. 1,2,3 -> lp 2: 4 > 3) and is KEPT
+            // where it is implied (pv <= supply), so no input loses an assertion.
+            assert!((lp as u128) * (pv as u128 + 1) <= (deposit as u128) * (supply as u128 + 1),
+                "LP rounding not pool-favoring");
+            if pv <= supply {
+                assert!((lp as u128) * (pv as u128) <= (deposit as u128) * (supply as u128),
+                    "LP rounding not pool-favoring (pre-N7 form, pv <= supply)");
+            }
+            kani::cover!(pv > supply, "share price > 1 (the case the pre-N7 form got wrong)");
         }
     }
 
@@ -398,9 +405,17 @@ mod kani_proofs {
         kani::assume(lp <= supply);
 
         if let Some(col) = calc_collateral_for_withdraw(supply, pv, lp) {
-            let lhs = (col as u128) * (supply as u128);
-            let rhs = (lp as u128) * (pv as u128);
-            assert!(lhs <= rhs, "Withdrawal rounding not pool-favoring");
+            // N7 (9ec1c3a): col = floor(lp*(pv+1)/(supply+1)) (src/math.rs:118-121) -> floor fact
+            // col*(supply+1) <= lp*(pv+1) (= 2b53db6, never merged). The pre-N7 form is false for the
+            // correct code when supply > pv (e.g. 3,1,2 -> col 1: 3 > 2) and is KEPT where implied.
+            assert!((col as u128) * (supply as u128 + 1) <= (lp as u128) * (pv as u128 + 1),
+                "Withdrawal rounding not pool-favoring");
+            if supply <= pv {
+                assert!((col as u128) * (supply as u128) <= (lp as u128) * (pv as u128),
+                    "Withdrawal rounding not pool-favoring (pre-N7 form, supply <= pv)");
+            }
+            assert!(col <= pv, "withdrawal never exceeds pool value");
+            kani::cover!(supply > pv, "share price < 1 (the case the pre-N7 form got wrong)");
         }
     }
 
