@@ -155,6 +155,9 @@ mod kani_proofs {
         kani::assume(pv <= 1_000_000_000);
         kani::assume(amount <= 1_000_000_000);
         let _ = calc_lp_for_deposit(supply, pv, amount);
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(supply > 0 && calc_lp_for_deposit(supply, pv, amount).is_some_and(|lp| lp > 0), "pro-rata mint on a live pool");
+        kani::cover!(calc_lp_for_deposit(supply, pv, amount).is_none(), "refused branch");
     }
 
     /// PROOF: calc_collateral_for_withdraw never panics.
@@ -169,6 +172,9 @@ mod kani_proofs {
         kani::assume(pv <= 1_000_000_000);
         kani::assume(lp <= 1_000_000_000);
         let _ = calc_collateral_for_withdraw(supply, pv, lp);
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(calc_collateral_for_withdraw(supply, pv, lp).is_some_and(|c| c > 0), "non-zero payout");
+        kani::cover!(calc_collateral_for_withdraw(supply, pv, lp).is_none(), "refused branch");
     }
 
     /// PROOF: pool_value never panics.
@@ -357,6 +363,8 @@ mod kani_proofs {
             (Some(o), Some(n)) => assert!(n >= o, "Deposit must not decrease value"),
             _ => {} // overflow cases
         }
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(matches!((old, new), (Some(o), Some(n)) if n > o), "value strictly increases");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -441,6 +449,8 @@ mod kani_proofs {
 
         assert_eq!(senior_loss, 0, "Senior lost while junior was positive");
         assert_eq!(junior_loss, loss_amount, "Junior did not absorb full loss");
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(loss_amount > 0 && senior_balance > 0 && junior_loss == loss_amount, "real loss fully absorbed by junior with a senior tranche present");
     }
 
     #[kani::proof]
@@ -468,6 +478,8 @@ mod kani_proofs {
             senior_loss <= senior_balance,
             "Senior lost more than balance"
         );
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(junior_loss > 0 && senior_loss > 0, "loss spills past junior into senior");
     }
 
     #[kani::proof]
@@ -495,6 +507,8 @@ mod kani_proofs {
             jf as u128 + sf as u128 <= total_fee as u128,
             "Fee distribution exceeds total"
         );
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(jf > 0 && sf > 0, "both tranches receive a fee share");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -565,6 +579,8 @@ mod kani_proofs {
         if let Some(floor) = hwm_floor(tvl, bps) {
             assert!(floor <= tvl, "floor must never exceed HWM TVL");
         }
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(hwm_floor(tvl, bps).is_some_and(|f| f > 0 && f < tvl), "floor strictly inside (0, tvl)");
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -702,6 +718,8 @@ mod kani_proofs {
             junior_total_lp,
             "junior_total_lp clobbered by HWM"
         );
+        // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+        kani::cover!(tranche_enabled && junior_balance > 0 && junior_total_lp > 0, "non-trivial tranche fields survive the HWM writes");
     }
 
     // ── PR#83 HIGH: distribute_fees Overflow Safety ──
