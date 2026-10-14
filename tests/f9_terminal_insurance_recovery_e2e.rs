@@ -1595,6 +1595,7 @@ fn custody(w: &World) -> ([u8; 32], [u8; 32]) {
 ///   * BurnAssetAdmin now refuses with 47 (custody not bound); nothing burned.
 ///   * Tag 20 (authority back) also clears; a re-bind (tag 19) records a fresh seed and restores
 ///     custody; then the burn succeeds.
+///
 /// NEGATIVE CONTROL: on 8291e92 the record survives tag 22 (stale seed) and the burn succeeds
 /// with the operator on the creator.
 #[test]
