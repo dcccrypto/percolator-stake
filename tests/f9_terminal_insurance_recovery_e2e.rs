@@ -43,7 +43,13 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 // v5: the stake program is loaded at the id the wrapper's devnet build PINS (A6DVNubv, the v2.1 fresh id), so the
 // wrapper recognises the pool's vault_auth as the STAKE unit class (Phase 4 item 6). Every other
 // F-9 assertion is id-independent.
-const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
+/// I-3 (security review 2026-10-14): the stake program id the harness loads the stake .so at.
+/// Default = the v2.2 RC id the canonical RC wrapper pins. Set `E2E_STAKE_ID` (e.g. `7JrgAUHi…`)
+/// together with `F9_WRAPPER_SO` (a wrapper that pins THAT stake id, e.g. the deployed v2.2 dump)
+/// and `E2E_STAKE_SO` (a stake .so built with that id) to run against the deployed bytes.
+fn stake_id_str() -> String {
+    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+}
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v2.2 (wrapper VERSION 19) market account length for capacity 1: 592 + 806 + 2437.
@@ -78,6 +84,9 @@ const MARKET_INSURANCE_OFF: usize = percolator_stake::wrapper_layout::MARKET_INS
 const W_ENGINE_LOCK_ACTIVE: u32 = 21;
 
 fn stake_so() -> PathBuf {
+    if let Ok(p) = std::env::var("E2E_STAKE_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_stake.so");
     p
@@ -309,7 +318,7 @@ fn world(name: &str) -> Option<World> {
         return None;
     }
     let mut svm = LiteSVM::new().with_spl_programs();
-    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let stake_id = Pubkey::from_str(&stake_id_str()).unwrap();
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
     svm.add_program_from_file(stake_id, &so).unwrap();

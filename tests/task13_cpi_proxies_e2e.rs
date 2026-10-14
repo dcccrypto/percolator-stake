@@ -59,7 +59,13 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 // The stake program's canonical declared id (`solana_program::declare_id!` in
 // src/lib.rs). Loading the .so at its real id keeps every PDA derivation in this
 // file identical to production.
-const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
+/// I-3 (security review 2026-10-14): the stake program id the harness loads the stake .so at.
+/// Default = the v2.2 RC id the canonical RC wrapper pins. Set `E2E_STAKE_ID` (e.g. `7JrgAUHi…`)
+/// together with `F9_WRAPPER_SO` (a wrapper that pins THAT stake id, e.g. the deployed v2.2 dump)
+/// and `E2E_STAKE_SO` (a stake .so built with that id) to run against the deployed bytes.
+fn stake_id_str() -> String {
+    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+}
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
@@ -116,12 +122,18 @@ const S_TAG_ADMIN_UPDATE_BACKING_FEE_POLICY: u8 = 27;
 const S_TAG_ADMIN_UPDATE_TRADE_FEE_POLICY: u8 = 28;
 
 fn stake_so() -> PathBuf {
+    if let Ok(p) = std::env::var("E2E_STAKE_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_stake.so");
     p
 }
 
 fn wrapper_so() -> PathBuf {
+    if let Ok(p) = std::env::var("F9_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.push("percolator-prog/target/deploy/percolator_prog.so");
@@ -676,7 +688,7 @@ fn env() -> Option<Env> {
     }
     let mut svm = LiteSVM::new();
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
-    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let stake_id = Pubkey::from_str(&stake_id_str()).unwrap();
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
 
     svm.add_program_from_file(wrapper_id, wrapper_so()).unwrap();
