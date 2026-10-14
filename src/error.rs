@@ -154,6 +154,10 @@ pub enum StakeError {
     /// `insurance_authority` and `insurance_operator` are not BOTH this pool's `vault_auth` PDA
     /// (a rotated-back operator would keep a creator drain path behind a "burned" pool).
     InsuranceCustodyNotBound = 47,
+    /// M-1b (security review 2026-10-14): a v5 pool may only bind a single-asset market
+    /// (`max_market_slots == 1`): the pool takes custody of asset 0's insurance only, and other
+    /// assets' insurance belongs to their own authorities.
+    MultiAssetMarketNotSupported = 48,
 }
 
 impl From<StakeError> for ProgramError {
@@ -212,6 +216,7 @@ pub fn error_hint(code: u32) -> &'static str {
         43 => "Nothing to sync — the deployed value is within the hysteresis band of the target, or there is no spare liquidity",
         44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid",
         45 => "Insurance units mismatch — the wrapper did not mint or burn the expected stake units; the sync was reverted",
+        48 => "Multi-asset market not supported — a v5 staking pool can only bind a single-asset market",
         47 => "Insurance custody not bound — the market's insurance authority and operator must both be the pool's vault authority before the asset admin can be burned; re-bind first",
         46 => "Creator account required — the terminal insurance surplus belongs to the pool creator (pool.admin); pass pool.admin's token account for the pool collateral (S1)",
         _ => "Unknown error — check the error code and pool state",

@@ -1578,24 +1578,58 @@ pub fn read_wrapper_engine_insurance(data: &[u8]) -> Option<u128> {
     Some(u128::from_le_bytes(data.get(off..off + 16)?.try_into().ok()?))
 }
 
-/// M-1: `(insurance, credit_reserved, budget_total)` of a pinned-layout wrapper MARKET account
-/// (engine header u128s at 941 / 1085 / 1101). `None` for anything else; the caller refuses.
-/// Feed to `math::creator_seed_at_bind`.
-pub fn read_wrapper_insurance_parts(data: &[u8]) -> Option<(u128, u128, u128)> {
-    if !crate::wrapper_layout::header_is_pinned(data)
+/// M-1 / M-1b: the engine readings the close-out seed is measured from at bind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WrapperBindInsurance {
+    /// Engine header `insurance` (941), `vault` (925), `source_insurance_credit_reserved_total_atoms` (1085).
+    pub insurance: u128,
+    pub vault: u128,
+    pub credit_reserved: u128,
+    /// Engine `config.max_market_slots` (626).
+    pub max_market_slots: u32,
+    /// ASSET 0's own remaining budget: `(budget_long - spent_long) + (budget_short - spent_short)`
+    /// from its engine slot (3049 / 3065 / 3081 / 3097), i.e. the wrapper's
+    /// `market_insurance_remaining_view(group, 0)` before its `min(insurance)`.
+    pub asset0_budget_remaining: u128,
+    /// Asset 0's stale K/F cohorts (2759 / 2767): non-zero = a hidden loss reservation exists.
+    pub asset0_stale_long: u64,
+    pub asset0_stale_short: u64,
+}
+
+/// M-1 / M-1b: read [`WrapperBindInsurance`] from a pinned-layout wrapper MARKET account long
+/// enough to hold asset 0's engine slot fields. `None` for anything else, or a corrupt
+/// `spent > budget` (the engine's own `domain_budget_remaining_parts` fails there too); the
+/// caller refuses.
+pub fn read_wrapper_bind_insurance(data: &[u8]) -> Option<WrapperBindInsurance> {
+    use crate::wrapper_layout as wl;
+    if !wl::header_is_pinned(data)
         || data.get(WRAPPER_OFF_KIND) != Some(&WRAPPER_KIND_MARKET)
         || data.len() < WRAPPER_MIN_MARKET_LEN
     {
         return None;
     }
-    let rd = |off: usize| -> Option<u128> {
+    let r128 = |off: usize| -> Option<u128> {
         Some(u128::from_le_bytes(data.get(off..off + 16)?.try_into().ok()?))
     };
-    Some((
-        rd(crate::wrapper_layout::MARKET_INSURANCE_OFF)?,
-        rd(crate::wrapper_layout::MARKET_INS_CREDIT_RESERVED_OFF)?,
-        rd(crate::wrapper_layout::MARKET_INS_BUDGET_TOTAL_OFF)?,
-    ))
+    let r64 = |off: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(data.get(off..off + 8)?.try_into().ok()?))
+    };
+    let long = r128(wl::ASSET0_INS_BUDGET_LONG_OFF)?.checked_sub(r128(wl::ASSET0_INS_SPENT_LONG_OFF)?)?;
+    let short =
+        r128(wl::ASSET0_INS_BUDGET_SHORT_OFF)?.checked_sub(r128(wl::ASSET0_INS_SPENT_SHORT_OFF)?)?;
+    Some(WrapperBindInsurance {
+        insurance: r128(wl::MARKET_INSURANCE_OFF)?,
+        vault: r128(wl::MARKET_VAULT_OFF)?,
+        credit_reserved: r128(wl::MARKET_INS_CREDIT_RESERVED_OFF)?,
+        max_market_slots: u32::from_le_bytes(
+            data.get(wl::MARKET_MAX_MARKET_SLOTS_OFF..wl::MARKET_MAX_MARKET_SLOTS_OFF + 4)?
+                .try_into()
+                .ok()?,
+        ),
+        asset0_budget_remaining: long.checked_add(short)?,
+        asset0_stale_long: r64(wl::ASSET0_STALE_COUNT_LONG_OFF)?,
+        asset0_stale_short: r64(wl::ASSET0_STALE_COUNT_SHORT_OFF)?,
+    })
 }
 
 /// M-2: asset 0's `(insurance_authority, insurance_operator)` of a pinned-layout wrapper MARKET

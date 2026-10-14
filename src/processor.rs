@@ -2241,9 +2241,10 @@ fn process_bind_insurance_authority(
     }
 
     // CLOSE-OUT RULE (2026-10-14, every v5 mode): record the creator's insurance seed = the
-    // creator's OWN money in the fund at the moment the pool takes custody of it (M-1, security
-    // review 2026-10-14): the BUDGETED insurance (what the authority/operator could withdraw),
-    // capped by insurance net of reserved credit (`math::creator_seed_at_bind`). Other parties'
+    // creator's OWN money in the fund at the moment the pool takes custody of it (M-1 / M-1b,
+    // security reviews 2026-10-14): ASSET 0's budgeted insurance (what its authority/operator
+    // could withdraw) net of reserved credit, capped by insurance and the vault
+    // (`math::creator_seed_at_bind`); single-asset markets only, no stale K/F cohort. Other parties'
     // claims inside the engine insurance (protocol / LP / staker-reserve / creator fee legs,
     // unrouted rent, reserved credit) are NOT the creator's seed. Before this bind the admin is
     // the insurance authority; after it only `vault_auth` can top up (wrapper tag 9
@@ -2259,13 +2260,26 @@ fn process_bind_insurance_authority(
         if slab.owner != percolator_program.key {
             return Err(ProgramError::IllegalOwner);
         }
-        let (insurance, credit_reserved, budget_total) =
-            state::read_wrapper_insurance_parts(&slab.try_borrow_data()?)
-                .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        let b = state::read_wrapper_bind_insurance(&slab.try_borrow_data()?)
+            .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        // M-1b: the pool takes custody of ASSET 0's insurance only. On a multi-asset market other
+        // assets' budgets belong to their own authorities (and FIRST_LOSS cannot unitise one).
+        if b.max_market_slots != 1 {
+            msg!("BindInsuranceAuthority: v5 pools bind single-asset markets only");
+            return Err(StakeError::MultiAssetMarketNotSupported.into());
+        }
+        // M-1b LOW: a stale K/F cohort on asset 0 carries a hidden loss reservation the wrapper
+        // keeps out of withdrawals; this program cannot compute it, so wait for the cohort to be
+        // settled (a crank) rather than count it as the creator's seed.
+        if b.asset0_stale_long != 0 || b.asset0_stale_short != 0 {
+            msg!("BindInsuranceAuthority: asset 0 has a stale K/F cohort; crank, then bind");
+            return Err(StakeError::InsuranceReadingsDiverged.into());
+        }
         Some(crate::math::creator_seed_at_bind(
-            insurance,
-            credit_reserved,
-            budget_total,
+            b.insurance,
+            b.vault,
+            b.credit_reserved,
+            b.asset0_budget_remaining,
             net_deployed,
         ))
     } else {

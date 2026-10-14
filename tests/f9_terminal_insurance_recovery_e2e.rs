@@ -69,6 +69,8 @@ const E_NOTHING_TO_RECOVER: u32 = 31;
 const E_UNSUPPORTED_WRAPPER_LAYOUT: u32 = 32;
 const E_CREATOR_ACCOUNT_REQUIRED: u32 = 46;
 const E_INSURANCE_CUSTODY_NOT_BOUND: u32 = 47;
+const E_MULTI_ASSET_NOT_SUPPORTED: u32 = 48;
+const E_INSURANCE_READINGS_DIVERGED: u32 = 44;
 /// FEE_ONLY growth-plan reading: the engine `insurance` balance in a market account (pinned
 /// v2.2 layout; `wrapper_layout::MARKET_INSURANCE_OFF`).
 const MARKET_INSURANCE_OFF: usize = percolator_stake::wrapper_layout::MARKET_INSURANCE_OFF;
@@ -260,6 +262,20 @@ thread_local! {
     /// M-1: atoms of a NON-creator claim (the staker-reserve fee leg, i.e. trade fees owed to
     /// someone else) forged into the engine insurance just before the bind. 0 = none.
     static PRE_BIND_CLAIM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// M-1b: a forge run on the market just before the bind; and whether `world` binds at all.
+    static PRE_BIND: std::cell::Cell<Option<fn(&mut World)>> = const { std::cell::Cell::new(None) };
+    static SKIP_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn market_rd128(w: &World, off: usize) -> u128 {
+    let d = w.svm.get_account(&w.market).unwrap().data;
+    u128::from_le_bytes(d[off..off + 16].try_into().unwrap())
+}
+
+fn market_wr(w: &mut World, off: usize, bytes: &[u8]) {
+    let mut m = w.svm.get_account(&w.market).unwrap();
+    m.data[off..off + bytes.len()].copy_from_slice(bytes);
+    w.svm.set_account(w.market, m).unwrap();
 }
 
 /// M-1: forge `x` atoms of another party's claim inside the engine insurance, exactly as an
@@ -459,6 +475,12 @@ fn world(name: &str) -> Option<World> {
     let claim = PRE_BIND_CLAIM.with(|c| c.get());
     if claim > 0 {
         forge_unbudgeted_claim(&mut w, claim);
+    }
+    if let Some(f) = PRE_BIND.with(|c| c.get()) {
+        f(&mut w);
+    }
+    if SKIP_BIND.with(|c| c.get()) {
+        return Some(w);
     }
     // Real Bind (tag 19). FEE_ONLY growth-plan reading: the pool is writable (the bind records
     // the creator's seed = the engine insurance now, i.e. BUDGET).
@@ -1532,6 +1554,11 @@ fn closeout_m1_seed_excludes_other_claims_in_insurance_forged_fee_leg() {
         "PIN: real wrapper budget total at 1101 == the creator's top-up"
     );
     assert_eq!(rd(percolator_stake::wrapper_layout::MARKET_INS_CREDIT_RESERVED_OFF), 0, "PIN 1085");
+    let b = percolator_stake::state::read_wrapper_bind_insurance(&m.data).expect("pinned");
+    assert_eq!(b.max_market_slots, 1, "PIN: max_market_slots @626 on the real wrapper");
+    assert_eq!(b.asset0_budget_remaining, BUDGET as u128, "PIN: asset-0 slot budget/spent @3049..3113");
+    assert_eq!((b.asset0_stale_long, b.asset0_stale_short), (0, 0), "PIN: stale counts @2759/2767");
+    assert_eq!(b.vault, rd(percolator_stake::wrapper_layout::MARKET_INSURANCE_OFF - 16), "PIN vault @925");
     let p = read_pool(&w.svm, &w.pool);
     assert!(p.creator_seed_recorded());
     assert_eq!(p.creator_seed_atoms(), BUDGET, "seed = the creator's own (budgeted) money");
@@ -1633,4 +1660,90 @@ fn closeout_m2_rotate_back_clears_seed_and_burn_requires_custody() {
     let r = burn(&mut w);
     assert!(r.is_ok(), "burn with custody bound: {}", logs(&r));
     assert!(read_pool(&w.svm, &w.pool).asset_admin_burned());
+}
+
+// ── Delta review 22c6de5: M-1b (asset 0 only, single-asset markets, no hidden K/F reservation) ──
+
+/// M-1b: another asset's insurance budget is NOT the creator's asset-0 seed. FORGED (the harness
+/// cannot activate a second asset): 3M of budget that is not asset 0's is added to the engine's
+/// GROUP-WIDE budget total (1101), the insurance (941) and the vault (925), exactly what an
+/// activated asset 1 with a 3M top-up adds to those header aggregates; asset 0's own slot
+/// budget is untouched. The seed is asset 0's budget (BUDGET), not BUDGET + 3M.
+/// NEGATIVE CONTROL: on 22c6de5 the seed reads the group-wide total, BUDGET + 3M.
+#[test]
+fn closeout_m1b_seed_is_asset0_budget_not_group_total_forged() {
+    fn forge(w: &mut World) {
+        use percolator_stake::wrapper_layout as wl;
+        const X: u128 = 3_000_000;
+        for off in [wl::MARKET_INS_BUDGET_TOTAL_OFF, wl::MARKET_INSURANCE_OFF, wl::MARKET_VAULT_OFF] {
+            let v = market_rd128(w, off) + X;
+            market_wr(w, off, &v.to_le_bytes());
+        }
+        let bal = token_amount(&w.svm, &w.wrapper_vault);
+        let (wv, mint, wva) = (w.wrapper_vault, w.mint, w.wrapper_vault_auth);
+        set_token_account(&mut w.svm, wv, &mint, &wva, bal + X as u64);
+    }
+    PRE_BIND.with(|c| c.set(Some(forge)));
+    let w = world("closeout_m1b_seed_is_asset0_budget_not_group_total_forged");
+    PRE_BIND.with(|c| c.set(None));
+    let Some(w) = w else { return };
+    assert_eq!(
+        market_rd128(&w, percolator_stake::wrapper_layout::MARKET_INS_BUDGET_TOTAL_OFF),
+        (BUDGET + 3_000_000) as u128,
+        "PRE: group-wide total includes the other asset's budget"
+    );
+    let p = read_pool(&w.svm, &w.pool);
+    assert!(p.creator_seed_recorded());
+    assert_eq!(p.creator_seed_atoms(), BUDGET, "seed = asset 0's own budget only");
+}
+
+/// M-1b belt and braces: a v5 bind refuses a multi-asset market (48) before any CPI; custody does
+/// not move. FORGED: `max_market_slots` (626) = 2 on the real market just before the bind (the
+/// byte the wrapper's own units ledger refuses on, W-10). Restoring 1 lets the same bind succeed.
+/// NEGATIVE CONTROL: on 22c6de5 the stake program never reads the byte (the bind is not refused
+/// with 48).
+#[test]
+fn closeout_m1b_multi_asset_bind_refused_forged() {
+    SKIP_BIND.with(|c| c.set(true));
+    let w = world("closeout_m1b_multi_asset_bind_refused_forged");
+    SKIP_BIND.with(|c| c.set(false));
+    let Some(mut w) = w else { return };
+    let off = percolator_stake::wrapper_layout::MARKET_MAX_MARKET_SLOTS_OFF;
+    let d = w.svm.get_account(&w.market).unwrap().data;
+    assert_eq!(u32::from_le_bytes(d[off..off + 4].try_into().unwrap()), 1, "PIN @626");
+    let me = w.admin.pubkey().to_bytes();
+    market_wr(&mut w, off, &2u32.to_le_bytes());
+    let r = bind_again(&mut w, true);
+    assert_eq!(custom(&r), Some(E_MULTI_ASSET_NOT_SUPPORTED), "{}", logs(&r));
+    assert_eq!(custody(&w), (me, me), "custody unchanged");
+    assert!(!read_pool(&w.svm, &w.pool).creator_seed_recorded());
+    market_wr(&mut w, off, &1u32.to_le_bytes());
+    let r = bind_again(&mut w, true);
+    assert!(r.is_ok(), "control: single-asset bind works: {}", logs(&r));
+    assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
+}
+
+/// M-1b LOW: a stale K/F cohort on asset 0 (hidden loss reservation the wrapper keeps out of
+/// withdrawals) makes the v5 bind wait (44) rather than count it as seed. FORGED stale count
+/// (2759 / 2767). Clearing it lets the bind succeed.
+/// NEGATIVE CONTROL: on 22c6de5 the bind succeeds with the stale cohort present.
+#[test]
+fn closeout_m1b_stale_kf_cohort_bind_waits_forged() {
+    SKIP_BIND.with(|c| c.set(true));
+    let w = world("closeout_m1b_stale_kf_cohort_bind_waits_forged");
+    SKIP_BIND.with(|c| c.set(false));
+    let Some(mut w) = w else { return };
+    use percolator_stake::wrapper_layout as wl;
+    for off in [wl::ASSET0_STALE_COUNT_LONG_OFF, wl::ASSET0_STALE_COUNT_SHORT_OFF] {
+        let d = w.svm.get_account(&w.market).unwrap().data;
+        assert_eq!(u64::from_le_bytes(d[off..off + 8].try_into().unwrap()), 0, "PIN");
+        market_wr(&mut w, off, &1u64.to_le_bytes());
+        let r = bind_again(&mut w, true);
+        assert_eq!(custom(&r), Some(E_INSURANCE_READINGS_DIVERGED), "{}", logs(&r));
+        assert!(!read_pool(&w.svm, &w.pool).creator_seed_recorded());
+        market_wr(&mut w, off, &0u64.to_le_bytes());
+    }
+    let r = bind_again(&mut w, true);
+    assert!(r.is_ok(), "control: {}", logs(&r));
+    assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
 }

@@ -1157,30 +1157,47 @@ mod kani_proofs {
         kani::cover!(forwarded > 0 && c > 0, "COVER: partial call after an earlier forward");
     }
 
-    /// PROOF CLOSE-OUT M-1 (`kani_closeout_seed_at_bind_excludes_claims`) on the REAL
-    /// `math::creator_seed_at_bind`: the seed is never above the budgeted slice (the creator's own,
-    /// withdrawable money), never above insurance net of reserved credit, exactly
-    /// `min(budget, insurance - reserved) - deployed`, and adding any other party's claim to the
-    /// insurance (outside the budget) never lifts it above the budget. Bounded u32 inputs.
-    /// MUTANTS: (M1) 8291e92's raw insurance; (M2) the budget ignored; (M3) reserved ignored.
+    /// PROOF CLOSE-OUT M-1 / M-1b (`kani_closeout_seed_at_bind_excludes_claims`) on the REAL
+    /// `math::creator_seed_at_bind`: the seed is never above asset 0's own budget net of reserved
+    /// credit, never above insurance net of reserved credit, never above the vault, exactly
+    /// `min(budget - reserved, insurance - reserved, vault) - deployed`, and adding any other
+    /// party's claim (fee legs, rent, ANOTHER ASSET's budget) to the insurance and the vault never
+    /// lifts it above asset 0's budget. Bounded u32 inputs.
+    /// MUTANTS: (M1) 8291e92's raw insurance; (M2) 22c6de5's group-wide budget (= budget + claim);
+    /// (M3) reserved ignored; (M4) vault cap ignored.
     #[kani::proof]
     fn kani_closeout_seed_at_bind_excludes_claims() {
         let insurance = kani::any::<u32>() as u128;
+        let vault = kani::any::<u32>() as u128;
         let reserved = kani::any::<u32>() as u128;
         let budget = kani::any::<u32>() as u128;
         let claim = kani::any::<u32>() as u128;
         let deployed = kani::any::<u32>() as u64;
-        let seed = percolator_stake::math::creator_seed_at_bind(insurance, reserved, budget, deployed);
-        assert!(seed as u128 <= budget);
+        let seed =
+            percolator_stake::math::creator_seed_at_bind(insurance, vault, reserved, budget, deployed);
+        assert!(seed as u128 <= budget.saturating_sub(reserved));
         assert!(seed as u128 <= insurance.saturating_sub(reserved));
-        let own = budget.min(insurance.saturating_sub(reserved)) as u64;
+        assert!(seed as u128 <= vault);
+        let own = budget
+            .saturating_sub(reserved)
+            .min(insurance.saturating_sub(reserved))
+            .min(vault) as u64;
         assert_eq!(seed, own.saturating_sub(deployed));
-        let with_claim =
-            percolator_stake::math::creator_seed_at_bind(insurance + claim, reserved, budget, deployed);
-        assert!(with_claim as u128 <= budget, "another party's claim never lifts the seed");
+        let with_claim = percolator_stake::math::creator_seed_at_bind(
+            insurance + claim,
+            vault + claim,
+            reserved,
+            budget,
+            deployed,
+        );
+        assert!(
+            with_claim as u128 <= budget.saturating_sub(reserved),
+            "another party's claim never lifts the seed"
+        );
         kani::cover!(insurance > budget && seed as u128 == budget && deployed == 0, "COVER: fee legs excluded");
         kani::cover!(insurance < budget && seed > 0, "COVER: losses below the budget");
         kani::cover!(reserved > 0 && seed > 0, "COVER: reserved credit excluded");
+        kani::cover!(vault < insurance && seed as u128 == vault && vault > 0, "COVER: vault cap");
     }
 
     /// PROOF CLOSE-OUT (`kani_closeout_settlement_conserves`) on the REAL `StakePool`

@@ -72,6 +72,22 @@ pub const GROUP_INS_CREDIT_RESERVED_OFF: usize = 493;
 /// all outside it (wrapper CloseSlab: `unbudgeted = I - reserved - budget - rent_unrouted`).
 /// Engine 3ce4cbd1 layout dump: 509.
 pub const GROUP_INS_BUDGET_TOTAL_OFF: usize = 509;
+/// Header-relative `config.max_market_slots` (u32 LE; `V16ConfigAccount` offset 2 + the 32-byte
+/// group id). M-1b: the close-out seed is recorded only on single-asset markets.
+/// `offset_of!` against engine 3ce4cbd1: 34.
+pub const GROUP_MAX_MARKET_SLOTS_OFF: usize = 34;
+/// Header-relative engine `vault` (u128 LE). `offset_of!` against engine 3ce4cbd1: 333.
+pub const GROUP_VAULT_OFF: usize = 333;
+/// `AssetStateV16Account` (first field of the engine slot) offsets, engine 3ce4cbd1:
+/// `stale_account_count_long` / `_short` (u64 LE). M-1b LOW: a stale K/F cohort carries a hidden
+/// loss reservation the stake program cannot compute, so the bind fails closed while either > 0.
+pub const ASSET_STALE_COUNT_LONG_OFF: usize = 337;
+pub const ASSET_STALE_COUNT_SHORT_OFF: usize = 345;
+/// `EngineAssetSlotV16Account` per-domain insurance budget / spent (u128 LE), engine 3ce4cbd1.
+pub const SLOT_INS_BUDGET_LONG_OFF: usize = 627;
+pub const SLOT_INS_BUDGET_SHORT_OFF: usize = 643;
+pub const SLOT_INS_SPENT_LONG_OFF: usize = 659;
+pub const SLOT_INS_SPENT_SHORT_OFF: usize = 675;
 
 /// Fixed wrapper-owned region at the start of every asset slot (`Market.wrapper`).
 pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
@@ -114,6 +130,16 @@ pub const MARKET_MODE_OFF: usize = MARKET_GROUP_OFF + GROUP_MODE_OFF;
 pub const MARKET_INSURANCE_OFF: usize = MARKET_GROUP_OFF + GROUP_INSURANCE_OFF;
 pub const MARKET_INS_CREDIT_RESERVED_OFF: usize = MARKET_GROUP_OFF + GROUP_INS_CREDIT_RESERVED_OFF;
 pub const MARKET_INS_BUDGET_TOTAL_OFF: usize = MARKET_GROUP_OFF + GROUP_INS_BUDGET_TOTAL_OFF;
+pub const MARKET_MAX_MARKET_SLOTS_OFF: usize = MARKET_GROUP_OFF + GROUP_MAX_MARKET_SLOTS_OFF;
+pub const MARKET_VAULT_OFF: usize = MARKET_GROUP_OFF + GROUP_VAULT_OFF;
+/// Start of asset 0's engine slot (`Market.engine`, after the 1024-byte wrapper region).
+pub const ASSET0_ENGINE_SLOT_OFF: usize = ASSET0_MARKET_ID_OFF;
+pub const ASSET0_STALE_COUNT_LONG_OFF: usize = ASSET0_ENGINE_SLOT_OFF + ASSET_STALE_COUNT_LONG_OFF;
+pub const ASSET0_STALE_COUNT_SHORT_OFF: usize = ASSET0_ENGINE_SLOT_OFF + ASSET_STALE_COUNT_SHORT_OFF;
+pub const ASSET0_INS_BUDGET_LONG_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_BUDGET_LONG_OFF;
+pub const ASSET0_INS_BUDGET_SHORT_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_BUDGET_SHORT_OFF;
+pub const ASSET0_INS_SPENT_LONG_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_SPENT_LONG_OFF;
+pub const ASSET0_INS_SPENT_SHORT_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_SPENT_SHORT_OFF;
 pub const ASSET0_INSURANCE_AUTHORITY_OFF: usize = ASSET0_WRAPPER_START + ASSET_INSURANCE_AUTHORITY_OFF;
 pub const ASSET0_INSURANCE_OPERATOR_OFF: usize = ASSET0_WRAPPER_START + ASSET_INSURANCE_OPERATOR_OFF;
 /// Shortest market account that can hold the engine header (and so the `mode` byte).
@@ -133,6 +159,16 @@ const _: () = assert!(MARKET_MODE_OFF == 1266);
 const _: () = assert!(MARKET_INSURANCE_OFF == 941);
 const _: () = assert!(MARKET_INS_CREDIT_RESERVED_OFF == 1085);
 const _: () = assert!(MARKET_INS_BUDGET_TOTAL_OFF == 1101);
+const _: () = assert!(MARKET_MAX_MARKET_SLOTS_OFF == 626);
+const _: () = assert!(MARKET_VAULT_OFF == 925);
+const _: () = assert!(ASSET0_ENGINE_SLOT_OFF == 2422);
+const _: () = assert!(ASSET0_STALE_COUNT_LONG_OFF == 2759);
+const _: () = assert!(ASSET0_STALE_COUNT_SHORT_OFF == 2767);
+const _: () = assert!(ASSET0_INS_BUDGET_LONG_OFF == 3049);
+const _: () = assert!(ASSET0_INS_BUDGET_SHORT_OFF == 3065);
+const _: () = assert!(ASSET0_INS_SPENT_LONG_OFF == 3081);
+const _: () = assert!(ASSET0_INS_SPENT_SHORT_OFF == 3097);
+const _: () = assert!(GROUP_MAX_MARKET_SLOTS_OFF + 4 <= MARKET_GROUP_LEN);
 const _: () = assert!(ASSET0_INSURANCE_AUTHORITY_OFF == 1422);
 const _: () = assert!(ASSET0_INSURANCE_OPERATOR_OFF == 1454);
 const _: () = assert!(GROUP_INS_BUDGET_TOTAL_OFF + 16 <= MARKET_GROUP_LEN);

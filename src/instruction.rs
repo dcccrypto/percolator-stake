@@ -203,9 +203,11 @@ pub enum StakeInstruction {
     ///
     /// CLOSE-OUT RULE (2026-10-14, every v5 pool: FIRST_LOSS and FEE_ONLY): the bind also
     /// records the creator's insurance seed = the creator's own money in the fund now
-    /// (`math::creator_seed_at_bind`: budgeted insurance, wrapper market byte 1101, capped by
-    /// insurance 941 minus reserved credit 1085; pool bytes 457..464 + flag byte 333 bit 0),
-    /// which caps what the
+    /// (`math::creator_seed_at_bind`: ASSET 0's remaining budget minus reserved credit, capped by
+    /// insurance minus reserved credit and by the engine vault; pool bytes 457..464 + flag byte
+    /// 333 bit 0). A v5 bind refuses a multi-asset market (`MultiAssetMarketNotSupported`, 48)
+    /// and waits while asset 0 has a stale K/F cohort (`InsuranceReadingsDiverged`, 44: crank,
+    /// then bind). The seed caps what the
     /// terminal settlement returns to the creator. The pool account must be writable for every
     /// v5 pool (`InvalidAccount`, 16, if not) and the market must be on the pinned layout
     /// (`UnsupportedWrapperLayout`, 32). A FEE_ONLY re-bind (after tag 20) overwrites it.

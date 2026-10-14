@@ -602,29 +602,39 @@ pub fn closeout_creator_share(
     surplus.min(entitled.saturating_sub(forwarded))
 }
 
-/// CLOSE-OUT RULE, M-1 (security review 2026-10-14): the creator's seed measured at bind = the
-/// creator's OWN money in the fund, i.e. the slice the insurance authority could withdraw:
+/// CLOSE-OUT RULE, M-1 / M-1b (security reviews 2026-10-14): the creator's seed measured at bind
+/// = the creator's OWN money in the fund the pool takes custody of, i.e. what asset 0's insurance
+/// authority could withdraw at that moment (a conservative lower bound of the wrapper's
+/// `market_insurance_withdraw_capacity_view(group, 0)`):
 ///
 /// ```text
-/// seed = min(budget_total, insurance - credit_reserved) - net_deployed     (saturating, u64)
+/// seed = min(asset0_budget - reserved, insurance - reserved, vault) - net_deployed   (saturating, u64)
 /// ```
 ///
-/// * `budget_total` (`insurance_domain_budget_remaining_total`) excludes by construction every
-///   other party's claim inside `insurance`: the protocol / LP / staker-reserve (tag 87) /
-///   creator fee legs (paid by their own tags; the creator fee leg would otherwise be counted
-///   twice), unrouted rent (the vault LP's claim) and reserved source credit.
-/// * `insurance - credit_reserved` caps it where losses spent insurance below the budgets.
+/// * `asset0_budget`: ASSET 0's own remaining budget (its two domains), never the group-wide
+///   total (M-1b: another asset's budget belongs to that asset's authority, which the bind does not
+///   take over). The budget excludes by construction every other party's claim inside
+///   `insurance`: protocol / LP / staker-reserve / creator fee legs and unrouted rent.
+/// * `reserved`: the GLOBAL reserved source credit, subtracted from the budget too. The wrapper
+///   subtracts each domain's own reservation (<= the global total), so this never over-counts.
+/// * `vault`: the wrapper caps every withdrawal at the engine vault.
+/// * The hidden K/F loss reservation is not computed here: the bind refuses while asset 0 has a
+///   stale cohort (then the reservation is exactly 0, engine `kernel_kf_hidden_loss_bound`).
 /// * `net_deployed`: staker principal deployed and not recovered (always 0 at bind; defensive).
 ///
-/// Always `seed <= budget_total`, `seed <= insurance - credit_reserved <= insurance`.
+/// Always `seed <= asset0_budget`, `seed <= insurance - reserved`, `seed <= vault`.
 /// Kani: `kani_closeout_seed_at_bind_excludes_claims`.
 pub fn creator_seed_at_bind(
     insurance: u128,
+    vault: u128,
     credit_reserved: u128,
-    budget_total: u128,
+    asset0_budget: u128,
     net_deployed: u64,
 ) -> u64 {
-    let own = budget_total.min(insurance.saturating_sub(credit_reserved));
+    let own = asset0_budget
+        .saturating_sub(credit_reserved)
+        .min(insurance.saturating_sub(credit_reserved))
+        .min(vault);
     u64::try_from(own)
         .unwrap_or(u64::MAX)
         .saturating_sub(net_deployed)

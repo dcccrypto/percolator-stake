@@ -132,45 +132,75 @@ fn closeout_first_loss_growth_on_creator_units_goes_to_stakers() {
     assert_eq!(q.closeout_creator_share(9_000_000, Some(3_000_000)), 3_000_000);
 }
 
-/// M-1 (security review 2026-10-14): the seed at bind is the budgeted slice only; other
-/// parties' claims in the insurance (fee legs, rent, reserved credit) never raise it.
-/// NEGATIVE CONTROL: 8291e92 recorded the raw insurance (here 7M / 12M).
+/// M-1 / M-1b (security reviews 2026-10-14): the seed at bind is asset 0's own budget net of
+/// reserved credit, capped by insurance net of reserved credit and by the vault; other parties'
+/// claims in the insurance (fee legs, rent, other assets' budgets) never raise it.
+/// NEGATIVE CONTROL: 8291e92 recorded the raw insurance (7M / 12M); 22c6de5 the group-wide budget.
 #[test]
 fn closeout_m1_seed_at_bind_examples() {
+    // args: insurance, vault, reserved, asset-0 budget, deployed
     // 5M budgeted (the creator's top-up) + 2M fee legs: seed 5M.
-    assert_eq!(creator_seed_at_bind(7_000_000, 0, 5_000_000, 0), 5_000_000);
-    // + 5M reserved credit: still 5M.
-    assert_eq!(creator_seed_at_bind(12_000_000, 5_000_000, 5_000_000, 0), 5_000_000);
-    // Losses spent insurance below the budgets: capped at insurance - reserved.
-    assert_eq!(creator_seed_at_bind(4_000_000, 1_000_000, 5_000_000, 0), 3_000_000);
-    assert_eq!(creator_seed_at_bind(1, 2, 5_000_000, 0), 0);
+    assert_eq!(creator_seed_at_bind(7_000_000, 7_000_000, 0, 5_000_000, 0), 5_000_000);
+    // + 5M reserved credit: the reservation is not the creator's either.
+    assert_eq!(creator_seed_at_bind(12_000_000, 12_000_000, 5_000_000, 5_000_000, 0), 0);
+    assert_eq!(creator_seed_at_bind(12_000_000, 12_000_000, 1_000_000, 5_000_000, 0), 4_000_000);
+    // Losses spent insurance below the budget: capped at insurance - reserved.
+    assert_eq!(creator_seed_at_bind(4_000_000, 9_000_000, 1_000_000, 5_000_000, 0), 3_000_000);
+    // Vault cap.
+    assert_eq!(creator_seed_at_bind(7_000_000, 2_000_000, 0, 5_000_000, 0), 2_000_000);
+    assert_eq!(creator_seed_at_bind(1, 1, 2, 5_000_000, 0), 0);
     // Defensive: net deployed staker principal is never the creator's.
-    assert_eq!(creator_seed_at_bind(7_000_000, 0, 5_000_000, 6_000_000), 0);
-    assert_eq!(creator_seed_at_bind(u128::MAX, 0, u128::MAX, 0), u64::MAX);
+    assert_eq!(creator_seed_at_bind(7_000_000, 7_000_000, 0, 5_000_000, 6_000_000), 0);
+    assert_eq!(creator_seed_at_bind(u128::MAX, u128::MAX, 0, u128::MAX, 0), u64::MAX);
 }
 
 /// M-1 / M-2 readers on synthetic pinned-layout bytes, and the record clear.
 #[test]
 fn closeout_m1_m2_readers_and_clear() {
     use percolator_stake::wrapper_layout as wl;
-    let mut d = vec![0u8; wl::ASSET0_INSURANCE_OPERATOR_OFF + 32];
+    let mut d = vec![0u8; wl::ASSET0_INS_SPENT_SHORT_OFF + 16];
     d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
     d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
     d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
-    d[wl::MARKET_INSURANCE_OFF..wl::MARKET_INSURANCE_OFF + 16].copy_from_slice(&7u128.to_le_bytes());
-    d[wl::MARKET_INS_CREDIT_RESERVED_OFF..wl::MARKET_INS_CREDIT_RESERVED_OFF + 16].copy_from_slice(&1u128.to_le_bytes());
-    d[wl::MARKET_INS_BUDGET_TOTAL_OFF..wl::MARKET_INS_BUDGET_TOTAL_OFF + 16].copy_from_slice(&5u128.to_le_bytes());
+    let put = |d: &mut Vec<u8>, off: usize, v: u128| d[off..off + 16].copy_from_slice(&v.to_le_bytes());
+    put(&mut d, wl::MARKET_INSURANCE_OFF, 70);
+    put(&mut d, wl::MARKET_VAULT_OFF, 90);
+    put(&mut d, wl::MARKET_INS_CREDIT_RESERVED_OFF, 1);
+    put(&mut d, wl::MARKET_INS_BUDGET_TOTAL_OFF, 999); // group-wide: must NOT be read
+    put(&mut d, wl::ASSET0_INS_BUDGET_LONG_OFF, 30);
+    put(&mut d, wl::ASSET0_INS_BUDGET_SHORT_OFF, 20);
+    put(&mut d, wl::ASSET0_INS_SPENT_LONG_OFF, 4);
+    put(&mut d, wl::ASSET0_INS_SPENT_SHORT_OFF, 1);
+    d[wl::MARKET_MAX_MARKET_SLOTS_OFF..wl::MARKET_MAX_MARKET_SLOTS_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+    d[wl::ASSET0_STALE_COUNT_SHORT_OFF..wl::ASSET0_STALE_COUNT_SHORT_OFF + 8].copy_from_slice(&3u64.to_le_bytes());
     d[wl::ASSET0_INSURANCE_AUTHORITY_OFF..wl::ASSET0_INSURANCE_AUTHORITY_OFF + 32].copy_from_slice(&[3; 32]);
     d[wl::ASSET0_INSURANCE_OPERATOR_OFF..wl::ASSET0_INSURANCE_OPERATOR_OFF + 32].copy_from_slice(&[4; 32]);
-    assert_eq!(state::read_wrapper_insurance_parts(&d), Some((7, 1, 5)));
+    let b = state::read_wrapper_bind_insurance(&d).unwrap();
+    assert_eq!(
+        b,
+        state::WrapperBindInsurance {
+            insurance: 70,
+            vault: 90,
+            credit_reserved: 1,
+            max_market_slots: 1,
+            asset0_budget_remaining: 45,
+            asset0_stale_long: 0,
+            asset0_stale_short: 3,
+        }
+    );
     assert_eq!(state::read_wrapper_asset0_insurance_keys(&d), Some(([3; 32], [4; 32])));
+    let mut corrupt = d.clone();
+    put(&mut corrupt, wl::ASSET0_INS_SPENT_LONG_OFF, 31); // spent > budget: fail closed
+    assert_eq!(state::read_wrapper_bind_insurance(&corrupt), None);
     let mut bad = d.clone();
     bad[8..10].copy_from_slice(&18u16.to_le_bytes());
-    assert_eq!(state::read_wrapper_insurance_parts(&bad), None);
+    assert_eq!(state::read_wrapper_bind_insurance(&bad), None);
     assert_eq!(state::read_wrapper_asset0_insurance_keys(&bad), None);
     let mut closed = d.clone();
     closed[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_CLOSED_MARKET;
     assert_eq!(state::read_wrapper_asset0_insurance_keys(&closed), None);
+    assert_eq!(state::read_wrapper_bind_insurance(&closed), None);
+    assert_eq!(state::read_wrapper_bind_insurance(&d[..d.len() - 1]), None);
     let short = &d[..wl::ASSET0_INSURANCE_OPERATOR_OFF + 31];
     assert_eq!(state::read_wrapper_asset0_insurance_keys(short), None);
     // Clear: bytes and flag gone; neighbours untouched.
@@ -194,27 +224,30 @@ fn closeout_m1_m2_readers_and_clear() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4096))]
 
-    /// M-1 seed at bind, full u128 range: never above the budgeted slice, never above insurance
-    /// net of reserved credit, exactly the formula, and blind to any claim added to insurance
-    /// outside the budget (a fee leg / rent can only lower the cap, never raise the seed).
+    /// M-1 / M-1b seed at bind, full u128 range: never above asset 0's budget, never above
+    /// insurance net of reserved credit, never above the vault, exactly the formula; any claim
+    /// added to the insurance / vault outside asset 0's budget (fee legs, rent, another asset's
+    /// budget) never raises it.
     #[test]
     fn closeout_m1_seed_at_bind_full_width(
         insurance in any::<u128>(),
+        vault in any::<u128>(),
         reserved in any::<u128>(),
         budget in any::<u128>(),
         deployed in any::<u64>(),
         claim in any::<u128>(),
     ) {
-        let seed = creator_seed_at_bind(insurance, reserved, budget, deployed);
-        prop_assert!(seed as u128 <= budget);
+        let seed = creator_seed_at_bind(insurance, vault, reserved, budget, deployed);
+        prop_assert!(seed as u128 <= budget.saturating_sub(reserved));
         prop_assert!(seed as u128 <= insurance.saturating_sub(reserved));
-        let own = budget.min(insurance.saturating_sub(reserved));
+        prop_assert!(seed as u128 <= vault);
+        let own = budget.saturating_sub(reserved).min(insurance.saturating_sub(reserved)).min(vault);
         prop_assert_eq!(seed, u64::try_from(own).unwrap_or(u64::MAX).saturating_sub(deployed));
-        let with_claim = creator_seed_at_bind(insurance.saturating_add(claim), reserved, budget, deployed);
-        prop_assert!(with_claim as u128 <= budget, "a claim outside the budget never raises the seed beyond it");
-        if budget <= insurance.saturating_sub(reserved) {
-            prop_assert_eq!(with_claim, seed, "fee legs / rent in insurance do not change the seed");
-        }
+        let with_claim = creator_seed_at_bind(
+            insurance.saturating_add(claim), vault.saturating_add(claim), reserved, budget, deployed);
+        prop_assert!(with_claim as u128 <= budget.saturating_sub(reserved),
+            "a claim outside asset 0's budget never raises the seed beyond it");
+        prop_assert!(with_claim >= seed);
     }
 
     /// The pure split, full u64 range: conserved to the atom; creator <= surplus; creator never
