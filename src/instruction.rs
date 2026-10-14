@@ -337,13 +337,17 @@ pub enum StakeInstruction {
     ///    owned by `vault_auth`, other than `pool.vault`) into `pool.vault`.
     ///    Wrapper tag 41 is itself permissionless, and anyone can point it at such
     ///    an account, so this is the undo for a griefed payout.
-    /// 4. Book the vault surplus: first the wrapper-attributable tag-87 fees
-    ///    (the normal `AccrueFees` path, Resolved only), then the rest by
-    ///    `StakePool::book_terminal_recovery`. Up to `wrapper_recoverable()` is
-    ///    booked as returned principal (as tag 23 does), and the remainder as fees
-    ///    when real LP holders exist. Booking the surplus rather than this call's
-    ///    own delta means a direct wrapper tag-41 push into `pool.vault` by a third
-    ///    party is still credited to stakers.
+    /// 4. Settle the vault surplus. (a) v5 FIRST_LOSS with a units ledger: forward the
+    ///    creator-class value the wrapper attributed (`creator_paid_to_stake_atoms` minus what
+    ///    was already forwarded) to the creator (S1). (b) Book the wrapper-attributable tag-87
+    ///    fees (the normal `AccrueFees` path, Resolved only). (c) S1 / S2 (2026-10-14): forward
+    ///    the creator's share of the remaining surplus (`math::terminal_creator_share`): ALL of
+    ///    it when no staker atom was ever deployed (`total_flushed == 0`: every FEE_ONLY pool,
+    ///    and a FIRST_LOSS pool that never synced) or no real staker exists; otherwise only the
+    ///    S2 pre-stake fee backlog. (d) Book the rest by `StakePool::book_terminal_recovery`: up
+    ///    to `wrapper_recoverable()` as returned principal, the remainder as fees when real LP
+    ///    holders exist. Settling the surplus rather than this call's own delta means a direct
+    ///    wrapper tag-41 push into `pool.vault` by a third party is settled the same way.
     /// 5. Set the pool's `market_resolved` flag (blocks deposits and flushes).
     ///
     /// Refused with `NothingToRecover` (31) if no tokens moved and nothing was
@@ -363,7 +367,19 @@ pub enum StakeInstruction {
     ///   6. `[]` Wrapper vault authority PDA (`[b"vault", market]` under the wrapper)
     ///   7. `[]` Token program
     ///   8. `[]` Percolator program (must equal pool.percolator_program)
-    ///   9. `[writable]` OPTIONAL stray token account to sweep (owner = vault_auth, mint = pool mint)
+    ///
+    /// FIRST_LOSS pools (v5) continue:
+    ///   9. `[writable]` The wrapper's `InsuranceUnitsV20` PDA (`["ins_units", market]`).
+    ///      REQUIRED. May be uncreated only when no staker ever deposited (`total_flushed == 0`);
+    ///      then the pre-units tag-41 CPI is used and the whole fund is the creator's seed (S1).
+    ///  10. `[writable]` The creator's token account (owner = `pool.admin`, mint = pool mint).
+    ///      REQUIRED.
+    ///  11. `[writable]` OPTIONAL stray token account to sweep (owner = vault_auth, mint = pool mint)
+    ///
+    /// FEE_ONLY pools continue with up to two OPTIONAL token accounts in any order, told apart by
+    /// their SPL owner: owner = vault_auth -> the stray to sweep; owner = `pool.admin` -> the
+    /// creator's account, REQUIRED (`CreatorAccountRequired`, 46) whenever the settlement owes the
+    /// creator something, which on a FEE_ONLY pool is any terminal surplus.
     RecoverTerminalInsurance { amount: u64 },
 
     /// 30: AdminCloseSlab — F-9. CPI proxy for the wrapper's CloseSlab (tag 13).
@@ -376,7 +392,10 @@ pub enum StakeInstruction {
     /// The pool PDA signs via `invoke_signed` (`[b"stake_pool", slab, bump]`).
     /// CloseSlab's primary sweep lands in account 5 (a token account owned by the
     /// pool PDA). This instruction moves it into `pool.vault` and books it
-    /// (`StakePool::book_terminal_recovery`). The slab and vault-account rent
+    /// (`StakePool::book_terminal_recovery`), except the creator's share
+    /// (`math::terminal_creator_share`, S1 / S2), which stays unbooked in `pool.vault` for the
+    /// next `RecoverTerminalInsurance` (amount 0) to forward. Pending wrapper fee payouts are
+    /// accrued BEFORE the close (the payout counter is unreadable afterwards). The slab and vault-account rent
     /// refunds that the wrapper pays to the pool PDA are forwarded to the admin
     /// signer. It sets the pool's `market_resolved` flag.
     ///

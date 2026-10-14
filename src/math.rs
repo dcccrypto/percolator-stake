@@ -561,6 +561,24 @@ pub fn terminal_cpi_delta_ok(before: u64, after: u64, requested: u64) -> bool {
     after.checked_sub(before) == Some(requested)
 }
 
+/// S1 / S2 (2026-10-14) — the part of a terminal vault `surplus` (vault balance above the
+/// booked pool value, after the wrapper fee accrual) that belongs to the creator:
+///
+/// * `creator_takes_all` (`StakePool::terminal_surplus_to_creator`: no staker atom was ever
+///   deployed, or no real staker exists): the whole surplus;
+/// * otherwise only the S2 pre-stake fee backlog still owed, `min(surplus, backlog_owed)`.
+///
+/// The rest (`surplus - share`) is booked for stakers exactly as before
+/// (`terminal_recovery_split`). Always `share <= surplus`, and `share <= backlog_owed` unless
+/// `creator_takes_all`. Kani: `kani_s1_terminal_creator_share_bounded`.
+pub fn terminal_creator_share(surplus: u64, backlog_owed: u64, creator_takes_all: bool) -> u64 {
+    if creator_takes_all {
+        surplus
+    } else {
+        surplus.min(backlog_owed)
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // v5 (Phase 4 item 6): first-loss deployment into the wrapper's insurance.
 // ════════════════════════════════════════════════════════════════════════════
@@ -690,6 +708,19 @@ mod tests {
             terminal_recovery_split(u64::MAX, u64::MAX, true),
             (u64::MAX, 0)
         );
+    }
+
+    #[test]
+    fn test_s1_terminal_creator_share() {
+        // No staker money in insurance / no real staker: the creator takes everything.
+        assert_eq!(terminal_creator_share(7_600, 0, true), 7_600);
+        assert_eq!(terminal_creator_share(7_600, 100, true), 7_600);
+        // Stakers deployed and exist: only the S2 backlog goes to the creator.
+        assert_eq!(terminal_creator_share(7_600, 100, false), 100);
+        assert_eq!(terminal_creator_share(50, 100, false), 50);
+        assert_eq!(terminal_creator_share(7_600, 0, false), 0);
+        assert_eq!(terminal_creator_share(0, 100, true), 0);
+        assert_eq!(terminal_creator_share(u64::MAX, u64::MAX, false), u64::MAX);
     }
 
     #[test]
