@@ -561,23 +561,73 @@ pub fn terminal_cpi_delta_ok(before: u64, after: u64, requested: u64) -> bool {
     after.checked_sub(before) == Some(requested)
 }
 
-/// S1 / S2 (2026-10-14) — the part of a terminal vault `surplus` (vault balance above the
-/// booked pool value, after the wrapper fee accrual) that belongs to the creator:
+/// CLOSE-OUT RULE (Khubair 2026-10-14 12:55, confirmed 13:36 and 19:35; every v5 pool mode).
 ///
-/// * `creator_takes_all` (`StakePool::terminal_surplus_to_creator`: no staker atom was ever
-///   deployed, or no real staker exists): the whole surplus;
-/// * otherwise only what is still owed, `min(surplus, backlog_owed)`: the S2 pre-stake fee
-///   backlog (FIRST_LOSS) or the seed remaining (FEE_ONLY growth-plan reading;
-///   `StakePool::terminal_creator_owed_atoms`).
+/// At a market's close the creator gets back the insurance seed recorded at bind if it is
+/// intact, else what is left of it, and never more; everything else goes to the stakers.
 ///
-/// The rest (`surplus - share`) is booked for stakers exactly as before
-/// (`terminal_recovery_split`). Always `share <= surplus`, and `share <= backlog_owed` unless
-/// `creator_takes_all`. Kani: `kani_s1_terminal_creator_share_bounded`.
-pub fn terminal_creator_share(surplus: u64, backlog_owed: u64, creator_takes_all: bool) -> u64 {
-    if creator_takes_all {
-        surplus
+/// Returns the creator's share of THIS settlement's `surplus` (vault balance above the booked
+/// pool value):
+///
+/// ```text
+/// entitled = min(seed, creator_class_released)   // FIRST_LOSS on the wrapper units ledger
+///          = seed                                // FEE_ONLY, or FIRST_LOSS never unitised
+/// share    = min(surplus, entitled - forwarded)  // saturating; forwarded = paid so far
+/// ```
+///
+/// * `seed`: the creator's insurance seed recorded at `BindInsuranceAuthority` (0 = none).
+/// * `forwarded`: every atom this pool has already sent to the creator (all counters).
+/// * `creator_class_released`: `Some(InsuranceUnitsV20::creator_paid_to_stake_atoms)` when
+///   the market's insurance is unitised (FIRST_LOSS): the value of the creator-class units the
+///   wrapper has released into the pool vault so far. That is "what is left of" the seed after
+///   the pro-rata losses the wrapper's unit ledger charged to the creator class; capping it at
+///   the seed sends the growth on creator units to the stakers. `None` when the whole fund is
+///   creator class (FEE_ONLY holds no units; a never-unitised FIRST_LOSS market).
+///
+/// Properties (Kani `kani_closeout_*`, proptests `closeout_*`): `share <= surplus`;
+/// cumulative `forwarded + share <= seed` (so the creator can never get more than the seed,
+/// whatever the rounding, the number of partial calls or the staker count); and over any
+/// sequence of settlements the creator's total is exactly `min(seed, total released)`
+/// (FEE_ONLY), or `min(seed, creator class released)` (unitised FIRST_LOSS).
+pub fn closeout_creator_share(
+    surplus: u64,
+    seed: u64,
+    forwarded: u64,
+    creator_class_released: Option<u64>,
+) -> u64 {
+    let entitled = match creator_class_released {
+        Some(released) => seed.min(released),
+        None => seed,
+    };
+    surplus.min(entitled.saturating_sub(forwarded))
+}
+
+/// CLOSE-OUT RULE: split one settlement's `surplus` into `(creator, stakers, unclaimed)`.
+///
+/// * `creator = closeout_creator_share(..)`;
+/// * the rest goes to the stakers (booked to the pool, so LP-share holders split it pro rata)
+///   when real stakers exist;
+/// * with NO real staker the rest is `unclaimed`: it is left unbooked in `pool.vault` and
+///   recorded (`StakePool::terminal_unclaimed_atoms`). The stake program has no protocol /
+///   treasury token destination, and booking it would hand it to the dead shares (stranded
+///   for ever); it never goes to the creator beyond the seed.
+///
+/// Always `creator + stakers + unclaimed == surplus` (to the atom) and `stakers == 0 ||
+/// unclaimed == 0`.
+pub fn closeout_split(
+    surplus: u64,
+    seed: u64,
+    forwarded: u64,
+    creator_class_released: Option<u64>,
+    real_stakers: bool,
+) -> (u64, u64, u64) {
+    let creator = closeout_creator_share(surplus, seed, forwarded, creator_class_released);
+    // Cannot underflow: creator <= surplus by construction.
+    let rest = surplus - creator;
+    if real_stakers {
+        (creator, rest, 0)
     } else {
-        surplus.min(backlog_owed)
+        (creator, 0, rest)
     }
 }
 
@@ -712,17 +762,34 @@ mod tests {
         );
     }
 
+    /// CLOSE-OUT RULE (2026-10-14). NEGATIVE CONTROL: the f372fa2 rule (creator takes the whole
+    /// surplus when no real staker / never deployed; FEE_ONLY creator takes all) gives 7_600 /
+    /// 7_000_000 in the "zero stakers" and "growth" rows below.
     #[test]
-    fn test_s1_terminal_creator_share() {
-        // No staker money in insurance / no real staker: the creator takes everything.
-        assert_eq!(terminal_creator_share(7_600, 0, true), 7_600);
-        assert_eq!(terminal_creator_share(7_600, 100, true), 7_600);
-        // Stakers deployed and exist: only the S2 backlog goes to the creator.
-        assert_eq!(terminal_creator_share(7_600, 100, false), 100);
-        assert_eq!(terminal_creator_share(50, 100, false), 50);
-        assert_eq!(terminal_creator_share(7_600, 0, false), 0);
-        assert_eq!(terminal_creator_share(0, 100, true), 0);
-        assert_eq!(terminal_creator_share(u64::MAX, u64::MAX, false), u64::MAX);
+    fn test_closeout_creator_share() {
+        // Seed intact, fund grew 5M -> 7M: creator exactly 5M, growth 2M to stakers.
+        assert_eq!(closeout_creator_share(7_000_000, 5_000_000, 0, None), 5_000_000);
+        assert_eq!(closeout_split(7_000_000, 5_000_000, 0, None, true), (5_000_000, 2_000_000, 0));
+        // Fund below the seed: creator gets what is left, stakers 0.
+        assert_eq!(closeout_split(3_000_000, 5_000_000, 0, None, true), (3_000_000, 0, 0));
+        // Zero real stakers: creator still capped at the seed; the rest is unclaimed.
+        assert_eq!(closeout_split(7_600, 5_000, 0, None, false), (5_000, 0, 2_600));
+        // No seed recorded (pre-build pool): creator nothing.
+        assert_eq!(closeout_split(7_600, 0, 0, None, false), (0, 0, 7_600));
+        assert_eq!(closeout_split(7_600, 0, 0, None, true), (0, 7_600, 0));
+        // Partial calls: 3M then 4M against a 5M seed -> 3M + 2M, never more.
+        let c1 = closeout_creator_share(3_000_000, 5_000_000, 0, None);
+        let c2 = closeout_creator_share(4_000_000, 5_000_000, c1, None);
+        assert_eq!((c1, c2), (3_000_000, 2_000_000));
+        assert_eq!(closeout_creator_share(u64::MAX, 5_000_000, 5_000_000, None), 0);
+        assert_eq!(closeout_creator_share(u64::MAX, 5_000_000, u64::MAX, None), 0);
+        // Unitised FIRST_LOSS: the creator class released caps it (pro-rata loss on creator
+        // units = what is left of the seed), and growth on creator units is not the creator's.
+        assert_eq!(closeout_creator_share(9_000_000, 5_000_000, 0, Some(4_000_000)), 4_000_000);
+        assert_eq!(closeout_creator_share(9_000_000, 5_000_000, 0, Some(6_000_000)), 5_000_000);
+        assert_eq!(closeout_creator_share(9_000_000, 5_000_000, 0, Some(0)), 0);
+        assert_eq!(closeout_creator_share(1, 5_000_000, 0, Some(6_000_000)), 1);
+        assert_eq!(closeout_split(u64::MAX, u64::MAX, 0, None, true), (u64::MAX, 0, 0));
     }
 
     #[test]

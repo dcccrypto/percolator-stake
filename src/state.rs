@@ -227,9 +227,10 @@ pub struct StakePool {
     pub pending_target_slot: u64, // 432..440
     /// Minimum slots between two syncs.
     pub sync_cooldown_slots: u64, // 440..448
-    /// S1: creator-class insurance value the wrapper paid into this vault at
-    /// terminal (`InsuranceUnitsV20::creator_paid_to_stake_atoms`) that has already
-    /// been forwarded to `admin`. Never decreases.
+    /// S1 (builds before the close-out rule): creator-class insurance value the wrapper paid
+    /// into this vault at terminal that was forwarded to `admin` in full. The close-out rule no
+    /// longer advances it (it forwards through bytes 464..472 and caps the creator at the seed);
+    /// it is still counted in `creator_total_forwarded_atoms`. Never decreases.
     pub creator_forwarded_atoms: u64, // 448..456
     pub _v5_reserved: [u8; 24], // 456..480
 }
@@ -349,27 +350,45 @@ pub const DEPLOY_TARGET_TIMELOCK_MIN_SLOTS: u64 = 216_000;
 /// S-6: `_v5_reserved[0]` (byte 456) = 1 while the pending target was proposed by the protocol
 /// authority (an admin proposal may not overwrite it).
 pub const V5_RESERVED_IDX_PENDING_BY_PROTOCOL: usize = 0;
-/// FEE_ONLY growth-plan reading (2026-10-14, branch `feat/v22-growth-stake-split-feeonly-plan`):
-/// `_v5_reserved[1..8]` (bytes 457..464, LE u56) = the creator's insurance seed of a FEE_ONLY pool:
-/// the market's engine insurance balance when the pool took custody of it
-/// (`BindInsuranceAuthority`, tag 19; a re-bind after a rotate-back overwrites it, since the creator
-/// could withdraw or add in between). 0 = no seed recorded (a pool bound before this build, or
-/// a market with no insurance at bind): the creator is then owed nothing from a FEE_ONLY fund
-/// while real stakers exist. Only 7 bytes are free here, so the record saturates at
-/// [`FEE_ONLY_SEED_MAX`] (2^56 - 1 atoms; a larger seed under-records, in the stakers' favour).
-pub const V5_RESERVED_FEE_ONLY_SEED: core::ops::Range<usize> = 1..8;
-/// Largest value the 7-byte FEE_ONLY seed record holds.
-pub const FEE_ONLY_SEED_MAX: u64 = (1u64 << 56) - 1;
-/// S1 (2026-10-14): `_v5_reserved[8..16]` (bytes 464..472, LE u64) = cumulative atoms of
-/// terminal vault SURPLUS forwarded to the creator (`pool.admin`) because no staker can own them
-/// (`StakePool::terminal_surplus_to_creator`) or because they are the S2 pre-stake backlog. Kept
-/// apart from `creator_forwarded_atoms`, which is the cursor against the wrapper's
-/// `creator_paid_to_stake_atoms`. Never decreases.
+/// CLOSE-OUT RULE (2026-10-14, every v5 mode): `_v5_reserved[1..8]` (bytes 457..464, LE u56) =
+/// the creator's insurance seed: the market's engine insurance balance when the pool took
+/// custody of it (`BindInsuranceAuthority`, tag 19; FIRST_LOSS and FEE_ONLY alike). Meaningful
+/// only when [`CLOSEOUT_FLAG_SEED_RECORDED`] is set; a pool bound before this build has no
+/// record and is treated as seed 0 (the creator is owed nothing from the fund; nothing is ever
+/// paid to the creator on a guess). Only 7 bytes are free here, so the record saturates at
+/// [`CREATOR_SEED_MAX`] (2^56 - 1 atoms; a larger seed under-records, never in the creator's
+/// favour).
+pub const V5_RESERVED_CREATOR_SEED: core::ops::Range<usize> = 1..8;
+/// Largest value the 7-byte seed record holds.
+pub const CREATOR_SEED_MAX: u64 = (1u64 << 56) - 1;
+/// CLOSE-OUT RULE: `_reserved[13]` (byte 333; the HWM map's spare padding 13..16, never written
+/// by any earlier build) = close-out flags.
+pub const RESERVED_IDX_CLOSEOUT_FLAGS: usize = 13;
+/// Bit 0 of the close-out flags: the seed at 457..464 was recorded by a close-out-rule bind.
+pub const CLOSEOUT_FLAG_SEED_RECORDED: u8 = 1;
+/// CLOSE-OUT RULE: `_mode_padding[0..7]` (bytes 281..288, LE u56; never written by any earlier
+/// build, ignored by the wrapper, which reads byte 280 only) = the terminal surplus that no
+/// real staker can own and that is not the creator's (the zero-real-stakers case): left
+/// UNBOOKED in `pool.vault` and recorded here as unclaimed. A level, rewritten by every terminal
+/// settlement: `vault balance - booked pool value` after it. A full u64: the low 7 bytes here,
+/// the high byte at [`RESERVED_IDX_UNCLAIMED_HI`] (exact to the atom, no saturation).
+pub const MODE_PADDING_TERMINAL_UNCLAIMED: core::ops::Range<usize> = 0..7;
+/// CLOSE-OUT RULE: `_reserved[14]` (byte 334, HWM-map spare padding, never written before) = the
+/// high byte of the unclaimed record.
+pub const RESERVED_IDX_UNCLAIMED_HI: usize = 14;
+/// S1 / CLOSE-OUT RULE: `_v5_reserved[8..16]` (bytes 464..472, LE u64) = cumulative atoms of
+/// terminal vault surplus forwarded to the creator (`pool.admin`). Since the close-out rule this
+/// is the ONLY counter a forward advances (the creator's seed return,
+/// `StakePool::closeout_creator_share`); `creator_forwarded_atoms` (448) is kept as the
+/// cursor earlier builds wrote and is counted in `creator_total_forwarded_atoms`. Never
+/// decreases.
 pub const V5_RESERVED_CREATOR_SURPLUS_FORWARDED: core::ops::Range<usize> = 8..16;
 /// S2 (2026-10-14): `_v5_reserved[16..24]` (bytes 472..480, LE u64) = wrapper fee payouts a
-/// FIRST_LOSS pool received while it had no real staker (consumed unbooked by `AccrueFees`) and
-/// that have not yet been forwarded to the creator. Raised by the S2 branch of the fee accrual,
-/// lowered when the terminal settlement forwards it.
+/// FIRST_LOSS pool received while it had no real staker (consumed unbooked by `AccrueFees`, so a
+/// later depositor is not priced with them). INFORMATIONAL since the close-out rule: the atoms
+/// stay unbooked in the vault until the close, where they are part of the surplus that goes to
+/// the stakers (or is recorded unclaimed) and are NEVER paid to the creator beyond the seed.
+/// Raised by the S2 branch of the fee accrual; no longer lowered.
 pub const V5_RESERVED_S2_BACKLOG_OWED: core::ops::Range<usize> = 16..24;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1007,6 +1026,33 @@ impl StakePool {
         Ok((to_returned, to_fees))
     }
 
+    /// CLOSE-OUT RULE booking (2026-10-14), run by RecoverTerminalInsurance (29) and
+    /// AdminCloseSlab (30) AFTER the creator's seed return has left the vault: book `vault_balance`
+    /// for the stakers when real stakers exist ([`StakePool::book_terminal_recovery`]: principal
+    /// first, the rest as fees, pro rata by LP share). On a v5 pool with NO real staker nothing
+    /// is booked (it would be owned by the dead shares only, i.e. stranded for ever): the
+    /// remainder stays in `pool.vault`. On v5 pools the unbooked remainder `vault_balance -
+    /// total_pool_value()` is then recorded as [`StakePool::terminal_unclaimed_atoms`]. Legacy
+    /// pools book exactly as before and record nothing. Returns `(to_returned, to_fees)`.
+    pub fn book_closeout_remainder(
+        &mut self,
+        vault_balance: u64,
+    ) -> Result<(u64, u64), crate::error::StakeError> {
+        use crate::error::StakeError;
+        if !self.is_v5_risk_mode() {
+            return self.book_terminal_recovery(vault_balance);
+        }
+        let booked = if self.has_real_lp_holders() {
+            self.book_terminal_recovery(vault_balance)?
+        } else {
+            (0, 0)
+        };
+        let unclaimed =
+            vault_balance.saturating_sub(self.total_pool_value().ok_or(StakeError::Overflow)?);
+        self.set_terminal_unclaimed_atoms(unclaimed);
+        Ok(booked)
+    }
+
     /// Tranche pools: the largest amount by which a permissionless
     /// `RecoverFlushedInsurance` (tag 23) could raise [`StakePool::senior_balance`]
     /// from the current state. Zero means `senior_balance()` is invariant under every
@@ -1105,71 +1151,79 @@ impl StakePool {
         self.set_v5_u64(V5_RESERVED_S2_BACKLOG_OWED, v);
     }
 
-    /// FEE_ONLY seed record (bytes 457..464, u56 LE). See [`V5_RESERVED_FEE_ONLY_SEED`].
-    pub fn fee_only_creator_seed_atoms(&self) -> u64 {
+    /// v5 risk modes (FIRST_LOSS or FEE_ONLY): the pools the close-out rule applies to. A legacy
+    /// pool (risk mode 0) cannot be created by this program.
+    pub fn is_v5_risk_mode(&self) -> bool {
+        self.risk_mode == RISK_MODE_FIRST_LOSS || self.risk_mode == RISK_MODE_FEE_ONLY
+    }
+
+    /// Close-out seed record (bytes 457..464, u56 LE), or 0 when no close-out-rule bind recorded
+    /// one (see [`V5_RESERVED_CREATOR_SEED`]).
+    pub fn creator_seed_atoms(&self) -> u64 {
+        if !self.creator_seed_recorded() {
+            return 0;
+        }
         let mut b = [0u8; 8];
-        b[..7].copy_from_slice(&self._v5_reserved[V5_RESERVED_FEE_ONLY_SEED]);
+        b[..7].copy_from_slice(&self._v5_reserved[V5_RESERVED_CREATOR_SEED]);
         u64::from_le_bytes(b)
     }
 
-    /// Records `v` atoms, saturating at [`FEE_ONLY_SEED_MAX`].
-    pub fn set_fee_only_creator_seed_atoms(&mut self, v: u64) {
-        let b = v.min(FEE_ONLY_SEED_MAX).to_le_bytes();
-        self._v5_reserved[V5_RESERVED_FEE_ONLY_SEED].copy_from_slice(&b[..7]);
+    /// True iff a close-out-rule bind recorded the seed (byte 333 bit 0).
+    pub fn creator_seed_recorded(&self) -> bool {
+        self._reserved[RESERVED_IDX_CLOSEOUT_FLAGS] & CLOSEOUT_FLAG_SEED_RECORDED != 0
     }
 
-    /// Growth-plan §2.10 S1 "seed remaining" for a FEE_ONLY pool: the seed recorded at bind
-    /// minus what the terminal settlement has already forwarded to the creator
-    /// (`creator_surplus_forwarded_atoms`). 0 for every other risk mode (FIRST_LOSS seeds are
-    /// creator UNITS in the wrapper ledger, forwarded through `creator_paid_to_stake_atoms`).
-    /// Losses the fund took are NOT subtracted here: `min(seed remaining, surplus)` at settlement
-    /// means a fund that shrank below the seed goes wholly to the creator (the seed absorbs
-    /// losses only after the growth is gone), and the stakers keep only growth above the seed.
-    pub fn fee_only_seed_remaining(&self) -> u64 {
-        if self.risk_mode != RISK_MODE_FEE_ONLY {
+    /// Records the seed (saturating at [`CREATOR_SEED_MAX`]) and sets the recorded flag.
+    pub fn record_creator_seed(&mut self, v: u64) {
+        let b = v.min(CREATOR_SEED_MAX).to_le_bytes();
+        self._v5_reserved[V5_RESERVED_CREATOR_SEED].copy_from_slice(&b[..7]);
+        self._reserved[RESERVED_IDX_CLOSEOUT_FLAGS] |= CLOSEOUT_FLAG_SEED_RECORDED;
+    }
+
+    /// Every atom this pool has sent to the creator (`pool.admin`) out of the vault: the S1
+    /// creator-class cursor of earlier builds (448) plus the terminal surplus counter (464), the
+    /// only counter this build advances. Saturating (both are bounded by the vault's history).
+    pub fn creator_total_forwarded_atoms(&self) -> u64 {
+        self.creator_forwarded_atoms
+            .saturating_add(self.creator_surplus_forwarded_atoms())
+    }
+
+    /// The seed not yet returned: `seed - forwarded` (saturating). An upper bound of what the
+    /// creator can still receive (the unitised FIRST_LOSS cap may be lower).
+    pub fn creator_seed_remaining(&self) -> u64 {
+        self.creator_seed_atoms()
+            .saturating_sub(self.creator_total_forwarded_atoms())
+    }
+
+    /// CLOSE-OUT RULE: the creator's share of a terminal `surplus` (vault above the booked pool
+    /// value): `math::closeout_creator_share(surplus, seed, forwarded, creator_class_released)`
+    /// for v5 pools, 0 for legacy pools. `creator_class_released` = the wrapper's
+    /// `creator_paid_to_stake_atoms` on a unitised FIRST_LOSS market, `None` otherwise.
+    pub fn closeout_creator_share(&self, surplus: u64, creator_class_released: Option<u64>) -> u64 {
+        if !self.is_v5_risk_mode() {
             return 0;
         }
-        self.fee_only_creator_seed_atoms()
-            .saturating_sub(self.creator_surplus_forwarded_atoms())
+        crate::math::closeout_creator_share(
+            surplus,
+            self.creator_seed_atoms(),
+            self.creator_total_forwarded_atoms(),
+            creator_class_released,
+        )
     }
 
-    /// What the terminal settlement may forward to the creator out of the surplus when the
-    /// creator does NOT take it all. Mode-exclusive, so neither term can leak into the other
-    /// mode even if its bytes were ever non-zero: FEE_ONLY -> the seed remaining only (the S2
-    /// backlog is FIRST_LOSS-only); every other mode -> the S2 backlog only. A cap: the share is
-    /// `min(surplus, this)`. Kani: `kani_s1_terminal_settlement_conserves` (share <= seed
-    /// remaining on FEE_ONLY).
-    pub fn terminal_creator_owed_atoms(&self) -> u64 {
-        if self.risk_mode == RISK_MODE_FEE_ONLY {
-            self.fee_only_seed_remaining()
-        } else {
-            self.s2_backlog_owed_atoms()
-        }
+    /// Recorded unclaimed terminal surplus (bytes 281..288 + 334). See
+    /// [`MODE_PADDING_TERMINAL_UNCLAIMED`].
+    pub fn terminal_unclaimed_atoms(&self) -> u64 {
+        let mut b = [0u8; 8];
+        b[..7].copy_from_slice(&self._mode_padding[MODE_PADDING_TERMINAL_UNCLAIMED]);
+        b[7] = self._reserved[RESERVED_IDX_UNCLAIMED_HI];
+        u64::from_le_bytes(b)
     }
 
-    /// S1 (growth plan §2.10; item 6 "creator seed return as creator units"): at terminal, does
-    /// the WHOLE vault surplus (vault balance above the booked pool value, after the wrapper fee
-    /// accrual) belong to the creator rather than to the stakers?
-    ///
-    /// * FIRST_LOSS with `total_flushed == 0`: no staker atom was ever deployed into the
-    ///   market's insurance from this pool. A FIRST_LOSS pool deploys only through
-    ///   `SyncInsuranceDeployment`, which books every atom into `total_flushed`. So every
-    ///   insurance atom that reaches the vault at terminal is creator-class (exactly how wrapper
-    ///   tag 116 classes a fund that predates the stakers: all creator units), and booking it to
-    ///   stakers would hand them the creator's seed.
-    /// * `!has_real_lp_holders()` (FIRST_LOSS or FEE_ONLY): no real staker exists, and none can
-    ///   join (deposits are refused once the wrapper is terminal), so a surplus booked into pool
-    ///   value would be owned by the dead shares only, i.e. stranded for ever (the 7.6k problem).
-    ///
-    /// A FEE_ONLY pool WITH real stakers is not creator-takes-all (growth-plan reading,
-    /// 2026-10-14): the creator gets `min(fee_only_seed_remaining, surplus)` through
-    /// `terminal_creator_owed_atoms`, and the stakers keep the growth above the seed.
-    ///
-    /// v5 risk modes only (a legacy pool cannot be created by this program).
-    pub fn terminal_surplus_to_creator(&self) -> bool {
-        let v5 = self.risk_mode == RISK_MODE_FIRST_LOSS || self.risk_mode == RISK_MODE_FEE_ONLY;
-        v5 && ((self.risk_mode == RISK_MODE_FIRST_LOSS && self.total_flushed == 0)
-            || !self.has_real_lp_holders())
+    pub fn set_terminal_unclaimed_atoms(&mut self, v: u64) {
+        let b = v.to_le_bytes();
+        self._mode_padding[MODE_PADDING_TERMINAL_UNCLAIMED].copy_from_slice(&b[..7]);
+        self._reserved[RESERVED_IDX_UNCLAIMED_HI] = b[7];
     }
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.

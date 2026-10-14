@@ -929,7 +929,8 @@ fn s1_terminal_partial_when_stakers_exist() {
     assert_eq!(token_amount(&w.svm, &w.wrapper_vault), 0);
     assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED, "S1: the creator gets exactly its seed");
     let p = w.pool();
-    assert_eq!(p.creator_forwarded_atoms, SEED);
+    assert_eq!(p.creator_total_forwarded_atoms(), SEED);
+    assert_eq!(p.creator_seed_atoms(), SEED, "close-out: the FIRST_LOSS bind recorded the seed");
     assert_eq!(p.total_returned, 5_000_000, "the stakers' deployment came back as principal");
     assert_eq!(p.total_pool_value(), Some(10_000_000));
     assert_eq!(token_amount(&w.svm, &w.vault), 10_000_000, "vault == books");
@@ -997,42 +998,203 @@ fn s1_terminal_full_seed_when_all_stakers_left() {
     assert_eq!(p.total_fees_earned, 0, "nothing booked to the dead shares");
 }
 
-/// S2 at terminal: on a pool where stakers DID deploy (so the surplus is not wholly the
-/// creator's), the pre-stake fee backlog still goes to the creator, not to the stakers who
-/// joined later. The backlog is FORGED (pool bytes 472..480 plus the matching unbooked atoms in
-/// the vault, i.e. exactly what `AccrueFees` leaves behind when the wrapper paid the 16% leg
-/// before the first staker; the accrual itself is unit-tested in
+/// S2 backlog at the close (CLOSE-OUT RULE): pre-stake fees are NOT the creator's (the creator
+/// never gets more than the seed); they are part of the surplus booked to the stakers. FORGED
+/// backlog (pool bytes 472..480 plus the matching unbooked atoms in the vault, exactly what
+/// `AccrueFees` leaves behind; the accrual is unit-tested in
 /// `processor::tests::s2_backlog_is_recorded_as_owed_to_the_creator`).
-/// NEGATIVE CONTROL: on the pre-S2 .so the backlog bytes are ignored and the atoms are booked as
-/// staker fees (creator receives only the seed; the fee assert fails).
+/// NEGATIVE CONTROL: on f372fa2 / 75dd991 the creator receives SEED + BACKLOG.
 #[test]
-fn s2_backlog_forwarded_to_creator_at_terminal_forged_backlog() {
+fn closeout_s2_backlog_goes_to_stakers_not_creator_forged_backlog() {
     const BACKLOG: u64 = 700_000;
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
     assert!(sync(&mut w).is_ok());
-    // Forge the S2 state: owed counter + the unbooked atoms in the vault.
     let mut acct = w.svm.get_account(&w.pool).unwrap();
     acct.data[472..480].copy_from_slice(&BACKLOG.to_le_bytes());
     w.svm.set_account(w.pool, acct).unwrap();
     let vault_now = token_amount(&w.svm, &w.vault);
     let (mint, va, vault) = (w.mint, w.vault_auth, w.vault);
     set_token_account(&mut w.svm, vault, &mint, &va, vault_now + BACKLOG);
-    assert_eq!(w.pool().s2_backlog_owed_atoms(), BACKLOG);
     admin_resolve(&mut w);
     let fund = token_amount(&w.svm, &w.wrapper_vault);
     let r = recover_terminal(&mut w, fund);
     assert!(r.is_ok(), "{}", logs(&r));
-    assert_eq!(
-        token_amount(&w.svm, &w.creator_ata),
-        SEED + BACKLOG,
-        "creator: its seed (creator units) + the pre-stake backlog"
-    );
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED, "creator: the seed, never more");
     let p = w.pool();
-    assert_eq!(p.s2_backlog_owed_atoms(), 0);
-    assert_eq!(p.creator_surplus_forwarded_atoms(), BACKLOG);
-    assert_eq!(p.total_fees_earned, 0, "the backlog is not booked to the stakers");
-    assert_eq!(p.total_pool_value(), Some(10_000_000));
-    assert_eq!(token_amount(&w.svm, &w.vault), 10_000_000, "vault == books");
+    assert_eq!(p.total_fees_earned, BACKLOG, "the backlog is booked to the stakers");
+    assert_eq!(p.total_pool_value(), Some(10_000_000 + BACKLOG));
+    assert_eq!(token_amount(&w.svm, &w.vault), 10_000_000 + BACKLOG, "vault == books");
+    assert_eq!(p.terminal_unclaimed_atoms(), 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CLOSE-OUT RULE (Khubair 2026-10-14) on FIRST_LOSS, real wrapper units ledger
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// FORGE the close-out seed record (bytes 457..464 + flag byte 333 bit 0).
+fn forge_seed(w: &mut World, seed: u64) {
+    let mut acct = w.svm.get_account(&w.pool).unwrap();
+    acct.data[457..464].copy_from_slice(&seed.to_le_bytes()[..7]);
+    acct.data[333] |= 1;
+    w.svm.set_account(w.pool, acct).unwrap();
+    assert_eq!(w.pool().creator_seed_atoms(), seed);
+}
+
+fn bind(w: &mut World, pool_writable: bool) -> TxResult {
+    let admin = w.admin.insecure_clone();
+    let pool_meta = if pool_writable {
+        AccountMeta::new(w.pool, false)
+    } else {
+        AccountMeta::new_readonly(w.pool, false)
+    };
+    let accounts = vec![
+        AccountMeta::new(w.admin.pubkey(), true),
+        pool_meta,
+        AccountMeta::new_readonly(w.vault_auth, false),
+        AccountMeta::new(w.market, false),
+        AccountMeta::new_readonly(w.wrapper_id, false),
+    ];
+    w.send_stake(&[&admin], accounts, vec![19])
+}
+
+/// The real FIRST_LOSS bind (tag 19, in `world`) recorded the seed = the engine insurance on the
+/// real wrapper market (SEED, topped up by the creator before the bind) and set the flag. A
+/// FIRST_LOSS bind with a read-only pool is refused by stake (16) before any CPI.
+/// NEGATIVE CONTROL: on 75dd991 the FIRST_LOSS record is 0 and the read-only bind reaches the
+/// wrapper (not 16).
+#[test]
+fn closeout_first_loss_bind_records_seed_from_real_wrapper() {
+    let mut w = world(false);
+    let p = w.pool();
+    assert!(p.creator_seed_recorded());
+    assert_eq!(p.creator_seed_atoms(), SEED);
+    let r = bind(&mut w, false);
+    assert_eq!(custom(&r), Some(16), "{}", logs(&r));
+    let r = bind(&mut w, true);
+    assert!(r.is_err(), "already bound: the wrapper refuses");
+    assert_ne!(custom(&r), Some(16));
+    assert_eq!(w.pool().creator_seed_atoms(), SEED, "record unchanged");
+}
+
+/// Growth on creator units goes to the stakers. FORGED: seed record lowered to 3M (the creator
+/// seeded 3M; its units grew to the 5M SEED value). Real wrapper terminal: the stake class (5M
+/// deployed) is paid first, then 5M of creator class; the creator gets min(3M, 5M) = 3M and the
+/// stakers their 5M principal back + 2M of growth.
+/// NEGATIVE CONTROL: on 75dd991 / f372fa2 the whole creator class (5M) is forwarded.
+#[test]
+fn closeout_first_loss_creator_unit_growth_goes_to_stakers_forged_seed() {
+    const SEED_REC: u64 = 3_000_000;
+    let mut w = world(true);
+    let a = new_staker(&mut w, 10_000_000);
+    assert!(deposit(&mut w, &a, 10_000_000).is_ok());
+    assert!(sync(&mut w).is_ok());
+    forge_seed(&mut w, SEED_REC);
+    admin_resolve(&mut w);
+    let fund = token_amount(&w.svm, &w.wrapper_vault);
+    assert_eq!(fund, SEED + 5_000_000);
+    let r = recover_terminal(&mut w, fund);
+    assert!(r.is_ok(), "{}", logs(&r));
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED_REC, "creator capped at the seed");
+    let p = w.pool();
+    assert_eq!(p.total_returned, 5_000_000, "principal back");
+    assert_eq!(p.total_fees_earned, SEED - SEED_REC, "growth on creator units to stakers");
+    assert_eq!(p.total_pool_value(), Some(10_000_000 + SEED - SEED_REC));
+    assert_eq!(token_amount(&w.svm, &w.vault), p.total_pool_value().unwrap(), "vault == books");
+    assert_eq!(w.units().unwrap().creator_paid_to_stake, SEED as u128);
+}
+
+/// Losses ate into the creator's units (pro rata, the unit ledger's rule the stakers consented
+/// to): the creator gets what is left of the seed, i.e. its creator-class value, never more.
+/// FORGED ledger: 2M stake units added with no atoms (class invariant kept), so of the 10M fund
+/// the stake class is worth floor(7/12 * 10M) and the creator class the rest (4,166,667 < SEED).
+#[test]
+fn closeout_first_loss_creator_class_loss_creator_gets_what_is_left_forged_ledger() {
+    let mut w = world(true);
+    let a = new_staker(&mut w, 10_000_000);
+    assert!(deposit(&mut w, &a, 10_000_000).is_ok());
+    assert!(sync(&mut w).is_ok());
+    let mut acct = w.svm.get_account(&w.units).unwrap();
+    let u = w.units().unwrap();
+    assert_eq!((u.units_stake, u.units_creator), (5_000_000, SEED as u128));
+    let off_total = percolator_stake::state::WRAPPER_INS_UNITS_OFF_UNITS_TOTAL;
+    let off_stake = percolator_stake::state::WRAPPER_INS_UNITS_OFF_UNITS_STAKE;
+    acct.data[off_total..off_total + 16].copy_from_slice(&(u.units_total + 2_000_000).to_le_bytes());
+    acct.data[off_stake..off_stake + 16].copy_from_slice(&(u.units_stake + 2_000_000).to_le_bytes());
+    w.svm.set_account(w.units, acct).unwrap();
+    admin_resolve(&mut w);
+    let fund = token_amount(&w.svm, &w.wrapper_vault);
+    let r = recover_terminal(&mut w, fund);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let paid = w.units().unwrap().creator_paid_to_stake as u64;
+    assert_eq!(paid, fund - fund * 7 / 12);
+    assert!(paid < SEED);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), paid, "creator: what is left of the seed");
+    let p = w.pool();
+    assert_eq!(
+        token_amount(&w.svm, &w.creator_ata) + (p.total_pool_value().unwrap() - 5_000_000),
+        fund,
+        "conserved: creator + booked = released"
+    );
+    assert_eq!(token_amount(&w.svm, &w.vault), p.total_pool_value().unwrap(), "vault == books");
+}
+
+/// Partial tag-29 calls on a unitised FIRST_LOSS market (stake class first, then creator class,
+/// across three calls) conserve exactly, with a FORGED 3M seed record: the creator total is 3M
+/// whatever the chunking, the stakers get principal + growth, vault == books after each call.
+#[test]
+fn closeout_first_loss_partial_calls_conserve_forged_seed() {
+    const SEED_REC: u64 = 3_000_000;
+    let mut w = world(true);
+    let a = new_staker(&mut w, 10_000_000);
+    assert!(deposit(&mut w, &a, 10_000_000).is_ok());
+    assert!(sync(&mut w).is_ok());
+    forge_seed(&mut w, SEED_REC);
+    admin_resolve(&mut w);
+    let fund = token_amount(&w.svm, &w.wrapper_vault);
+    let mut released = 0;
+    for chunk in [4_000_000u64, 2_500_000, fund - 6_500_000] {
+        let r = recover_terminal(&mut w, chunk);
+        assert!(r.is_ok(), "chunk {chunk}: {}", logs(&r));
+        released += chunk;
+        let p = w.pool();
+        let creator = token_amount(&w.svm, &w.creator_ata);
+        assert!(creator <= SEED_REC);
+        assert_eq!(token_amount(&w.svm, &w.vault), p.total_pool_value().unwrap(), "vault == books");
+        assert_eq!(creator + (p.total_pool_value().unwrap() - 5_000_000), released, "conserved");
+    }
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED_REC);
+    assert_eq!(w.pool().total_fees_earned, SEED - SEED_REC);
+}
+
+/// Zero real stakers at the close on FIRST_LOSS (all stakers left while Live; the units ledger
+/// exists, nothing deployed). FORGED 3M seed record, 5M fund: creator exactly 3M, the 2M of
+/// growth unclaimed (left unbooked in the vault and recorded), nothing booked to dead shares.
+/// NEGATIVE CONTROL: on f372fa2 / 96a90483 / 75dd991 the creator receives all 5M.
+#[test]
+fn closeout_first_loss_zero_stakers_creator_capped_rest_unclaimed_forged_seed() {
+    const SEED_REC: u64 = 3_000_000;
+    let mut w = world(true);
+    let a = new_staker(&mut w, 10_000_000);
+    assert!(deposit(&mut w, &a, 10_000_000).is_ok());
+    w.warp(10);
+    let lp = token_amount(&w.svm, &a.lp_ata);
+    assert!(withdraw(&mut w, &a, lp).is_ok());
+    forge_seed(&mut w, SEED_REC);
+    let p0 = w.pool();
+    assert!(!p0.has_real_lp_holders());
+    admin_resolve(&mut w);
+    let r = recover_terminal(&mut w, SEED);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p = w.pool();
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED_REC, "never beyond the seed");
+    assert_eq!(p.total_fees_earned, 0, "nothing booked to the dead shares");
+    assert_eq!(p.total_pool_value(), p0.total_pool_value());
+    assert_eq!(p.terminal_unclaimed_atoms(), SEED - SEED_REC, "rest recorded unclaimed");
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        p.total_pool_value().unwrap() + SEED - SEED_REC,
+        "vault == books + unclaimed"
+    );
 }

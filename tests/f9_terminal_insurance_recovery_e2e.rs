@@ -1213,7 +1213,8 @@ fn f9_v5_first_loss_terminal_returns_creator_seed_s1() {
     assert!(r.is_ok(), "v5 terminal recovery: {}", logs(&r));
     assert_eq!(token_amount(&w.svm, &creator_ata), BUDGET, "S1: the seed went back to the creator");
     let pool = read_pool(&w.svm, &w.pool);
-    assert_eq!(pool.creator_forwarded_atoms, BUDGET);
+    assert_eq!(pool.creator_total_forwarded_atoms(), BUDGET);
+    assert_eq!(pool.creator_seed_atoms(), BUDGET, "close-out: FIRST_LOSS bind recorded the seed");
     assert_eq!(pool.total_fees_earned, 0, "the seed was not booked to stakers");
     // The staker's LP is worth exactly its deposit.
     let alice_lp = token_amount(&w.svm, &w.alice.as_ref().unwrap().lp_ata);
@@ -1228,11 +1229,20 @@ fn f9_v5_first_loss_terminal_returns_creator_seed_s1() {
 
 // ── FEE_ONLY growth-plan reading (2026-10-14): seed recorded at bind, stakers keep growth ─────
 
-fn forge_fee_only_seed(w: &mut World, seed: u64) {
+/// FORGE the close-out seed record (bytes 457..464 + flag byte 333 bit 0). `None` = no record
+/// (a pool bound before the close-out build: bytes and flag cleared).
+fn forge_seed(w: &mut World, seed: Option<u64>) {
     let mut acct = w.svm.get_account(&w.pool).unwrap();
-    acct.data[457..464].copy_from_slice(&seed.to_le_bytes()[..7]);
+    acct.data[457..464].copy_from_slice(&seed.unwrap_or(0).to_le_bytes()[..7]);
+    if seed.is_some() {
+        acct.data[333] |= 1;
+    } else {
+        acct.data[333] &= !1;
+    }
     w.svm.set_account(w.pool, acct).unwrap();
-    assert_eq!(read_pool(&w.svm, &w.pool).fee_only_creator_seed_atoms(), seed);
+    let p = read_pool(&w.svm, &w.pool);
+    assert_eq!(p.creator_seed_atoms(), seed.unwrap_or(0));
+    assert_eq!(p.creator_seed_recorded(), seed.is_some());
 }
 
 fn bind_again(w: &mut World, pool_writable: bool) -> Result<(), litesvm::types::FailedTransactionMetadata> {
@@ -1275,13 +1285,13 @@ fn f9_fee_only_bind_records_creator_seed_from_real_wrapper() {
     let m = w.svm.get_account(&w.market).unwrap();
     let raw = u128::from_le_bytes(m.data[MARKET_INSURANCE_OFF..MARKET_INSURANCE_OFF + 16].try_into().unwrap());
     assert_eq!(raw, BUDGET as u128, "PIN: engine insurance at byte 941 on the real wrapper");
-    assert_eq!(read_pool(&w.svm, &w.pool).fee_only_creator_seed_atoms(), BUDGET);
+    assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
     let r = bind_again(&mut w, false);
     assert_eq!(custom(&r), Some(E_INVALID_ACCOUNT), "{}", logs(&r));
     let r = bind_again(&mut w, true);
     assert!(r.is_err());
     assert_ne!(custom(&r), Some(E_INVALID_ACCOUNT), "{}", logs(&r));
-    assert_eq!(read_pool(&w.svm, &w.pool).fee_only_creator_seed_atoms(), BUDGET);
+    assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
 }
 
 /// Growth above the seed stays with the FEE_ONLY stakers. FORGED: the seed record is lowered to
@@ -1298,7 +1308,7 @@ fn f9_fee_only_growth_above_seed_stays_with_stakers_forged_seed() {
         return;
     };
     const SEED: u64 = 3_000_000;
-    forge_fee_only_seed(&mut w, SEED);
+    forge_seed(&mut w, Some(SEED));
     let p0 = read_pool(&w.svm, &w.pool);
     admin_resolve(&mut w);
     let r = recover_terminal(
@@ -1315,14 +1325,14 @@ fn f9_fee_only_growth_above_seed_stays_with_stakers_forged_seed() {
     let p1 = read_pool(&w.svm, &w.pool);
     assert_eq!(token_amount(&w.svm, &w.creator_ata), 2_000_000, "seed first");
     assert_eq!(p1.total_fees_earned, p0.total_fees_earned);
-    assert_eq!(p1.fee_only_seed_remaining(), 1_000_000);
+    assert_eq!(p1.creator_seed_remaining(), 1_000_000);
     let r = recover_terminal(&mut w, BUDGET - 2_000_000, DEFAULT_OPTS);
     assert!(r.is_ok(), "{}", logs(&r));
     let p2 = read_pool(&w.svm, &w.pool);
     assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED, "creator gets exactly its seed");
     assert_eq!(p2.total_fees_earned - p0.total_fees_earned, BUDGET - SEED, "growth to stakers");
     assert_eq!(p2.creator_surplus_forwarded_atoms(), SEED);
-    assert_eq!(p2.fee_only_seed_remaining(), 0);
+    assert_eq!(p2.creator_seed_remaining(), 0);
     assert_eq!(p2.total_pool_value(), Some(STAKE + BUDGET - SEED));
     assert_eq!(token_amount(&w.svm, &w.vault), STAKE + BUDGET - SEED, "vault == books");
     assert_eq!(token_amount(&w.svm, &w.wrapper_vault), 0);
@@ -1346,7 +1356,7 @@ fn f9_fee_only_no_seed_record_books_budget_to_stakers_forged() {
     let Some(mut w) = world("f9_fee_only_no_seed_record_books_budget_to_stakers_forged") else {
         return;
     };
-    forge_fee_only_seed(&mut w, 0);
+    forge_seed(&mut w, None);
     let p0 = read_pool(&w.svm, &w.pool);
     admin_resolve(&mut w);
     let r = recover_terminal(
@@ -1362,4 +1372,110 @@ fn f9_fee_only_no_seed_record_books_budget_to_stakers_forged() {
     assert_eq!(p1.total_fees_earned - p0.total_fees_earned, BUDGET);
     assert_eq!(token_amount(&w.svm, &w.creator_ata), 0);
     assert_eq!(p1.total_pool_value(), Some(STAKE + BUDGET));
+}
+
+// ── CLOSE-OUT RULE (Khubair 2026-10-14, every v5 mode) — FEE_ONLY edge cases ─────────────────
+
+/// Zero real stakers, fund above the seed. FORGED: the seed record lowered to 3M (the creator
+/// seeded 3M, the fund grew to the 5M BUDGET). The creator gets exactly 3M; the 2M of growth is
+/// NOT the creator's: it is left unbooked in pool.vault (nothing booked to the dead shares) and
+/// recorded as unclaimed (pool bytes 281..288 + 334). A repeat call pays the creator nothing more;
+/// the market still retires.
+/// NEGATIVE CONTROL: on f372fa2 / 96a90483 (the live devnet build) the creator receives all 5M
+/// (`terminal_surplus_to_creator` with no real staker) and the creator-balance assert fails.
+#[test]
+fn closeout_fee_only_zero_stakers_creator_capped_at_seed_rest_unclaimed() {
+    let Some(mut w) = world("closeout_fee_only_zero_stakers_creator_capped_at_seed_rest_unclaimed")
+    else {
+        return;
+    };
+    const SEED: u64 = 3_000_000;
+    let alice = w.alice.take().unwrap();
+    let lp = token_amount(&w.svm, &alice.lp_ata);
+    let slot = w.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    w.svm.warp_to_slot(slot + 100);
+    assert!(withdraw(&mut w, &alice, lp, true).is_ok());
+    forge_seed(&mut w, Some(SEED));
+    let p0 = read_pool(&w.svm, &w.pool);
+    assert!(!p0.has_real_lp_holders(), "PRE: dead shares only");
+    admin_resolve(&mut w);
+    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED, "creator: the seed, never more");
+    assert_eq!(p1.total_pool_value(), p0.total_pool_value(), "nothing booked to dead shares");
+    assert_eq!(p1.total_fees_earned, p0.total_fees_earned);
+    assert_eq!(p1.terminal_unclaimed_atoms(), BUDGET - SEED, "growth recorded as unclaimed");
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        p1.total_pool_value().unwrap() + (BUDGET - SEED),
+        "vault == books + unclaimed (to the atom)"
+    );
+    assert_eq!(token_amount(&w.svm, &w.wrapper_vault), 0);
+    let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
+    assert_eq!(custom(&r), Some(E_NOTHING_TO_RECOVER), "{}", logs(&r));
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED);
+    let admin = w.admin.insecure_clone();
+    let r = admin_close_slab(&mut w, &admin);
+    assert!(r.is_ok(), "{}", logs(&r));
+    assert_eq!(terminal(&w.svm, &w.market), WrapperTerminal::Closed);
+    let p2 = read_pool(&w.svm, &w.pool);
+    assert_eq!(p2.terminal_unclaimed_atoms(), BUDGET - SEED, "still recorded after the close");
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED);
+}
+
+/// Fund below the seed (FORGED record 8M > the 5M fund, i.e. losses ate 3M of the seed): the
+/// creator gets what is left (5M), the stakers 0 of the fund (their principal untouched).
+/// NEGATIVE CONTROL: on 3c715dc (S1-only) the 5M is booked to the stakers.
+#[test]
+fn closeout_fee_only_fund_below_seed_all_to_creator_stakers_zero() {
+    let Some(mut w) = world("closeout_fee_only_fund_below_seed_all_to_creator_stakers_zero") else {
+        return;
+    };
+    forge_seed(&mut w, Some(8_000_000));
+    let p0 = read_pool(&w.svm, &w.pool);
+    assert!(p0.has_real_lp_holders());
+    admin_resolve(&mut w);
+    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET, "creator: what is left of the seed");
+    assert_eq!(p1.total_pool_value(), p0.total_pool_value(), "stakers: 0 of the fund");
+    assert_eq!(p1.creator_seed_remaining(), 3_000_000, "the lost part is simply not there");
+    assert_eq!(p1.terminal_unclaimed_atoms(), 0);
+    assert_eq!(token_amount(&w.svm, &w.vault), p1.total_pool_value().unwrap(), "vault == books");
+}
+
+/// AdminCloseSlab (tag 30) reservation path: a third party pushes the whole budget into
+/// pool.vault with wrapper tag 41 directly; the admin then closes the slab. Tag 30 books only the
+/// part that is not the creator's (BUDGET - seed, growth to the stakers) and leaves the seed
+/// unbooked; the next tag 29 (amount 0, closed market) forwards exactly the seed. FORGED seed 3M.
+#[test]
+fn closeout_fee_only_admin_close_slab_reserves_only_the_seed() {
+    let Some(mut w) = world("closeout_fee_only_admin_close_slab_reserves_only_the_seed") else {
+        return;
+    };
+    const SEED: u64 = 3_000_000;
+    forge_seed(&mut w, Some(SEED));
+    let p0 = read_pool(&w.svm, &w.pool);
+    admin_resolve(&mut w);
+    let vault = w.vault;
+    let r = third_party_tag41(&mut w, BUDGET, vault);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let admin = w.admin.insecure_clone();
+    let r = admin_close_slab(&mut w, &admin);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(
+        p1.total_pool_value().unwrap() - p0.total_pool_value().unwrap(),
+        BUDGET - SEED,
+        "tag 30 books the growth to the stakers, not the seed"
+    );
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), 0);
+    let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p2 = read_pool(&w.svm, &w.pool);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED);
+    assert_eq!(p2.total_pool_value(), p1.total_pool_value());
+    assert_eq!(token_amount(&w.svm, &w.vault), p2.total_pool_value().unwrap(), "vault == books");
 }

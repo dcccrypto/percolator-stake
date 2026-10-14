@@ -58,8 +58,8 @@ pub const GROUP_NEXT_MARKET_ID_OFF: usize = 629;
 pub const GROUP_MODE_OFF: usize = 674;
 /// Header-relative offset of the engine `insurance` balance (u128 LE; the fund wrapper tag 41
 /// withdraws at terminal). v2.2: 349 = market_group_id 32 + `V16ConfigAccount` 297 +
-/// asset_slot_capacity 4 + vault 16. FEE_ONLY growth-plan reading only (2026-10-14): read once,
-/// at BindInsuranceAuthority, to record the creator's seed. `offset_of!` against engine
+/// asset_slot_capacity 4 + vault 16. CLOSE-OUT RULE (2026-10-14, every v5 mode): read once, at
+/// BindInsuranceAuthority, to record the creator's seed. `offset_of!` against engine
 /// 3ce4cbd1 (`MarketGroupV16HeaderAccount`: size 806, mode 674, next_market_id 629, i.e. the
 /// pinned layout); real-bytes pin `f9_fee_only_bind_records_creator_seed_from_real_wrapper`.
 pub const GROUP_INSURANCE_OFF: usize = 349;
