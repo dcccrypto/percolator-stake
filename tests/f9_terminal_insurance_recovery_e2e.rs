@@ -68,6 +68,7 @@ const E_MARKET_NOT_TERMINAL: u32 = 30;
 const E_NOTHING_TO_RECOVER: u32 = 31;
 const E_UNSUPPORTED_WRAPPER_LAYOUT: u32 = 32;
 const E_CREATOR_ACCOUNT_REQUIRED: u32 = 46;
+const E_INSURANCE_CUSTODY_NOT_BOUND: u32 = 47;
 /// FEE_ONLY growth-plan reading: the engine `insurance` balance in a market account (pinned
 /// v2.2 layout; `wrapper_layout::MARKET_INSURANCE_OFF`).
 const MARKET_INSURANCE_OFF: usize = percolator_stake::wrapper_layout::MARKET_INSURANCE_OFF;
@@ -256,6 +257,29 @@ struct Staker {
 thread_local! {
     /// v5 risk mode of the pool `world` creates (2 = FEE_ONLY for the legacy F-9 suite).
     static RISK_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
+    /// M-1: atoms of a NON-creator claim (the staker-reserve fee leg, i.e. trade fees owed to
+    /// someone else) forged into the engine insurance just before the bind. 0 = none.
+    static PRE_BIND_CLAIM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// M-1: forge `x` atoms of another party's claim inside the engine insurance, exactly as an
+/// accrued trade-fee leg sits there: engine `insurance` += x (market 941), the wrapper vault
+/// holds the atoms, `insurance_reserve_accrued_atoms` += x (account 544..560); the BUDGETED
+/// slice (market 1101) is untouched (fee legs are never credited to a budget).
+fn forge_unbudgeted_claim(w: &mut World, x: u64) {
+    let mut m = w.svm.get_account(&w.market).unwrap();
+    let rd = |d: &[u8], o: usize| u128::from_le_bytes(d[o..o + 16].try_into().unwrap());
+    let ins = rd(&m.data, MARKET_INSURANCE_OFF) + x as u128;
+    m.data[MARKET_INSURANCE_OFF..MARKET_INSURANCE_OFF + 16].copy_from_slice(&ins.to_le_bytes());
+    let vault_hdr = MARKET_INSURANCE_OFF - 16; // engine `vault` (u128) precedes `insurance`
+    let v = rd(&m.data, vault_hdr) + x as u128;
+    m.data[vault_hdr..vault_hdr + 16].copy_from_slice(&v.to_le_bytes());
+    let r = rd(&m.data, 544) + x as u128;
+    m.data[544..560].copy_from_slice(&r.to_le_bytes());
+    w.svm.set_account(w.market, m).unwrap();
+    let bal = token_amount(&w.svm, &w.wrapper_vault);
+    let (wv, mint, wva) = (w.wrapper_vault, w.mint, w.wrapper_vault_auth);
+    set_token_account(&mut w.svm, wv, &mint, &wva, bal + x);
 }
 
 fn world(name: &str) -> Option<World> {
@@ -432,6 +456,10 @@ fn world(name: &str) -> Option<World> {
         set_token_account(&mut w.svm, ca, &mint, &admin, 0);
     }
     w.alice = Some(deposit(&mut w, STAKE).expect("staker deposit while Live"));
+    let claim = PRE_BIND_CLAIM.with(|c| c.get());
+    if claim > 0 {
+        forge_unbudgeted_claim(&mut w, claim);
+    }
     // Real Bind (tag 19). FEE_ONLY growth-plan reading: the pool is writable (the bind records
     // the creator's seed = the engine insurance now, i.e. BUDGET).
     let (admin_k, payer_k) = (w.admin.insecure_clone(), w.payer.insecure_clone());
@@ -1478,4 +1506,130 @@ fn closeout_fee_only_admin_close_slab_reserves_only_the_seed() {
     assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED);
     assert_eq!(p2.total_pool_value(), p1.total_pool_value());
     assert_eq!(token_amount(&w.svm, &w.vault), p2.total_pool_value().unwrap(), "vault == books");
+}
+
+// ── Security review 2026-10-14: M-1 (seed = creator's own money) and M-2 (custody) ──────────
+
+/// M-1: the seed recorded at bind is the creator's OWN money only. FORGED: 2M of another
+/// party's claim (an accrued staker-reserve fee leg) sits in the engine insurance at bind. The
+/// record is the budgeted slice (BUDGET), not the raw insurance (BUDGET + 2M), so at close the
+/// creator cannot take that 2M out of the stakers' share. Also pins the real wrapper offsets of
+/// the budget total (1101) and reserved credit (1085).
+/// NEGATIVE CONTROL: on 8291e92 the record is the raw engine insurance, BUDGET + 2M.
+#[test]
+fn closeout_m1_seed_excludes_other_claims_in_insurance_forged_fee_leg() {
+    const CLAIM: u64 = 2_000_000;
+    PRE_BIND_CLAIM.with(|c| c.set(CLAIM));
+    let w = world("closeout_m1_seed_excludes_other_claims_in_insurance_forged_fee_leg");
+    PRE_BIND_CLAIM.with(|c| c.set(0));
+    let Some(w) = w else { return };
+    let m = w.svm.get_account(&w.market).unwrap();
+    let rd = |o: usize| u128::from_le_bytes(m.data[o..o + 16].try_into().unwrap());
+    assert_eq!(rd(MARKET_INSURANCE_OFF), (BUDGET + CLAIM) as u128, "PRE: claim inside insurance");
+    assert_eq!(
+        rd(percolator_stake::wrapper_layout::MARKET_INS_BUDGET_TOTAL_OFF),
+        BUDGET as u128,
+        "PIN: real wrapper budget total at 1101 == the creator's top-up"
+    );
+    assert_eq!(rd(percolator_stake::wrapper_layout::MARKET_INS_CREDIT_RESERVED_OFF), 0, "PIN 1085");
+    let p = read_pool(&w.svm, &w.pool);
+    assert!(p.creator_seed_recorded());
+    assert_eq!(p.creator_seed_atoms(), BUDGET, "seed = the creator's own (budgeted) money");
+}
+
+fn rotate(w: &mut World, tag: u8, pool_writable: bool) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let (admin_k, payer_k) = (w.admin.insecure_clone(), w.payer.insecure_clone());
+    let pool_meta = if pool_writable {
+        AccountMeta::new(w.pool, false)
+    } else {
+        AccountMeta::new_readonly(w.pool, false)
+    };
+    send(
+        &mut w.svm,
+        &payer_k,
+        &[&admin_k],
+        Instruction {
+            program_id: w.stake_id,
+            accounts: vec![
+                AccountMeta::new(w.admin.pubkey(), true),
+                pool_meta,
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new_readonly(w.admin.pubkey(), true), // new target = the creator
+                AccountMeta::new(w.market, false),
+                AccountMeta::new_readonly(w.wrapper_id, false),
+            ],
+            data: vec![tag],
+        },
+    )
+}
+
+fn burn(w: &mut World) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let (admin_k, payer_k) = (w.admin.insecure_clone(), w.payer.insecure_clone());
+    send(
+        &mut w.svm,
+        &payer_k,
+        &[&admin_k],
+        Instruction {
+            program_id: w.stake_id,
+            accounts: vec![
+                AccountMeta::new(w.admin.pubkey(), true),
+                AccountMeta::new(w.pool, false),
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new(w.market, false),
+                AccountMeta::new_readonly(w.wrapper_id, false),
+            ],
+            data: vec![21u8],
+        },
+    )
+}
+
+fn custody(w: &World) -> ([u8; 32], [u8; 32]) {
+    percolator_stake::state::read_wrapper_asset0_insurance_keys(&w.svm.get_account(&w.market).unwrap().data)
+        .expect("pinned market")
+}
+
+/// M-2 on the real wrapper (FEE_ONLY, Live, not burned):
+///   * PIN: after the bind, asset 0's insurance authority (1422) and operator (1454) are vault_auth.
+///   * Tag 22 (operator back to the creator) with a read-only pool: 16, nothing moves.
+///   * Tag 22 writable: the operator is the creator's again AND the seed record is cleared.
+///   * BurnAssetAdmin now refuses with 47 (custody not bound); nothing burned.
+///   * Tag 20 (authority back) also clears; a re-bind (tag 19) records a fresh seed and restores
+///     custody; then the burn succeeds.
+/// NEGATIVE CONTROL: on 8291e92 the record survives tag 22 (stale seed) and the burn succeeds
+/// with the operator on the creator.
+#[test]
+fn closeout_m2_rotate_back_clears_seed_and_burn_requires_custody() {
+    let Some(mut w) = world("closeout_m2_rotate_back_clears_seed_and_burn_requires_custody") else {
+        return;
+    };
+    let va = w.vault_auth.to_bytes();
+    let me = w.admin.pubkey().to_bytes();
+    assert_eq!(custody(&w), (va, va), "PIN: authority @1422 and operator @1454 = vault_auth");
+    assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
+    let r = rotate(&mut w, 22, false);
+    assert_eq!(custom(&r), Some(E_INVALID_ACCOUNT), "read-only v5 pool: {}", logs(&r));
+    assert_eq!(custody(&w), (va, va));
+    let r = rotate(&mut w, 22, true);
+    assert!(r.is_ok(), "tag 22: {}", logs(&r));
+    assert_eq!(custody(&w), (va, me), "operator back with the creator");
+    let p = read_pool(&w.svm, &w.pool);
+    assert!(!p.creator_seed_recorded(), "seed record cleared");
+    assert_eq!(p.creator_seed_atoms(), 0);
+    let r = burn(&mut w);
+    assert_eq!(custom(&r), Some(E_INSURANCE_CUSTODY_NOT_BOUND), "{}", logs(&r));
+    assert!(!read_pool(&w.svm, &w.pool).asset_admin_burned());
+    let r = rotate(&mut w, 20, true);
+    assert!(r.is_ok(), "tag 20: {}", logs(&r));
+    assert_eq!(custody(&w), (me, me));
+    let r = burn(&mut w);
+    assert_eq!(custom(&r), Some(E_INSURANCE_CUSTODY_NOT_BOUND), "{}", logs(&r));
+    let r = bind_again(&mut w, true);
+    assert!(r.is_ok(), "re-bind: {}", logs(&r));
+    assert_eq!(custody(&w), (va, va));
+    let p = read_pool(&w.svm, &w.pool);
+    assert!(p.creator_seed_recorded());
+    assert_eq!(p.creator_seed_atoms(), BUDGET, "fresh seed at the re-bind");
+    let r = burn(&mut w);
+    assert!(r.is_ok(), "burn with custody bound: {}", logs(&r));
+    assert!(read_pool(&w.svm, &w.pool).asset_admin_burned());
 }

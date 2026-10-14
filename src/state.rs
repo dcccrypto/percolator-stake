@@ -1180,6 +1180,16 @@ impl StakePool {
         self._reserved[RESERVED_IDX_CLOSEOUT_FLAGS] |= CLOSEOUT_FLAG_SEED_RECORDED;
     }
 
+    /// M-2 (security review 2026-10-14): forget the seed record (bytes 457..464 zeroed, flag
+    /// cleared). Called when the insurance authority or operator is rotated back to the creator
+    /// (tags 20 / 22): from then on the creator controls the fund again and only a fresh bind
+    /// (tag 19) may record a seed. A stale record would let the creator take staker growth up to
+    /// a seed it already withdrew.
+    pub fn clear_creator_seed(&mut self) {
+        self._v5_reserved[V5_RESERVED_CREATOR_SEED].copy_from_slice(&[0u8; 7]);
+        self._reserved[RESERVED_IDX_CLOSEOUT_FLAGS] &= !CLOSEOUT_FLAG_SEED_RECORDED;
+    }
+
     /// Every atom this pool has sent to the creator (`pool.admin`) out of the vault: the S1
     /// creator-class cursor of earlier builds (448) plus the terminal surplus counter (464), the
     /// only counter this build advances. Saturating (both are bounded by the vault's history).
@@ -1566,6 +1576,42 @@ pub fn read_wrapper_engine_insurance(data: &[u8]) -> Option<u128> {
     }
     let off = crate::wrapper_layout::MARKET_INSURANCE_OFF;
     Some(u128::from_le_bytes(data.get(off..off + 16)?.try_into().ok()?))
+}
+
+/// M-1: `(insurance, credit_reserved, budget_total)` of a pinned-layout wrapper MARKET account
+/// (engine header u128s at 941 / 1085 / 1101). `None` for anything else; the caller refuses.
+/// Feed to `math::creator_seed_at_bind`.
+pub fn read_wrapper_insurance_parts(data: &[u8]) -> Option<(u128, u128, u128)> {
+    if !crate::wrapper_layout::header_is_pinned(data)
+        || data.get(WRAPPER_OFF_KIND) != Some(&WRAPPER_KIND_MARKET)
+        || data.len() < WRAPPER_MIN_MARKET_LEN
+    {
+        return None;
+    }
+    let rd = |off: usize| -> Option<u128> {
+        Some(u128::from_le_bytes(data.get(off..off + 16)?.try_into().ok()?))
+    };
+    Some((
+        rd(crate::wrapper_layout::MARKET_INSURANCE_OFF)?,
+        rd(crate::wrapper_layout::MARKET_INS_CREDIT_RESERVED_OFF)?,
+        rd(crate::wrapper_layout::MARKET_INS_BUDGET_TOTAL_OFF)?,
+    ))
+}
+
+/// M-2: asset 0's `(insurance_authority, insurance_operator)` of a pinned-layout wrapper MARKET
+/// account (profile at the start of asset slot 0). `None` for anything else; the caller refuses.
+pub fn read_wrapper_asset0_insurance_keys(data: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    if !crate::wrapper_layout::header_is_pinned(data)
+        || data.get(WRAPPER_OFF_KIND) != Some(&WRAPPER_KIND_MARKET)
+    {
+        return None;
+    }
+    let a = crate::wrapper_layout::ASSET0_INSURANCE_AUTHORITY_OFF;
+    let o = crate::wrapper_layout::ASSET0_INSURANCE_OPERATOR_OFF;
+    Some((
+        data.get(a..a + 32)?.try_into().ok()?,
+        data.get(o..o + 32)?.try_into().ok()?,
+    ))
 }
 
 pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {

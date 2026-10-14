@@ -63,9 +63,23 @@ pub const GROUP_MODE_OFF: usize = 674;
 /// 3ce4cbd1 (`MarketGroupV16HeaderAccount`: size 806, mode 674, next_market_id 629, i.e. the
 /// pinned layout); real-bytes pin `f9_fee_only_bind_records_creator_seed_from_real_wrapper`.
 pub const GROUP_INSURANCE_OFF: usize = 349;
+/// Header-relative `source_insurance_credit_reserved_total_atoms` (u128 LE): insurance reserved
+/// for source credits, not the insurance authority's. Engine 3ce4cbd1 layout dump: 493.
+pub const GROUP_INS_CREDIT_RESERVED_OFF: usize = 493;
+/// Header-relative `insurance_domain_budget_remaining_total` (u128 LE): the BUDGETED slice of
+/// insurance, the only part the insurance authority/operator can withdraw (wrapper tags 57/41).
+/// Fee legs (protocol / LP / staker reserve / creator), reserved credit and unrouted rent are
+/// all outside it (wrapper CloseSlab: `unbudgeted = I - reserved - budget - rent_unrouted`).
+/// Engine 3ce4cbd1 layout dump: 509.
+pub const GROUP_INS_BUDGET_TOTAL_OFF: usize = 509;
 
 /// Fixed wrapper-owned region at the start of every asset slot (`Market.wrapper`).
 pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
+/// `AssetOracleProfileV16.insurance_authority` / `insurance_operator` within the asset's wrapper
+/// region (4 x u8, u32, 5 x u16, u8, [u8; 5] = 24 B before them). Real-bytes pin:
+/// `closeout_burn_requires_custody_and_rotate_back_clears_seed`.
+pub const ASSET_INSURANCE_AUTHORITY_OFF: usize = 24;
+pub const ASSET_INSURANCE_OPERATOR_OFF: usize = 56;
 /// `AssetOracleProfileV16.insurance_top_up` within the asset's wrapper region.
 pub const ASSET_INSURANCE_TOP_UP_OFF: usize = 496;
 /// `AssetControlSequencesV16` within the asset's wrapper region (= profile length).
@@ -98,6 +112,10 @@ pub const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = MARKET_GROUP_OFF + GROUP
 pub const MARKET_MODE_OFF: usize = MARKET_GROUP_OFF + GROUP_MODE_OFF;
 /// Engine `insurance` balance (u128 LE).
 pub const MARKET_INSURANCE_OFF: usize = MARKET_GROUP_OFF + GROUP_INSURANCE_OFF;
+pub const MARKET_INS_CREDIT_RESERVED_OFF: usize = MARKET_GROUP_OFF + GROUP_INS_CREDIT_RESERVED_OFF;
+pub const MARKET_INS_BUDGET_TOTAL_OFF: usize = MARKET_GROUP_OFF + GROUP_INS_BUDGET_TOTAL_OFF;
+pub const ASSET0_INSURANCE_AUTHORITY_OFF: usize = ASSET0_WRAPPER_START + ASSET_INSURANCE_AUTHORITY_OFF;
+pub const ASSET0_INSURANCE_OPERATOR_OFF: usize = ASSET0_WRAPPER_START + ASSET_INSURANCE_OPERATOR_OFF;
 /// Shortest market account that can hold the engine header (and so the `mode` byte).
 pub const MIN_MARKET_ACCOUNT_LEN: usize = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
 
@@ -113,6 +131,12 @@ const _: () = assert!(ASSET0_TRADE_FEE_OFF == 1934);
 const _: () = assert!(MARKET_ASSET_GENERATION_FRONTIER_OFF == 1221);
 const _: () = assert!(MARKET_MODE_OFF == 1266);
 const _: () = assert!(MARKET_INSURANCE_OFF == 941);
+const _: () = assert!(MARKET_INS_CREDIT_RESERVED_OFF == 1085);
+const _: () = assert!(MARKET_INS_BUDGET_TOTAL_OFF == 1101);
+const _: () = assert!(ASSET0_INSURANCE_AUTHORITY_OFF == 1422);
+const _: () = assert!(ASSET0_INSURANCE_OPERATOR_OFF == 1454);
+const _: () = assert!(GROUP_INS_BUDGET_TOTAL_OFF + 16 <= MARKET_GROUP_LEN);
+const _: () = assert!(ASSET_INSURANCE_OPERATOR_OFF + 32 <= ASSET_INSURANCE_TOP_UP_OFF);
 const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1398);
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);

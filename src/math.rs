@@ -602,6 +602,34 @@ pub fn closeout_creator_share(
     surplus.min(entitled.saturating_sub(forwarded))
 }
 
+/// CLOSE-OUT RULE, M-1 (security review 2026-10-14): the creator's seed measured at bind = the
+/// creator's OWN money in the fund, i.e. the slice the insurance authority could withdraw:
+///
+/// ```text
+/// seed = min(budget_total, insurance - credit_reserved) - net_deployed     (saturating, u64)
+/// ```
+///
+/// * `budget_total` (`insurance_domain_budget_remaining_total`) excludes by construction every
+///   other party's claim inside `insurance`: the protocol / LP / staker-reserve (tag 87) /
+///   creator fee legs (paid by their own tags; the creator fee leg would otherwise be counted
+///   twice), unrouted rent (the vault LP's claim) and reserved source credit.
+/// * `insurance - credit_reserved` caps it where losses spent insurance below the budgets.
+/// * `net_deployed`: staker principal deployed and not recovered (always 0 at bind; defensive).
+///
+/// Always `seed <= budget_total`, `seed <= insurance - credit_reserved <= insurance`.
+/// Kani: `kani_closeout_seed_at_bind_excludes_claims`.
+pub fn creator_seed_at_bind(
+    insurance: u128,
+    credit_reserved: u128,
+    budget_total: u128,
+    net_deployed: u64,
+) -> u64 {
+    let own = budget_total.min(insurance.saturating_sub(credit_reserved));
+    u64::try_from(own)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(net_deployed)
+}
+
 /// CLOSE-OUT RULE: split one settlement's `surplus` into `(creator, stakers, unclaimed)`.
 ///
 /// * `creator = closeout_creator_share(..)`;

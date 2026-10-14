@@ -14,7 +14,7 @@
 //! 75dd991 rule (FIRST_LOSS creator class forwarded in full) fails these properties.
 
 use bytemuck::Zeroable;
-use percolator_stake::math::{closeout_creator_share, closeout_split};
+use percolator_stake::math::{closeout_creator_share, closeout_split, creator_seed_at_bind};
 use percolator_stake::state::{self, StakePool};
 use proptest::prelude::*;
 
@@ -132,12 +132,90 @@ fn closeout_first_loss_growth_on_creator_units_goes_to_stakers() {
     assert_eq!(q.closeout_creator_share(9_000_000, Some(3_000_000)), 3_000_000);
 }
 
+/// M-1 (security review 2026-10-14): the seed at bind is the budgeted slice only; other
+/// parties' claims in the insurance (fee legs, rent, reserved credit) never raise it.
+/// NEGATIVE CONTROL: 8291e92 recorded the raw insurance (here 7M / 12M).
+#[test]
+fn closeout_m1_seed_at_bind_examples() {
+    // 5M budgeted (the creator's top-up) + 2M fee legs: seed 5M.
+    assert_eq!(creator_seed_at_bind(7_000_000, 0, 5_000_000, 0), 5_000_000);
+    // + 5M reserved credit: still 5M.
+    assert_eq!(creator_seed_at_bind(12_000_000, 5_000_000, 5_000_000, 0), 5_000_000);
+    // Losses spent insurance below the budgets: capped at insurance - reserved.
+    assert_eq!(creator_seed_at_bind(4_000_000, 1_000_000, 5_000_000, 0), 3_000_000);
+    assert_eq!(creator_seed_at_bind(1, 2, 5_000_000, 0), 0);
+    // Defensive: net deployed staker principal is never the creator's.
+    assert_eq!(creator_seed_at_bind(7_000_000, 0, 5_000_000, 6_000_000), 0);
+    assert_eq!(creator_seed_at_bind(u128::MAX, 0, u128::MAX, 0), u64::MAX);
+}
+
+/// M-1 / M-2 readers on synthetic pinned-layout bytes, and the record clear.
+#[test]
+fn closeout_m1_m2_readers_and_clear() {
+    use percolator_stake::wrapper_layout as wl;
+    let mut d = vec![0u8; wl::ASSET0_INSURANCE_OPERATOR_OFF + 32];
+    d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
+    d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
+    d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
+    d[wl::MARKET_INSURANCE_OFF..wl::MARKET_INSURANCE_OFF + 16].copy_from_slice(&7u128.to_le_bytes());
+    d[wl::MARKET_INS_CREDIT_RESERVED_OFF..wl::MARKET_INS_CREDIT_RESERVED_OFF + 16].copy_from_slice(&1u128.to_le_bytes());
+    d[wl::MARKET_INS_BUDGET_TOTAL_OFF..wl::MARKET_INS_BUDGET_TOTAL_OFF + 16].copy_from_slice(&5u128.to_le_bytes());
+    d[wl::ASSET0_INSURANCE_AUTHORITY_OFF..wl::ASSET0_INSURANCE_AUTHORITY_OFF + 32].copy_from_slice(&[3; 32]);
+    d[wl::ASSET0_INSURANCE_OPERATOR_OFF..wl::ASSET0_INSURANCE_OPERATOR_OFF + 32].copy_from_slice(&[4; 32]);
+    assert_eq!(state::read_wrapper_insurance_parts(&d), Some((7, 1, 5)));
+    assert_eq!(state::read_wrapper_asset0_insurance_keys(&d), Some(([3; 32], [4; 32])));
+    let mut bad = d.clone();
+    bad[8..10].copy_from_slice(&18u16.to_le_bytes());
+    assert_eq!(state::read_wrapper_insurance_parts(&bad), None);
+    assert_eq!(state::read_wrapper_asset0_insurance_keys(&bad), None);
+    let mut closed = d.clone();
+    closed[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_CLOSED_MARKET;
+    assert_eq!(state::read_wrapper_asset0_insurance_keys(&closed), None);
+    let short = &d[..wl::ASSET0_INSURANCE_OPERATOR_OFF + 31];
+    assert_eq!(state::read_wrapper_asset0_insurance_keys(short), None);
+    // Clear: bytes and flag gone; neighbours untouched.
+    let mut p = v5_pool(false);
+    p.record_creator_seed(5_000_000);
+    p.set_terminal_unclaimed_atoms(u64::MAX);
+    p._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL] = 1;
+    p.clear_creator_seed();
+    assert!(!p.creator_seed_recorded());
+    assert_eq!(p.creator_seed_atoms(), 0);
+    assert_eq!(&p._v5_reserved[state::V5_RESERVED_CREATOR_SEED], &[0u8; 7]);
+    assert_eq!(p.terminal_unclaimed_atoms(), u64::MAX);
+    assert_eq!(p._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL], 1);
+    assert_eq!(p.closeout_creator_share(9_000_000, None), 0, "no record: nothing to the creator");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Full-width proptests
 // ─────────────────────────────────────────────────────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// M-1 seed at bind, full u128 range: never above the budgeted slice, never above insurance
+    /// net of reserved credit, exactly the formula, and blind to any claim added to insurance
+    /// outside the budget (a fee leg / rent can only lower the cap, never raise the seed).
+    #[test]
+    fn closeout_m1_seed_at_bind_full_width(
+        insurance in any::<u128>(),
+        reserved in any::<u128>(),
+        budget in any::<u128>(),
+        deployed in any::<u64>(),
+        claim in any::<u128>(),
+    ) {
+        let seed = creator_seed_at_bind(insurance, reserved, budget, deployed);
+        prop_assert!(seed as u128 <= budget);
+        prop_assert!(seed as u128 <= insurance.saturating_sub(reserved));
+        let own = budget.min(insurance.saturating_sub(reserved));
+        prop_assert_eq!(seed, u64::try_from(own).unwrap_or(u64::MAX).saturating_sub(deployed));
+        let with_claim = creator_seed_at_bind(insurance.saturating_add(claim), reserved, budget, deployed);
+        prop_assert!(with_claim as u128 <= budget, "a claim outside the budget never raises the seed beyond it");
+        if budget <= insurance.saturating_sub(reserved) {
+            prop_assert_eq!(with_claim, seed, "fee legs / rent in insurance do not change the seed");
+        }
+    }
 
     /// The pure split, full u64 range: conserved to the atom; creator <= surplus; creator never
     /// beyond the seed cumulatively (`forwarded + creator <= seed` whenever `forwarded <= seed`,

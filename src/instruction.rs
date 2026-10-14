@@ -202,8 +202,10 @@ pub enum StakeInstruction {
     /// late call fails with EngineLockActive instead, not Unauthorized.
     ///
     /// CLOSE-OUT RULE (2026-10-14, every v5 pool: FIRST_LOSS and FEE_ONLY): the bind also
-    /// records the creator's insurance seed = the market's engine insurance balance now
-    /// (wrapper market byte 941; pool bytes 457..464 + flag byte 333 bit 0), which caps what the
+    /// records the creator's insurance seed = the creator's own money in the fund now
+    /// (`math::creator_seed_at_bind`: budgeted insurance, wrapper market byte 1101, capped by
+    /// insurance 941 minus reserved credit 1085; pool bytes 457..464 + flag byte 333 bit 0),
+    /// which caps what the
     /// terminal settlement returns to the creator. The pool account must be writable for every
     /// v5 pool (`InvalidAccount`, 16, if not) and the market must be on the pinned layout
     /// (`UnsupportedWrapperLayout`, 32). A FEE_ONLY re-bind (after tag 20) overwrites it.
@@ -235,7 +237,8 @@ pub enum StakeInstruction {
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
-    ///   1. `[]` Pool PDA
+    ///   1. `[writable]` Pool PDA (v5 pools: the seed record is cleared, M-2; `[]` still
+    ///      accepted on a legacy pool; a read-only v5 pool is refused with 16)
     ///   2. `[]` Vault authority PDA (the CURRENT authority; signed via CPI)
     ///   3. `[signer]` New target authority (the successor; co-signs the outer tx)
     ///   4. `[writable]` Slab / market account (wrapper-owned)
@@ -255,6 +258,11 @@ pub enum StakeInstruction {
     /// authority check, so calling this after the market has been resolved (e.g.
     /// via `AdminResolveMarket`, tag 24) fails with EngineLockActive instead,
     /// regardless of whether asset_admin was already burned.
+    ///
+    /// M-2 (security review 2026-10-14): refused with `InsuranceCustodyNotBound` (47) unless
+    /// asset 0's `insurance_authority` AND `insurance_operator` are both this pool's `vault_auth`
+    /// (read from the market account). Rotating either back (tag 20 / 22) also clears the
+    /// close-out seed record of a v5 pool; a re-bind (tag 19) records a fresh one.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (current asset_admin == pool.admin)
@@ -281,7 +289,8 @@ pub enum StakeInstruction {
     ///
     /// Accounts:
     ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
-    ///   1. `[]` Pool PDA
+    ///   1. `[writable]` Pool PDA (v5 pools: the seed record is cleared, M-2; `[]` still
+    ///      accepted on a legacy pool; a read-only v5 pool is refused with 16)
     ///   2. `[]` Vault authority PDA (the CURRENT operator; signed via CPI)
     ///   3. `[signer]` New target operator (co-signs the outer tx)
     ///   4. `[writable]` Slab / market account (wrapper-owned)
@@ -401,9 +410,10 @@ pub enum StakeInstruction {
     /// The pool PDA signs via `invoke_signed` (`[b"stake_pool", slab, bump]`).
     /// CloseSlab's primary sweep lands in account 5 (a token account owned by the
     /// pool PDA). This instruction moves it into `pool.vault` and books it
-    /// (`StakePool::book_terminal_recovery`), except the creator's share
-    /// (`math::terminal_creator_share`, S1 / S2), which stays unbooked in `pool.vault` for the
-    /// next `RecoverTerminalInsurance` (amount 0) to forward. Pending wrapper fee payouts are
+    /// (`StakePool::book_closeout_remainder`), except the creator's seed return
+    /// (`StakePool::closeout_creator_share` with the seed cap only: >= the creator's true share),
+    /// which stays unbooked in `pool.vault` for the next `RecoverTerminalInsurance` (amount 0) to
+    /// forward; that call books any excess to the stakers. Pending wrapper fee payouts are
     /// accrued BEFORE the close (the payout counter is unreadable afterwards). The slab and vault-account rent
     /// refunds that the wrapper pays to the pool PDA are forwarded to the admin
     /// signer. It sets the pool's `market_resolved` flag.

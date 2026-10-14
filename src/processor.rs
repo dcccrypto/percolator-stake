@@ -1812,10 +1812,11 @@ fn process_withdraw(
 // pool value through the wrapper's insurance-unit ledger. Tag 3 returns `DeprecatedV5`
 // (dispatch below). I-S1 (restated after S1, security review S-L1 2026-10-14): no
 // admin-signed path moves BOOKED pool value anywhere but to stakers. The one path that pays
-// `pool.admin` is RecoverTerminalInsurance's S1 forward, and it is capped at the vault balance
-// minus booked pool value (`math::terminal_creator_share`): only unbooked terminal surplus
-// (the creator's seed, or everything when stakers never took insurance risk) can go there.
-// Proof property: `kani_s1_terminal_settlement_conserves` asserts `v1 >= v0`.
+// `pool.admin` is RecoverTerminalInsurance's close-out forward (`StakePool::
+// closeout_creator_share`): capped at the vault balance minus booked pool value AND, in total,
+// at the seed recorded at bind (less what was already forwarded). Only unbooked terminal
+// surplus, never more than the creator's seed, can go there.
+// Proof property: `kani_closeout_settlement_conserves` asserts `v1 >= v0`.
 
 // ═══════════════════════════════════════════════════════════════
 // 4: UpdateConfig
@@ -2240,11 +2241,15 @@ fn process_bind_insurance_authority(
     }
 
     // CLOSE-OUT RULE (2026-10-14, every v5 mode): record the creator's insurance seed = the
-    // market's engine insurance balance (wrapper market byte 941) at the moment the pool takes
-    // custody of it. Before this bind the admin is the insurance authority and may withdraw or
-    // top up at will, so everything in the fund is the creator's; after it, only `vault_auth`
-    // can top up (wrapper tag 9 `expect_live_authority`) or withdraw. Read from the pinned
-    // layout only (fail closed), BEFORE the CPIs (they do not move insurance).
+    // creator's OWN money in the fund at the moment the pool takes custody of it (M-1, security
+    // review 2026-10-14): the BUDGETED insurance (what the authority/operator could withdraw),
+    // capped by insurance net of reserved credit (`math::creator_seed_at_bind`). Other parties'
+    // claims inside the engine insurance (protocol / LP / staker-reserve / creator fee legs,
+    // unrouted rent, reserved credit) are NOT the creator's seed. Before this bind the admin is
+    // the insurance authority; after it only `vault_auth` can top up (wrapper tag 9
+    // `expect_live_authority`) or withdraw. Read from the pinned layout only (fail closed),
+    // BEFORE the CPIs (they do not move insurance). Subtracting, not refusing: a refusal would
+    // block the bind (the creator-drain lock) while claims the creator cannot clear are open.
     // `net_deployed` (staker principal flushed and not yet recovered) is subtracted defensively:
     // it is always 0 here, because a FIRST_LOSS sync tops up as `vault_auth`, which the wrapper
     // refuses until this bind has made it the insurance authority. The pool account must be
@@ -2254,9 +2259,15 @@ fn process_bind_insurance_authority(
         if slab.owner != percolator_program.key {
             return Err(ProgramError::IllegalOwner);
         }
-        let ins = state::read_wrapper_engine_insurance(&slab.try_borrow_data()?)
-            .ok_or(StakeError::UnsupportedWrapperLayout)?;
-        Some(u64::try_from(ins).unwrap_or(u64::MAX).saturating_sub(net_deployed))
+        let (insurance, credit_reserved, budget_total) =
+            state::read_wrapper_insurance_parts(&slab.try_borrow_data()?)
+                .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        Some(crate::math::creator_seed_at_bind(
+            insurance,
+            credit_reserved,
+            budget_total,
+            net_deployed,
+        ))
     } else {
         None
     };
@@ -2394,6 +2405,25 @@ fn process_burn_asset_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
         return Err(StakeError::InvalidPda.into());
     }
 
+    // M-2 (security review 2026-10-14): burning the asset admin disables the rotate-back escape
+    // for good, so it must only seal a pool that actually holds custody of the insurance: BOTH
+    // asset 0's `insurance_authority` (tags 41 / 9) and `insurance_operator` (tag 57) must be
+    // this pool's `vault_auth`. Otherwise a creator could rotate the operator back (tag 22),
+    // burn, and keep a tag-57 drain path behind a "burned" pool and a stale seed record.
+    {
+        if slab.owner != percolator_program.key {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let (authority, operator) =
+            state::read_wrapper_asset0_insurance_keys(&slab.try_borrow_data()?)
+                .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        let va = expected_vault_auth.to_bytes();
+        if authority != va || operator != va {
+            msg!("BurnAssetAdmin: insurance authority and operator must both be the pool's vault_auth");
+            return Err(StakeError::InsuranceCustodyNotBound.into());
+        }
+    }
+
     cpi::cpi_burn_asset_admin(
         percolator_program,
         admin,      // current asset_admin; signer
@@ -2458,7 +2488,7 @@ fn process_rotate_insurance_operator(
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
 
-    let (pool_slab, pool_percolator) = {
+    let (pool_slab, pool_percolator, v5_pool) = {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
@@ -2479,8 +2509,13 @@ fn process_rotate_insurance_operator(
             msg!("RotateInsuranceOperator: asset_admin burn is final; rotate-back is disabled");
             return Err(StakeError::Unauthorized.into());
         }
-        (pool.slab, pool.percolator_program)
+        (pool.slab, pool.percolator_program, pool.is_v5_risk_mode())
     };
+    // M-2 (security review 2026-10-14): a v5 pool forgets its seed record below, so the pool
+    // account must be writable (checked before any CPI).
+    if v5_pool {
+        validate_account_writable(pool_pda)?;
+    }
 
     if pool_slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
@@ -2504,6 +2539,12 @@ fn process_rotate_insurance_operator(
         vault_auth_seeds,
     )?;
 
+    if v5_pool {
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool = pool_from_data_mut(&mut pool_data[..])?;
+        pool.clear_creator_seed();
+        msg!("close-out: creator seed record cleared (custody rotated back to the creator; re-bind to record a new seed)");
+    }
     msg!("RotateInsuranceOperator: insurance_operator rotated off vault_auth PDA to new target");
     Ok(())
 }
@@ -2544,7 +2585,7 @@ fn process_rotate_insurance_authority(
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
 
-    let (pool_slab, pool_percolator) = {
+    let (pool_slab, pool_percolator, v5_pool) = {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
@@ -2566,8 +2607,13 @@ fn process_rotate_insurance_authority(
             msg!("RotateInsuranceAuthority: asset_admin burn is final; rotate-back is disabled");
             return Err(StakeError::Unauthorized.into());
         }
-        (pool.slab, pool.percolator_program)
+        (pool.slab, pool.percolator_program, pool.is_v5_risk_mode())
     };
+    // M-2 (security review 2026-10-14): a v5 pool forgets its seed record below, so the pool
+    // account must be writable (checked before any CPI).
+    if v5_pool {
+        validate_account_writable(pool_pda)?;
+    }
 
     if pool_slab != slab.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
@@ -2592,6 +2638,12 @@ fn process_rotate_insurance_authority(
         vault_auth_seeds,
     )?;
 
+    if v5_pool {
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool = pool_from_data_mut(&mut pool_data[..])?;
+        pool.clear_creator_seed();
+        msg!("close-out: creator seed record cleared (custody rotated back to the creator; re-bind to record a new seed)");
+    }
     msg!("RotateInsuranceAuthority: insurance_authority rotated off vault_auth PDA to new target");
     Ok(())
 }
@@ -2876,10 +2928,10 @@ fn accrue_fees_inner(
     // AccrueFees instruction refuses explicitly (NoRealLpHolders) before reaching here.
     // S2 (F5, v5 FIRST_LOSS pools): fees the wrapper paid while the pool had no real staker
     // belong to nobody who staked for them. Consume them from the attribution cursor instead of
-    // leaving them for the FIRST staker to book. They stay as unbooked vault surplus and are
-    // recorded as owed to the creator (2026-10-14: before, the terminal recovery booked them to
-    // whoever held LP then, i.e. a staker who joined later still captured them at terminal); the
-    // terminal settlement forwards them to `pool.admin` (`math::terminal_creator_share`).
+    // leaving them for the FIRST staker to book (a later depositor is not priced with them).
+    // They stay as unbooked vault surplus and the counter at 472 records them (informational).
+    // CLOSE-OUT RULE: they are NOT paid to the creator; at the close they are part of the
+    // surplus booked to the stakers then holding LP (or recorded unclaimed with none).
     if fee_delta > 0 && pool.pool_mode == 0 && pool.is_first_loss() && !pool.has_real_lp_holders() {
         pool.mode0_fees_attributed = pool
             .mode0_fees_attributed
@@ -4387,9 +4439,6 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     let pool = pool_from_data_mut(&mut pool_data[..])?;
     // The market is Resolved (checked above) or now Closed: both terminal, so a
     // surplus in pool.vault may be booked (see `book_terminal_recovery`).
-    // S1 / S2 (2026-10-14): the creator's part of the surplus (`math::terminal_creator_share`)
-    // is NOT booked here; it stays in the vault and the next RecoverTerminalInsurance (amount 0
-    // works on a closed market) forwards it to pool.admin's token account.
     // CLOSE-OUT RULE: reserve the creator's seed return (not booked; forwarded by the next
     // RecoverTerminalInsurance). No units account here, so the reservation uses the seed cap
     // alone (`None`): it is >= the creator's true share (the unitised FIRST_LOSS cap is lower or
