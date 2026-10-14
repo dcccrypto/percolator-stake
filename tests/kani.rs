@@ -1003,4 +1003,239 @@ mod kani_proofs {
             "COVER: dead shares, principal only"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // v5 (Phase 4 item 6, S3) and S1 / S2 (growth plan §2.10).
+    // Written 2026-10-14, NOT RUN (another session owns the Kani run; run once on final code).
+    // ═══════════════════════════════════════════════════════════
+
+    /// PROOF I-S4 (`kani_s3_sync_bounded_by_target_and_buffer`) on the REAL `math::sync_plan`.
+    /// With `V = liquid + deployed`, `target = floor(V*t)`, `h = floor(V*hy)`,
+    /// `buffer = ceil(V*b)`:
+    ///   * TopUp(a): `a > 0`, it was below the band (`deployed + h < target`),
+    ///     `deployed + a <= target` and `liquid - a >= buffer` (never below the buffer);
+    ///   * Recover(r): it was above the band (`deployed > target + h`) and lands EXACTLY on the
+    ///     target (`deployed - r == target`), `r <= deployed`;
+    ///   * None: inside the band, or below it with no spare liquidity above the buffer;
+    ///   * out-of-range bps -> `None` (fail closed).
+    /// Inputs u32 widened to u64 (solver time); bps unconstrained u16 so the fail-closed arm and
+    /// the `target + buffer > 10,000` region (not admitted by `V5Init::validate`, where the
+    /// buffer can actually bind) are both explored.
+    /// MUTANTS this must kill: (M1) top-up ignores the buffer (`a = target - deployed`);
+    /// (M2) recover only down to `target + h`; (M3) buffer floored instead of ceiled;
+    /// (M4) band test `<=` instead of `<` on the top-up side; (M5) recover when
+    /// `deployed == target + h`.
+    #[kani::proof]
+    fn kani_s3_sync_bounded_by_target_and_buffer() {
+        use percolator_stake::math::{sync_plan, SyncAction};
+        let liquid: u32 = kani::any();
+        let deployed: u32 = kani::any();
+        let t: u16 = kani::any();
+        let b: u16 = kani::any();
+        let hy: u16 = kani::any();
+        let (l, d) = (liquid as u64, deployed as u64);
+        let plan = sync_plan(l, d, t, b, hy);
+        if t > 10_000 || b > 10_000 || hy > 10_000 {
+            assert!(plan.is_none(), "out-of-range bps fail closed");
+            kani::cover!(plan.is_none(), "COVER: fail-closed arm");
+            return;
+        }
+        let v = (l + d) as u128;
+        let target = v * t as u128 / 10_000;
+        let h = v * hy as u128 / 10_000;
+        let buffer = (v * b as u128).div_ceil(10_000);
+        match plan.expect("in-range bps always plan") {
+            SyncAction::TopUp(a) => {
+                let a = a as u128;
+                assert!(a > 0);
+                assert!((d as u128) + h < target, "only below the band");
+                assert!((d as u128) + a <= target, "never above the target");
+                assert!(a <= l as u128 && (l as u128) - a >= buffer, "never below the buffer");
+                kani::cover!((d as u128) + a == target, "COVER: top-up to the target");
+                kani::cover!(
+                    (d as u128) + a < target && (l as u128) - a == buffer,
+                    "COVER: top-up clipped by the buffer"
+                );
+            }
+            SyncAction::Recover(r) => {
+                let r = r as u128;
+                assert!((d as u128) > target + h, "only above the band");
+                assert!(r <= d as u128);
+                assert_eq!((d as u128) - r, target, "lands exactly on the target");
+                kani::cover!(r > 0 && h > 0, "COVER: recovery with a hysteresis band");
+            }
+            SyncAction::None => {
+                let in_band = (d as u128) + h >= target && (d as u128) <= target + h;
+                let no_spare = (d as u128) + h < target && (l as u128) <= buffer;
+                assert!(in_band || no_spare, "None only inside the band or with no spare");
+                kani::cover!(in_band && v > 0, "COVER: inside the band");
+                kani::cover!(no_spare && target > 0, "COVER: below target, buffer exhausted");
+            }
+        }
+    }
+
+    /// PROOF I-S3 (`kani_s3_units_mint_burn_no_dilution`) on stake's REAL mirrors of the wrapper
+    /// unit math (`math::expected_topup_units` = `floor(a*U/I)`, `math::expected_recover_burn` =
+    /// `ceil(r*U/I)`, `math::deployed_value` = `floor(Us*I/U)`), which the sync requires the
+    /// wrapper to match exactly (error 45):
+    ///   * mint: incumbents' per-unit value never falls (`(I+a)/(U+m) >= I/U`) and the new
+    ///     units are worth at most what was paid (`m*(I+a)/(U+m) <= a`);
+    ///   * burn: the leaver never takes more than its units are worth (`b*I/U >= r`) and the
+    ///     stayers' per-unit value never falls (`(I-r)/(U-b) >= I/U` when `b < U`);
+    ///   * value: `deployed_value(Us, U, I) <= I` for `Us <= U`, and a lower `I` never raises it
+    ///     (losses are pro rata).
+    /// u32 inputs widened to u128 (solver time), `U, I > 0` (the genesis / reset arms mint 1:1 and
+    /// are covered separately by `s1_expected_units`).
+    /// MUTANTS: (M1) mint rounded up; (M2) burn rounded down; (M3) value rounded up.
+    #[kani::proof]
+    fn kani_s3_units_mint_burn_no_dilution() {
+        use percolator_stake::math::{deployed_value, expected_recover_burn, expected_topup_units};
+        let u: u32 = kani::any();
+        let i: u32 = kani::any();
+        let a: u32 = kani::any();
+        let r: u32 = kani::any();
+        let us: u32 = kani::any();
+        let i2: u32 = kani::any();
+        kani::assume(u > 0 && i > 0);
+        let (uu, ii) = (u as u128, i as u128);
+        // Mint.
+        let m = expected_topup_units(a as u64, uu, ii).unwrap();
+        let (a128, m128) = (a as u128, m);
+        assert!((ii + a128) * uu >= ii * (uu + m128), "incumbents not diluted");
+        assert!(m128 * (ii + a128) <= a128 * (uu + m128), "new units worth <= paid");
+        kani::cover!(m > 0 && a128 * uu % ii != 0, "COVER: mint with rounding dust");
+        // Burn.
+        if let Some(b) = expected_recover_burn(r as u64, uu, ii) {
+            let r128 = r as u128;
+            assert!(r128 <= ii);
+            assert!(b * ii >= r128 * uu, "burned units worth >= paid out");
+            if b < uu {
+                assert!((ii - r128) * uu >= ii * (uu - b), "stayers not diluted");
+            }
+            kani::cover!(b > 0 && r128 * uu % ii != 0, "COVER: burn with rounding");
+        } else {
+            assert!(r as u128 > ii, "burn refused only beyond the free insurance");
+        }
+        // Value bound and monotonicity in I.
+        kani::assume(us <= u);
+        let v = deployed_value(us as u128, uu, ii).unwrap() as u128;
+        assert!(v <= ii);
+        if i2 <= i {
+            let v2 = deployed_value(us as u128, uu, i2 as u128).unwrap() as u128;
+            assert!(v2 <= v, "a loss never raises the stake value");
+            kani::cover!(v2 < v, "COVER: loss lowers the stake value");
+        }
+    }
+
+    /// PROOF S1/S2 (`kani_s1_terminal_creator_share_bounded`) on the REAL
+    /// `math::terminal_creator_share`: the creator's terminal share never exceeds the surplus;
+    /// without `creator_takes_all` it never exceeds the S2 backlog owed; with it, it is the whole
+    /// surplus. Full u64 range.
+    /// MUTANTS: (M1) `max` instead of `min`; (M2) the backlog ignored (`0` when not all);
+    /// (M3) the flag ignored (always the backlog).
+    #[kani::proof]
+    fn kani_s1_terminal_creator_share_bounded() {
+        let surplus: u64 = kani::any();
+        let backlog: u64 = kani::any();
+        let all: bool = kani::any();
+        let s = percolator_stake::math::terminal_creator_share(surplus, backlog, all);
+        assert!(s <= surplus);
+        if all {
+            assert_eq!(s, surplus);
+        } else {
+            assert!(s <= backlog);
+            assert_eq!(s, surplus.min(backlog));
+        }
+        kani::cover!(all && s > 0, "COVER: creator takes all");
+        kani::cover!(!all && s == backlog && s < surplus, "COVER: backlog only, rest booked");
+        kani::cover!(!all && s == surplus && s < backlog, "COVER: backlog exceeds surplus");
+    }
+
+    /// PROOF S1 settlement conservation on the REAL `StakePool` (`terminal_surplus_to_creator`
+    /// + `book_terminal_recovery`), in the order RecoverTerminalInsurance runs them: from a
+    /// fully booked pool the wrapper releases `released` atoms; the creator is paid
+    /// `share = terminal_creator_share(released, backlog, pool.terminal_surplus_to_creator())`
+    /// out of the vault, and the rest is booked. Then:
+    ///   * `share + booked <= released` (nothing created) and pool value never exceeds the vault;
+    ///   * creator-takes-all -> NOTHING is booked to stakers (pool value unchanged);
+    ///   * otherwise, with real holders, the books absorb exactly `released - share`
+    ///     (conservation: every released atom goes to the creator or the stakers).
+    /// Bounded to 2^40 per field (as `kani_f9_pool_receives_exactly_what_wrapper_releases`).
+    /// MUTANTS: (M1) book before forwarding (booked = released); (M2) predicate ignores
+    /// `total_flushed`; (M3) predicate ignores real holders.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_s1_terminal_settlement_conserves() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.risk_mode = if kani::any() {
+            percolator_stake::state::RISK_MODE_FIRST_LOSS
+        } else {
+            percolator_stake::state::RISK_MODE_FEE_ONLY
+        };
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        let released: u64 = kani::any();
+        let backlog: u64 = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B && released <= B);
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        kani::assume(backlog <= B);
+        p.set_s2_backlog_owed_atoms(backlog);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let all = p.terminal_surplus_to_creator();
+        let real = p.has_real_lp_holders();
+        let balance = v0 + released;
+        let share = percolator_stake::math::terminal_creator_share(released, backlog, all);
+        let (r, f) = p.book_terminal_recovery(balance - share).expect("bounded input");
+        let v1 = p.total_pool_value().expect("representable");
+        assert!(share + r + f <= released, "nothing created");
+        assert!(v1 + share <= balance);
+        if all {
+            assert_eq!(v1, v0, "creator takes all: nothing booked to stakers");
+            assert_eq!(share, released);
+        } else if real {
+            assert_eq!(v1 + share, balance, "every released atom is the creator's or booked");
+        }
+        kani::cover!(all && released > 0 && real, "COVER: never-deployed pool with stakers");
+        kani::cover!(all && released > 0 && !real, "COVER: no real stakers");
+        kani::cover!(!all && share > 0 && r + f > 0, "COVER: backlog to creator, rest to stakers");
+    }
+
+    /// PROOF I-S1 (`kani_s3_admin_cannot_flush`), dispatch level on the REAL
+    /// `processor::process`: tag 3 (FlushToInsurance) and tag 23 (RecoverFlushedInsurance) are
+    /// `Err(DeprecatedV5)` for ANY amount and ANY caller, before a single account is read (the
+    /// account slice is empty).
+    /// MUTANTS: (M1) route tag 3 to a flush handler; (M2) route tag 23 to a recovery handler.
+    #[kani::proof]
+    fn kani_s3_admin_cannot_flush() {
+        let tag: u8 = if kani::any() { 3 } else { 23 };
+        let amount: u64 = kani::any();
+        let mut data = [0u8; 9];
+        data[0] = tag;
+        data[1..9].copy_from_slice(&amount.to_le_bytes());
+        let pid = solana_program::pubkey::Pubkey::new_from_array([7u8; 32]);
+        let r = percolator_stake::processor::process(&pid, &[], &data);
+        assert_eq!(
+            r,
+            Err(solana_program::program_error::ProgramError::Custom(
+                percolator_stake::error::StakeError::DeprecatedV5 as u32
+            ))
+        );
+        kani::cover!(tag == 3 && amount > 0, "COVER: tag 3 refused");
+        kani::cover!(tag == 23 && amount > 0, "COVER: tag 23 refused");
+    }
 }
