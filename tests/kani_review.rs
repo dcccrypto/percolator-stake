@@ -170,3 +170,67 @@ fn rv_st1_sync_plan_u8() {
         None => panic!("in-range dials never fail"),
     }
 }
+
+/// Review: same body as `rv_subpool_roundtrip_no_profit_u8`, solver cadical (the z3 run was NO-VERDICT at 600 s).
+#[kani::proof]
+#[kani::solver(cadical)]
+fn rv_subpool_roundtrip_no_profit_u8_cadical() {
+    let (sub_lp, sub_bal, dep) = (u8v(), u8v(), u8v());
+    let senior: bool = kani::any();
+    kani::assume(sub_lp > 0 && sub_bal > 0 && dep > 0);
+    let lp = if senior {
+        calc_senior_lp_for_deposit(sub_lp, sub_bal, dep)
+    } else {
+        calc_junior_lp_for_deposit(sub_lp, sub_bal, dep)
+    };
+    // u8 operands: the pro-rata branch never overflows, so the mint is always computed.
+    let lp = lp.expect("pro-rata mint never refused at u8");
+    if lp == 0 {
+        kani::cover!(true, "zero-share mint (caller refuses ZeroSharesMinted)");
+        return;
+    }
+    let back = if senior {
+        calc_senior_collateral_for_withdraw(sub_lp + lp, sub_bal + dep, lp)
+    } else {
+        calc_junior_collateral_for_withdraw(sub_lp + lp, sub_bal + dep, lp)
+    }
+    .expect("redemption never refused at u8");
+    kani::cover!(senior && back == dep, "senior round trip, exact");
+    kani::cover!(!senior && back < dep, "junior round trip, rounding retained");
+    kani::cover!(sub_bal > sub_lp && back + 1 < dep, "share price > 1, loss > 1 atom");
+    assert!(back <= dep);
+}
+
+/// Review: same body as `rv_st1_sync_plan_u8`, solver kissat (the z3 run was NO-VERDICT at 600 s).
+#[kani::proof]
+#[kani::solver(kissat)]
+fn rv_st1_sync_plan_u8_kissat() {
+    let liquid = u8v();
+    let deployed = u8v();
+    let t: u16 = kani::any();
+    let b: u16 = kani::any();
+    let h: u16 = kani::any();
+    let r = sync_plan(liquid, deployed, t, b, h);
+    if t > 10_000 || b > 10_000 || h > 10_000 {
+        assert!(r.is_none(), "a dial above 100% is refused");
+        return;
+    }
+    let v = liquid + deployed;
+    let target = (v as u128 * t as u128 / 10_000) as u64;
+    let buffer = (v as u128 * b as u128).div_ceil(10_000) as u64;
+    match r {
+        Some(SyncAction::TopUp(a)) => {
+            assert!(a > 0);
+            assert!(deployed + a <= target, "never above the target");
+            assert!(liquid - a >= buffer, "never below the liquid buffer");
+            kani::cover!(a < target - deployed, "top-up limited by the buffer");
+            kani::cover!(a == target - deployed && liquid - a > buffer, "top-up limited by the target");
+        }
+        Some(SyncAction::Recover(x)) => {
+            kani::cover!(x > 0 && h > 0, "recover with hysteresis");
+            assert!(deployed - x == target, "recovery lands exactly on the target");
+        }
+        Some(SyncAction::None) => kani::cover!(deployed < target, "below target but inside hysteresis or no spare"),
+        None => panic!("in-range dials never fail"),
+    }
+}
