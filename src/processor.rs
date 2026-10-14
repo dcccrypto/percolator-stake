@@ -3747,9 +3747,8 @@ fn process_return_insurance(
 // The ONLY outflow (S1 / S2, v5): creator-owned value leaves `pool.vault` for a token account
 // of `pool.admin` (the creator), never anywhere else, and never booked staker value:
 //   * the creator-class insurance the wrapper attributes (`creator_paid_to_stake_atoms`);
-//   * the vault SURPLUS above the booked pool value when a FIRST_LOSS pool never deployed a
-//     staker atom or no real staker exists, else only the S2 pre-stake fee backlog
-//     (`terminal_creator_share`).
+//   * the vault SURPLUS above the booked pool value when no staker atom was ever deployed or no
+//     real staker exists, else only the S2 pre-stake fee backlog (`terminal_creator_share`).
 // The caller cannot choose the recipient (key-derived from `pool.admin`) or the amounts.
 /// S1: transfer `amount` atoms from `pool.vault` to the creator's token account, signed by
 /// `vault_auth`. `creator` must be a writable SPL token account of the pool collateral whose
@@ -4160,10 +4159,9 @@ fn process_recover_terminal_insurance(
         .ok_or(StakeError::Overflow)?;
 
     // S1 / S2 (2026-10-14): the part of the remaining surplus that is the creator's: all of it
-    // when a FIRST_LOSS pool never deployed a staker atom or no real staker exists (it would
-    // otherwise be booked to stakers as a windfall of the creator's seed, or stranded on the
-    // dead shares), else only the S2 pre-stake fee backlog. Forwarded BEFORE the rest is booked.
-    // A FEE_ONLY pool with real stakers books its surplus to them, as before S1.
+    // when no staker atom was ever deployed or no real staker exists (it would otherwise be
+    // booked to stakers as a windfall of the creator's seed, or stranded on the dead shares),
+    // else only the S2 pre-stake fee backlog. Forwarded BEFORE the rest is booked.
     let surplus_forwarded = settle_creator_surplus(
         pool,
         vault,
@@ -6143,14 +6141,12 @@ mod tests {
     }
 
     /// S1 predicate: the whole terminal surplus is the creator's iff the pool is v5 and either
-    /// (FIRST_LOSS) never deployed a staker atom or has no real staker. A FEE_ONLY pool with
-    /// real stakers is NOT creator-takes-all here (held decision; unchanged from aebbff6).
-    /// NEGATIVE CONTROL: the predicate is new.
+    /// never deployed a staker atom or has no real staker. NEGATIVE CONTROL: the predicate is new.
     #[test]
     fn s1_terminal_surplus_to_creator_predicate() {
         let real = state::MINIMUM_LIQUIDITY + 1;
         for (mode, flushed, lp, want) in [
-            (state::RISK_MODE_FEE_ONLY, 0u64, real, false),
+            (state::RISK_MODE_FEE_ONLY, 0u64, real, true),
             (state::RISK_MODE_FEE_ONLY, 0, state::MINIMUM_LIQUIDITY, true),
             (state::RISK_MODE_FIRST_LOSS, 0, real, true),
             (state::RISK_MODE_FIRST_LOSS, 5, real, false),

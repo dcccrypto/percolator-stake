@@ -1098,25 +1098,21 @@ impl StakePool {
     /// the WHOLE vault surplus (vault balance above the booked pool value, after the wrapper fee
     /// accrual) belong to the creator rather than to the stakers?
     ///
-    /// * FIRST_LOSS with `total_flushed == 0`: no staker atom was ever deployed into the
-    ///   market's insurance from this pool. A FIRST_LOSS pool deploys only through
+    /// * `total_flushed == 0`: no staker atom was ever deployed into the market's insurance from
+    ///   this pool. A FEE_ONLY pool never deploys, and a FIRST_LOSS pool deploys only through
     ///   `SyncInsuranceDeployment`, which books every atom into `total_flushed`. So every
     ///   insurance atom that reaches the vault at terminal is creator-class (exactly how wrapper
     ///   tag 116 classes a fund that predates the stakers: all creator units), and booking it to
-    ///   stakers would hand them the creator's seed.
-    /// * `!has_real_lp_holders()` (FIRST_LOSS or FEE_ONLY): no real staker exists, and none can
-    ///   join (deposits are refused once the wrapper is terminal), so a surplus booked into pool
-    ///   value would be owned by the dead shares only, i.e. stranded for ever (the 7.6k problem).
-    ///
-    /// NOT decided here (HELD for Khubair, 2026-10-14): who gets a FEE_ONLY pool's terminal fund
-    /// while real stakers exist. This predicate leaves that case exactly as before S1 (the
-    /// surplus is booked to the stakers by `book_terminal_recovery`).
+    ///   stakers would hand them the creator's seed. With no stakers it was stranded for ever
+    ///   (the 7.6k problem).
+    /// * `!has_real_lp_holders()`: no real staker exists, and none can join (deposits are
+    ///   refused once the wrapper is terminal), so a surplus booked into pool value would be
+    ///   owned by the dead shares only, i.e. stranded.
     ///
     /// v5 risk modes only (a legacy pool cannot be created by this program).
     pub fn terminal_surplus_to_creator(&self) -> bool {
-        let v5 = self.risk_mode == RISK_MODE_FIRST_LOSS || self.risk_mode == RISK_MODE_FEE_ONLY;
-        v5 && ((self.risk_mode == RISK_MODE_FIRST_LOSS && self.total_flushed == 0)
-            || !self.has_real_lp_holders())
+        (self.risk_mode == RISK_MODE_FIRST_LOSS || self.risk_mode == RISK_MODE_FEE_ONLY)
+            && (self.total_flushed == 0 || !self.has_real_lp_holders())
     }
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.

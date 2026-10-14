@@ -300,14 +300,12 @@ proptest! {
             prop_assert_eq!(v1, v0);
             prop_assert_eq!(share, released);
         } else {
-            prop_assert!(real && (p.total_flushed > 0 || !first_loss));
+            prop_assert!(real && p.total_flushed > 0);
             prop_assert_eq!(v1 + share, balance);
             prop_assert_eq!(share, released.min(backlog));
         }
-        // S1 split (2026-10-14): a FEE_ONLY pool's fund goes to the creator only when no real
-        // staker exists; with real stakers the routing is HELD and unchanged from before S1.
         if !first_loss {
-            prop_assert_eq!(all, !real, "FEE_ONLY: creator-takes-all iff no real staker");
+            prop_assert!(all, "a FEE_ONLY pool never deployed: the surplus is the creator's");
         }
     }
 }

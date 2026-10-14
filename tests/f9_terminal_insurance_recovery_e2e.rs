@@ -680,20 +680,18 @@ fn admin_close_slab(
 
 /// The headline: a stake-owned, bound, Resolved market with a 5M insurance budget.
 ///   BEFORE: CloseSlab (via the proxy) is refused 21 while the budget is outstanding.
-///   tag 29 (permissionless): exactly BUDGET moves wrapper -> pool.vault, and exactly
-///   BUDGET is booked to stakers.
+///   tag 29 (permissionless): exactly BUDGET moves wrapper -> pool.vault, and (S1,
+///   2026-10-14) exactly BUDGET is forwarded to the creator (pool.admin): this FEE_ONLY pool
+///   never deployed a staker atom into the insurance, so the whole budget is the creator's seed.
+///   Stakers' value is unchanged (they never risked anything for it).
 ///   tag 30: the market retires to a tombstone, and the rent refund reaches the admin.
-///   The staker then withdraws principal + the whole budget (less dead-share dust).
 /// NEGATIVE CONTROL: on the pre-fix stake .so (2212e17), tag 29 and tag 30 do not
-/// exist (InvalidInstructionData), so this test fails at the first tag-29 assert.
-///
-/// S1 split (2026-10-14): who gets a FEE_ONLY pool's fund while real stakers exist is HELD for
-/// Khubair, so this build keeps the pre-S1 routing for it: tag 29 in the pre-S1 account shape
-/// (no creator account) still succeeds, the creator receives nothing and the budget is booked
-/// to the stakers. The held commit (FEE_ONLY -> creator) replaces this test.
+/// exist (InvalidInstructionData), so this test fails at the first tag-29 assert. On the
+/// pre-S1 .so (aebbff6) the budget is booked to the stakers instead: the creator-balance and
+/// pool-value asserts below fail (BUDGET booked as fees).
 #[test]
-fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
-    let Some(mut w) = world("f9_bound_resolved_market_returns_budget_to_stakers_and_retires")
+fn f9_bound_resolved_market_returns_budget_to_creator_and_retires() {
+    let Some(mut w) = world("f9_bound_resolved_market_returns_budget_to_creator_and_retires")
     else {
         return;
     };
@@ -721,7 +719,8 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
 
     let wv0 = token_amount(&w.svm, &w.wrapper_vault);
     assert_eq!(wv0, BUDGET);
-    // The pre-S1 account shape (no creator account) is accepted: nothing is owed to the creator.
+    // S1: without the creator's account the settlement refuses (it would otherwise have to book
+    // the creator's seed to the stakers), and nothing moves.
     let r = recover_terminal(
         &mut w,
         BUDGET,
@@ -730,28 +729,34 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
             ..DEFAULT_OPTS
         },
     );
+    assert_eq!(custom(&r), Some(E_CREATOR_ACCOUNT_REQUIRED), "{}", logs(&r));
+    assert_eq!(token_amount(&w.svm, &w.wrapper_vault), BUDGET, "nothing moved");
+    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
     assert!(r.is_ok(), "tag 29: {}", logs(&r));
     let pool1 = read_pool(&w.svm, &w.pool);
-    assert_eq!(token_amount(&w.svm, &w.creator_ata), 0, "FEE_ONLY with stakers: creator gets 0");
-    assert_eq!(pool1.creator_surplus_forwarded_atoms(), 0);
     assert_eq!(
         token_amount(&w.svm, &w.wrapper_vault),
         0,
         "wrapper released the whole budget"
     );
     assert_eq!(
-        token_amount(&w.svm, &w.vault),
-        STAKE + BUDGET,
-        "pool.vault received exactly the budget"
+        token_amount(&w.svm, &w.creator_ata),
+        BUDGET,
+        "S1: the creator got its whole seed back"
     );
     assert_eq!(
-        pool1.total_fees_earned - pool0.total_fees_earned,
-        BUDGET,
-        "stakers credited exactly the budget"
+        token_amount(&w.svm, &w.vault),
+        STAKE,
+        "pool.vault keeps exactly the stakers' principal"
     );
+    assert_eq!(
+        pool1.total_fees_earned, pool0.total_fees_earned,
+        "nothing booked to stakers"
+    );
+    assert_eq!(pool1.creator_surplus_forwarded_atoms(), BUDGET);
     assert_eq!(
         pool1.total_pool_value(),
-        Some(STAKE + BUDGET),
+        Some(STAKE),
         "pool value == vault balance"
     );
     assert!(
@@ -787,10 +792,7 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
     );
     let admin_l1 = w.svm.get_account(&w.admin.pubkey()).unwrap().lamports;
     assert!(admin_l1 > admin_l0, "rent refund forwarded to the admin");
-    assert_eq!(
-        read_pool(&w.svm, &w.pool).total_pool_value(),
-        Some(STAKE + BUDGET)
-    );
+    assert_eq!(read_pool(&w.svm, &w.pool).total_pool_value(), Some(STAKE));
 
     // Book-only on a closed market still works (and finds nothing).
     let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
@@ -804,13 +806,16 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
     );
 }
 
-/// Stakers actually get the budget: a staker who deposited while Live redeems their
-/// whole LP after the terminal recovery and receives principal + their pro-rata share
-/// of the budget. Withdraw works both with the slab account omitted and, while the
-/// market is still Resolved (not closed), with it passed.
+/// S1 (2026-10-14): a FEE_ONLY staker never deployed anything into the insurance, so the
+/// terminal budget is the creator's, not a windfall for stakers. A staker who deposited while
+/// Live redeems exactly its principal after the terminal recovery (less nothing: the dead
+/// shares hold their own 1,000); the creator receives the whole budget. Withdraw works both
+/// with the slab account omitted and, while the market is still Resolved, with it passed.
+/// NEGATIVE CONTROL: on the pre-S1 .so (aebbff6) bob receives principal + ~half the budget
+/// and the creator 0, so both asserts fail.
 #[test]
-fn f9_staker_redeems_principal_plus_budget() {
-    let Some(mut w) = world("f9_staker_redeems_principal_plus_budget") else {
+fn f9_staker_redeems_principal_creator_gets_budget_s1() {
+    let Some(mut w) = world("f9_staker_redeems_principal_creator_gets_budget_s1") else {
         return;
     };
     // Second staker so we hold the keypair (world()'s first staker is dropped).
@@ -818,23 +823,19 @@ fn f9_staker_redeems_principal_plus_budget() {
     let bob_lp = token_amount(&w.svm, &bob.lp_ata);
     admin_resolve(&mut w);
     assert!(recover_terminal(&mut w, BUDGET, DEFAULT_OPTS).is_ok());
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET, "S1: creator seed returned");
     let slot = w.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
     w.svm.warp_to_slot(slot + 100);
     let before = token_amount(&w.svm, &bob.ata);
     let r = withdraw(&mut w, &bob, bob_lp, true);
     assert!(r.is_ok(), "withdraw: {}", logs(&r));
     let got = token_amount(&w.svm, &bob.ata) - before;
-    // Bob holds bob_lp of total_lp (2*STAKE, 1,000 dead). Pool value 2*STAKE + BUDGET.
     let pool = read_pool(&w.svm, &w.pool);
     eprintln!(
-        "F-9 redeem: bob got {got} for {bob_lp} LP; pool now value {:?}",
+        "S1 redeem: bob got {got} for {bob_lp} LP; pool now value {:?}",
         pool.total_pool_value()
     );
-    assert!(
-        got > STAKE + BUDGET / 2 - 1_000,
-        "bob gets principal + ~half the budget, got {got}"
-    );
-    assert!(got <= STAKE + BUDGET / 2, "and not more than his share");
+    assert!(got <= STAKE && got + 1 >= STAKE, "bob gets exactly his principal, got {got}");
 }
 
 /// JIT guard: once the WRAPPER is Resolved (here via tag 24, but equally by a
@@ -944,10 +945,13 @@ fn f9_recover_terminal_destination_is_pinned() {
 }
 
 /// Griefing 1: a third party front-runs with a DIRECT wrapper tag 41 into pool.vault.
-/// The tokens arrive unbooked; tag 29 (amount 0) books them for stakers.
+/// The tokens arrive unbooked; tag 29 (amount 0) settles them. S1 (2026-10-14): the pool
+/// never deployed a staker atom, so they are the creator's seed and go to the creator, never
+/// to the stakers (a staker would otherwise profit from this front-run).
+/// NEGATIVE CONTROL: on the pre-S1 .so the BUDGET is booked as staker fees.
 #[test]
-fn f9_third_party_direct_tag41_is_still_booked() {
-    let Some(mut w) = world("f9_third_party_direct_tag41_is_still_booked") else {
+fn f9_third_party_direct_tag41_is_still_settled_to_creator() {
+    let Some(mut w) = world("f9_third_party_direct_tag41_is_still_settled_to_creator") else {
         return;
     };
     admin_resolve(&mut w);
@@ -964,15 +968,18 @@ fn f9_third_party_direct_tag41_is_still_booked() {
     let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
     assert!(r.is_ok(), "{}", logs(&r));
     let p1 = read_pool(&w.svm, &w.pool);
-    assert_eq!(p1.total_fees_earned - p0.total_fees_earned, BUDGET);
-    assert_eq!(p1.total_pool_value(), Some(STAKE + BUDGET));
+    assert_eq!(p1.total_fees_earned, p0.total_fees_earned, "nothing booked to stakers");
+    assert_eq!(p1.total_pool_value(), Some(STAKE));
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET);
+    assert_eq!(token_amount(&w.svm, &w.vault), STAKE);
 }
 
 /// Griefing 2: a third party points wrapper tag 41 at a STRAY token account it
-/// created with owner = vault_auth. Tag 29 sweeps it (account 9) and books it.
+/// created with owner = vault_auth. Tag 29 sweeps it (the stray rides with the creator account
+/// in the optional tail, in either order) and S1 forwards it to the creator.
 #[test]
-fn f9_stray_vault_auth_payout_is_swept_and_booked() {
-    let Some(mut w) = world("f9_stray_vault_auth_payout_is_swept_and_booked") else {
+fn f9_stray_vault_auth_payout_is_swept_and_settled() {
+    let Some(mut w) = world("f9_stray_vault_auth_payout_is_swept_and_settled") else {
         return;
     };
     admin_resolve(&mut w);
@@ -1002,11 +1009,9 @@ fn f9_stray_vault_auth_payout_is_swept_and_booked() {
     );
     assert!(r.is_ok(), "{}", logs(&r));
     assert_eq!(token_amount(&w.svm, &stray), 0);
-    assert_eq!(token_amount(&w.svm, &w.vault), STAKE + BUDGET);
-    assert_eq!(
-        read_pool(&w.svm, &w.pool).total_pool_value(),
-        Some(STAKE + BUDGET)
-    );
+    assert_eq!(token_amount(&w.svm, &w.vault), STAKE);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET);
+    assert_eq!(read_pool(&w.svm, &w.pool).total_pool_value(), Some(STAKE));
 }
 
 /// Tag 30 is admin-only, and requires a Resolved market.

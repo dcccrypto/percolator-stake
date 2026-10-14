@@ -342,10 +342,10 @@ pub enum StakeInstruction {
     ///    was already forwarded) to the creator (S1). (b) Book the wrapper-attributable tag-87
     ///    fees (the normal `AccrueFees` path, Resolved only). (c) S1 / S2 (2026-10-14): forward
     ///    the creator's share of the remaining surplus (`math::terminal_creator_share`): ALL of
-    ///    it when a FIRST_LOSS pool never deployed a staker atom (`total_flushed == 0`) or no
-    ///    real staker exists; otherwise only the S2 pre-stake fee backlog (always 0 on
-    ///    FEE_ONLY). (d) Book the rest by `StakePool::book_terminal_recovery`: up to
-    ///    `wrapper_recoverable()` as returned principal, the remainder as fees when real LP
+    ///    it when no staker atom was ever deployed (`total_flushed == 0`: every FEE_ONLY pool,
+    ///    and a FIRST_LOSS pool that never synced) or no real staker exists; otherwise only the
+    ///    S2 pre-stake fee backlog. (d) Book the rest by `StakePool::book_terminal_recovery`: up
+    ///    to `wrapper_recoverable()` as returned principal, the remainder as fees when real LP
     ///    holders exist. Settling the surplus rather than this call's own delta means a direct
     ///    wrapper tag-41 push into `pool.vault` by a third party is settled the same way.
     /// 5. Set the pool's `market_resolved` flag (blocks deposits and flushes).
@@ -379,8 +379,7 @@ pub enum StakeInstruction {
     /// FEE_ONLY pools continue with up to two OPTIONAL token accounts in any order, told apart by
     /// their SPL owner: owner = vault_auth -> the stray to sweep; owner = `pool.admin` -> the
     /// creator's account, REQUIRED (`CreatorAccountRequired`, 46) whenever the settlement owes the
-    /// creator something, which on a FEE_ONLY pool is any terminal surplus once no real staker
-    /// exists (with real stakers the surplus is booked to them, as before S1).
+    /// creator something, which on a FEE_ONLY pool is any terminal surplus.
     RecoverTerminalInsurance { amount: u64 },
 
     /// 30: AdminCloseSlab — F-9. CPI proxy for the wrapper's CloseSlab (tag 13).
