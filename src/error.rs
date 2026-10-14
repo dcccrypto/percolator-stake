@@ -214,10 +214,10 @@ pub fn error_hint(code: u32) -> &'static str {
         41 => "Not supported on first-loss pools — tranches, HWM and admin rotation of the insurance authority are disabled",
         42 => "Asset admin not burned — burn the asset admin (BurnAssetAdmin) before stake can be deployed into insurance",
         43 => "Nothing to sync — the deployed value is within the hysteresis band of the target, or there is no spare liquidity",
-        44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid",
+        44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid. On BindInsuranceAuthority: asset 0 has unsettled positions (a stale funding cohort); crank to the current slot and refresh every open position in the same transaction as the bind, or bind before the market has positions",
         45 => "Insurance units mismatch — the wrapper did not mint or burn the expected stake units; the sync was reverted",
-        48 => "Multi-asset market not supported — a v5 staking pool can only bind a single-asset market",
         47 => "Insurance custody not bound — the market's insurance authority and operator must both be the pool's vault authority before the asset admin can be burned; re-bind first",
+        48 => "Multi-asset market not supported — a v5 staking pool can only bind a single-asset market; this cannot be undone for this market (bind before any second asset can be added)",
         46 => "Creator account required — the terminal insurance surplus belongs to the pool creator (pool.admin); pass pool.admin's token account for the pool collateral (S1)",
         _ => "Unknown error — check the error code and pool state",
     }
