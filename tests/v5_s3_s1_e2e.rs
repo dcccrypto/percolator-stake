@@ -15,8 +15,11 @@
 //!
 //! The wrapper .so must pin THIS stake id (A6DVNubv, the v2.2 RC devnet pin): the canonical RC
 //! artifact `artifacts/v22-combination-2026-10-08/wrapper-v22rem-c6ee0b6e-devnet.so`
-//! (sha256 53fddfe7…). The fresh-ID devnet artifact pins 7JrgAUHi and classes every unit as the
-//! creator's, so it cannot run these tests. Default path `../percolator-prog/target/deploy/
+//! (sha256 53fddfe7…) by default. To run against the DEPLOYED v2.2 bytes (I-3), set
+//! `F9_WRAPPER_SO` to the dump of 6kpg2wi7 (first 2,534,328 B, sha256 f6e7180d…, pins stake
+//! 7JrgAUHi), `E2E_STAKE_ID=7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V` and `E2E_STAKE_SO` to a
+//! stake .so built with that id. A wrapper that pins a different stake id than the one the .so is
+//! loaded at classes every unit as the creator's, and the FIRST_LOSS tests fail (sync 45, creator 0). Default path `../percolator-prog/target/deploy/
 //! percolator_prog.so`; override with `F9_WRAPPER_SO`. A missing .so is a hard failure here
 //! (not a silent skip). Rebuild `target/deploy/percolator_stake.so` after changing the source.
 
@@ -43,7 +46,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 const WRAPPER_ID: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
-const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
+/// I-3 (security review 2026-10-14): the stake program id the harness loads the stake .so at.
+/// Default = the v2.2 RC id the canonical RC wrapper pins. Set `E2E_STAKE_ID` (e.g. `7JrgAUHi…`)
+/// together with `F9_WRAPPER_SO` (a wrapper that pins THAT stake id, e.g. the deployed v2.2 dump)
+/// and `E2E_STAKE_SO` (a stake .so built with that id) to run against the deployed bytes.
+fn stake_id_str() -> String {
+    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+}
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MARKET_LEN_V22_CAP1: usize = 4059;
@@ -64,6 +73,9 @@ const E_ASSET_ADMIN_NOT_BURNED: u32 = 42;
 const E_NOTHING_TO_SYNC: u32 = 43;
 
 fn stake_so() -> PathBuf {
+    if let Ok(p) = std::env::var("E2E_STAKE_SO") {
+        return PathBuf::from(p);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/deploy/percolator_stake.so")
 }
 
@@ -281,7 +293,7 @@ fn world(burn_asset_admin: bool) -> World {
     // Start away from slot 0: the program stores slot stamps as `slot.max(1)` (0 = "none"), so a
     // world at slot 0 would shift every cooldown / timelock boundary by one slot.
     svm.warp_to_slot(1_000);
-    let stake_id = Pubkey::from_str(STAKE_ID).unwrap();
+    let stake_id = Pubkey::from_str(&stake_id_str()).unwrap();
     let wrapper_id = Pubkey::from_str(WRAPPER_ID).unwrap();
     svm.add_program_from_file(stake_id, &so).unwrap();
     svm.add_program_from_file(wrapper_id, &wso).unwrap();
