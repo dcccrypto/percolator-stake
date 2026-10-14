@@ -2249,8 +2249,12 @@ fn process_bind_insurance_authority(
     // unrouted rent, reserved credit) are NOT the creator's seed. Before this bind the admin is
     // the insurance authority; after it only `vault_auth` can top up (wrapper tag 9
     // `expect_live_authority`) or withdraw. Read from the pinned layout only (fail closed),
-    // BEFORE the CPIs (they do not move insurance). Subtracting, not refusing: a refusal would
-    // block the bind (the creator-drain lock) while claims the creator cannot clear are open.
+    // BEFORE the CPIs (they do not move insurance). Other parties' claims (fee legs, rent,
+    // reserved credit) are SUBTRACTED, not refused on: the creator cannot clear them. The bind
+    // DOES refuse two states: a multi-asset market (48; never recoverable for that market, so the
+    // launch flow must bind before anyone can append an asset, M-4) and a stale K/F cohort on
+    // asset 0 (44; retry in one transaction: crank to the current slot, refresh every positioned
+    // asset-0 account, then bind; or bind before the market has any position, L-4).
     // `net_deployed` (staker principal flushed and not yet recovered) is subtracted defensively:
     // it is always 0 here, because a FIRST_LOSS sync tops up as `vault_auth`, which the wrapper
     // refuses until this bind has made it the insurance authority. The pool account must be
