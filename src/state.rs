@@ -349,6 +349,17 @@ pub const DEPLOY_TARGET_TIMELOCK_MIN_SLOTS: u64 = 216_000;
 /// S-6: `_v5_reserved[0]` (byte 456) = 1 while the pending target was proposed by the protocol
 /// authority (an admin proposal may not overwrite it).
 pub const V5_RESERVED_IDX_PENDING_BY_PROTOCOL: usize = 0;
+/// S1 (2026-10-14): `_v5_reserved[8..16]` (bytes 464..472, LE u64) = cumulative atoms of
+/// terminal vault SURPLUS forwarded to the creator (`pool.admin`) because no staker can own them
+/// (`StakePool::terminal_surplus_to_creator`) or because they are the S2 pre-stake backlog. Kept
+/// apart from `creator_forwarded_atoms`, which is the cursor against the wrapper's
+/// `creator_paid_to_stake_atoms`. Never decreases.
+pub const V5_RESERVED_CREATOR_SURPLUS_FORWARDED: core::ops::Range<usize> = 8..16;
+/// S2 (2026-10-14): `_v5_reserved[16..24]` (bytes 472..480, LE u64) = wrapper fee payouts a
+/// FIRST_LOSS pool received while it had no real staker (consumed unbooked by `AccrueFees`) and
+/// that have not yet been forwarded to the creator. Raised by the S2 branch of the fee accrual,
+/// lowered when the terminal settlement forwards it.
+pub const V5_RESERVED_S2_BACKLOG_OWED: core::ops::Range<usize> = 16..24;
 
 // ════════════════════════════════════════════════════════════════════════════
 // v5 CROSS-PROGRAM LAYOUT CONTRACT: the wrapper's `InsuranceUnitsV20`
@@ -1053,6 +1064,59 @@ impl StakePool {
     /// v5: this pool deploys into the market's insurance (first loss).
     pub fn is_first_loss(&self) -> bool {
         self.risk_mode == RISK_MODE_FIRST_LOSS
+    }
+
+    fn v5_u64(&self, r: core::ops::Range<usize>) -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&self._v5_reserved[r]);
+        u64::from_le_bytes(b)
+    }
+
+    fn set_v5_u64(&mut self, r: core::ops::Range<usize>, v: u64) {
+        self._v5_reserved[r].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// S1: cumulative terminal surplus forwarded to the creator (bytes 464..472).
+    pub fn creator_surplus_forwarded_atoms(&self) -> u64 {
+        self.v5_u64(V5_RESERVED_CREATOR_SURPLUS_FORWARDED)
+    }
+
+    pub fn set_creator_surplus_forwarded_atoms(&mut self, v: u64) {
+        self.set_v5_u64(V5_RESERVED_CREATOR_SURPLUS_FORWARDED, v);
+    }
+
+    /// S2: pre-stake fee backlog still owed to the creator (bytes 472..480).
+    pub fn s2_backlog_owed_atoms(&self) -> u64 {
+        self.v5_u64(V5_RESERVED_S2_BACKLOG_OWED)
+    }
+
+    pub fn set_s2_backlog_owed_atoms(&mut self, v: u64) {
+        self.set_v5_u64(V5_RESERVED_S2_BACKLOG_OWED, v);
+    }
+
+    /// S1 (growth plan §2.10; item 6 "creator seed return as creator units"): at terminal, does
+    /// the WHOLE vault surplus (vault balance above the booked pool value, after the wrapper fee
+    /// accrual) belong to the creator rather than to the stakers?
+    ///
+    /// * FIRST_LOSS with `total_flushed == 0`: no staker atom was ever deployed into the
+    ///   market's insurance from this pool. A FIRST_LOSS pool deploys only through
+    ///   `SyncInsuranceDeployment`, which books every atom into `total_flushed`. So every
+    ///   insurance atom that reaches the vault at terminal is creator-class (exactly how wrapper
+    ///   tag 116 classes a fund that predates the stakers: all creator units), and booking it to
+    ///   stakers would hand them the creator's seed.
+    /// * `!has_real_lp_holders()` (FIRST_LOSS or FEE_ONLY): no real staker exists, and none can
+    ///   join (deposits are refused once the wrapper is terminal), so a surplus booked into pool
+    ///   value would be owned by the dead shares only, i.e. stranded for ever (the 7.6k problem).
+    ///
+    /// NOT decided here (HELD for Khubair, 2026-10-14): who gets a FEE_ONLY pool's terminal fund
+    /// while real stakers exist. This predicate leaves that case exactly as before S1 (the
+    /// surplus is booked to the stakers by `book_terminal_recovery`).
+    ///
+    /// v5 risk modes only (a legacy pool cannot be created by this program).
+    pub fn terminal_surplus_to_creator(&self) -> bool {
+        let v5 = self.risk_mode == RISK_MODE_FIRST_LOSS || self.risk_mode == RISK_MODE_FEE_ONLY;
+        v5 && ((self.risk_mode == RISK_MODE_FIRST_LOSS && self.total_flushed == 0)
+            || !self.has_real_lp_holders())
     }
 
     /// Set discriminator in first 8 bytes of _reserved and version in byte 8.

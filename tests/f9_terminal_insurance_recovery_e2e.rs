@@ -67,6 +67,7 @@ const E_INVALID_ACCOUNT: u32 = 16;
 const E_MARKET_NOT_TERMINAL: u32 = 30;
 const E_NOTHING_TO_RECOVER: u32 = 31;
 const E_UNSUPPORTED_WRAPPER_LAYOUT: u32 = 32;
+const E_CREATOR_ACCOUNT_REQUIRED: u32 = 46;
 // Wrapper EngineLockActive.
 const W_ENGINE_LOCK_ACTIVE: u32 = 21;
 
@@ -234,6 +235,9 @@ struct World {
     vault: Pubkey,
     lp_mint: Pubkey,
     alice: Option<Staker>,
+    /// S1: `pool.admin`'s (the creator's) collateral token account; RecoverTerminalInsurance
+    /// forwards the creator's insurance seed here.
+    creator_ata: Pubkey,
 }
 
 struct Staker {
@@ -418,7 +422,12 @@ fn world(name: &str) -> Option<World> {
         vault,
         lp_mint,
         alice: None,
+        creator_ata: Pubkey::new_unique(),
     };
+    {
+        let (ca, mint, admin) = (w.creator_ata, w.mint, w.admin.pubkey());
+        set_token_account(&mut w.svm, ca, &mint, &admin, 0);
+    }
     w.alice = Some(deposit(&mut w, STAKE).expect("staker deposit while Live"));
     // Real Bind (tag 19).
     let (admin_k, payer_k) = (w.admin.insecure_clone(), w.payer.insecure_clone());
@@ -564,11 +573,13 @@ struct RecoverOpts {
     vault: Option<Pubkey>,
     vault_auth: Option<Pubkey>,
     stray: Option<Pubkey>,
+    no_creator: bool,
 }
 const DEFAULT_OPTS: RecoverOpts = RecoverOpts {
     vault: None,
     vault_auth: None,
     stray: None,
+    no_creator: false,
 };
 
 /// Stake tag 29, sent by a RANDOM non-signing caller (permissionless).
@@ -591,6 +602,11 @@ fn recover_terminal(
     ];
     if let Some(k) = o.stray {
         accounts.push(AccountMeta::new(k, false));
+    }
+    // S1 (FEE_ONLY): the creator's account rides in the same optional tail (told apart from the
+    // stray by its SPL owner). `no_creator` drops it to prove the refusal.
+    if !o.no_creator {
+        accounts.push(AccountMeta::new(w.creator_ata, false));
     }
     let mut data = vec![29u8];
     data.extend_from_slice(&amount.to_le_bytes());
@@ -670,6 +686,11 @@ fn admin_close_slab(
 ///   The staker then withdraws principal + the whole budget (less dead-share dust).
 /// NEGATIVE CONTROL: on the pre-fix stake .so (2212e17), tag 29 and tag 30 do not
 /// exist (InvalidInstructionData), so this test fails at the first tag-29 assert.
+///
+/// S1 split (2026-10-14): who gets a FEE_ONLY pool's fund while real stakers exist is HELD for
+/// Khubair, so this build keeps the pre-S1 routing for it: tag 29 in the pre-S1 account shape
+/// (no creator account) still succeeds, the creator receives nothing and the budget is booked
+/// to the stakers. The held commit (FEE_ONLY -> creator) replaces this test.
 #[test]
 fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
     let Some(mut w) = world("f9_bound_resolved_market_returns_budget_to_stakers_and_retires")
@@ -700,9 +721,19 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
 
     let wv0 = token_amount(&w.svm, &w.wrapper_vault);
     assert_eq!(wv0, BUDGET);
-    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
+    // The pre-S1 account shape (no creator account) is accepted: nothing is owed to the creator.
+    let r = recover_terminal(
+        &mut w,
+        BUDGET,
+        RecoverOpts {
+            no_creator: true,
+            ..DEFAULT_OPTS
+        },
+    );
     assert!(r.is_ok(), "tag 29: {}", logs(&r));
     let pool1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), 0, "FEE_ONLY with stakers: creator gets 0");
+    assert_eq!(pool1.creator_surplus_forwarded_atoms(), 0);
     assert_eq!(
         token_amount(&w.svm, &w.wrapper_vault),
         0,
@@ -1004,12 +1035,13 @@ fn f9_admin_close_slab_is_admin_only_and_needs_resolved() {
 }
 
 /// Dead shares only: every real staker exited BEFORE resolution (real Withdraw).
-/// The budget still leaves the wrapper (so the market can retire), but it is NOT
-/// booked to the dead shares (F3): it stays in pool.vault unbooked, pool value is
-/// unchanged, and the market still retires through tag 30.
+/// The budget still leaves the wrapper (so the market can retire). It is not booked to the
+/// dead shares (F3), and (S1, 2026-10-14) it is no longer stranded unbooked in pool.vault:
+/// it goes back to the creator. The market still retires through tag 30.
+/// NEGATIVE CONTROL: on the pre-S1 .so the budget stays in pool.vault for ever (creator 0).
 #[test]
-fn f9_dead_shares_only_budget_leaves_wrapper_but_is_not_booked() {
-    let Some(mut w) = world("f9_dead_shares_only_budget_leaves_wrapper_but_is_not_booked") else {
+fn f9_dead_shares_only_budget_returns_to_creator_not_stranded() {
+    let Some(mut w) = world("f9_dead_shares_only_budget_returns_to_creator_not_stranded") else {
         return;
     };
     let alice = w.alice.take().unwrap();
@@ -1038,6 +1070,12 @@ fn f9_dead_shares_only_budget_leaves_wrapper_but_is_not_booked() {
         "F3: nothing booked to dead shares"
     );
     assert_eq!(p1.total_pool_value(), p0.total_pool_value());
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET, "S1: not stranded");
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        p1.total_pool_value().unwrap(),
+        "vault == books (only the dead shares' own value is left)"
+    );
     let admin = w.admin.insecure_clone();
     let r = admin_close_slab(&mut w, &admin);
     assert!(r.is_ok(), "{}", logs(&r));

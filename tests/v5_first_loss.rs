@@ -4,7 +4,8 @@
 //! ledger, losses spread pro rata, no admin flush) is exercised against the REAL wrapper in
 //! `percolator-prog/tests/p4_wave_d.rs` (`xprog_*`), because this repo's own e2e harness hand-
 //! encodes an older InitMarket. Here: the sync plan (I-S4) with a mutant negative control, the
-//! units-ledger reader (fail closed), the v5 wire, and the config bounds.
+//! units-ledger reader (fail closed), the v5 wire, the config bounds, and (2026-10-14) the S1/S2
+//! terminal settlement conservation. The stake-side e2e of S3 + S1 is `tests/v5_s3_s1_e2e.rs`.
 
 use percolator_stake::instruction::StakeInstruction;
 use percolator_stake::math::{self, SyncAction};
@@ -247,5 +248,66 @@ fn s1_expected_units() {
         assert_eq!(m, (a as u128) * u / i);
         let b = math::expected_recover_burn(a.min(i as u64), u, i).unwrap();
         assert_eq!(b, ((a.min(i as u64) as u128) * u).div_ceil(i));
+    }
+}
+
+// ── S1 / S2 (2026-10-14): terminal settlement conservation on the REAL StakePool ──────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4096))]
+
+    /// Mirrors `kani_s1_terminal_settlement_conserves` at full width: from a fully booked pool the
+    /// wrapper releases `released` atoms; the creator gets `terminal_creator_share(..)` and the rest
+    /// is booked by `book_terminal_recovery`. Nothing is created; creator-takes-all books nothing to
+    /// stakers; otherwise (real holders) every released atom goes to the creator or the books.
+    #[test]
+    fn s1_terminal_settlement_conserves(
+        first_loss in any::<bool>(),
+        deposited in 0u64..1u64 << 50,
+        withdrawn_frac in 0u64..=1_000,
+        flushed_frac in 0u64..=1_000,
+        returned_frac in 0u64..=1_000,
+        recovered_frac in 0u64..=1_000,
+        fees in 0u64..1u64 << 40,
+        lp in 0u64..1u64 << 50,
+        released in 0u64..1u64 << 50,
+        backlog in 0u64..1u64 << 50,
+    ) {
+        use bytemuck::Zeroable;
+        let mut p = state::StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.risk_mode = if first_loss { state::RISK_MODE_FIRST_LOSS } else { state::RISK_MODE_FEE_ONLY };
+        p.total_deposited = deposited;
+        p.total_withdrawn = deposited / 1_000 * withdrawn_frac;
+        let live = deposited - p.total_withdrawn;
+        p.total_flushed = if first_loss { live / 1_000 * flushed_frac } else { 0 };
+        p.total_returned = p.total_flushed / 1_000 * returned_frac;
+        p.total_recovered_from_wrapper = p.total_returned / 1_000 * recovered_frac;
+        p.total_fees_earned = fees;
+        p.total_lp_supply = lp;
+        p.set_s2_backlog_owed_atoms(backlog);
+        let v0 = p.total_pool_value().unwrap();
+        let all = p.terminal_surplus_to_creator();
+        let real = p.has_real_lp_holders();
+        let balance = v0 + released;
+        let share = math::terminal_creator_share(released, backlog, all);
+        let (r, f) = p.book_terminal_recovery(balance - share).unwrap();
+        let v1 = p.total_pool_value().unwrap();
+        prop_assert!(share + r + f <= released);
+        prop_assert!(v1 + share <= balance);
+        if all {
+            prop_assert_eq!(v1, v0);
+            prop_assert_eq!(share, released);
+        } else {
+            prop_assert!(real && (p.total_flushed > 0 || !first_loss));
+            prop_assert_eq!(v1 + share, balance);
+            prop_assert_eq!(share, released.min(backlog));
+        }
+        // S1 split (2026-10-14): a FEE_ONLY pool's fund goes to the creator only when no real
+        // staker exists; with real stakers the routing is HELD and unchanged from before S1.
+        if !first_loss {
+            prop_assert_eq!(all, !real, "FEE_ONLY: creator-takes-all iff no real staker");
+        }
     }
 }

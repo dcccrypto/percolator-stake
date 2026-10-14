@@ -24,6 +24,47 @@ fn test_stake_pool_size_is_480_v5() {
     assert_eq!(StakePool::CURRENT_VERSION, 5);
 }
 
+/// The offsets an SDK / app needs to show a first-loss pool's value the way the program prices
+/// it (release checklist 2026-10-13 §5 item 4):
+/// `liquid = total_deposited - total_withdrawn - total_flushed + total_returned + total_fees_earned`
+/// (`realized_junior_loss`, `_reserved[51..59]`, is tranche-only and 0 on first-loss pools),
+/// `deployed = floor(units_stake * snap_free / units_total)` from the wrapper's
+/// `InsuranceUnitsV20`, `pool value = liquid + deployed`, `LP price = value / total_lp_supply`
+/// (the pool counter, which includes the 1,000 dead shares; not the SPL mint supply). Plus the
+/// S1/S2 counters claimed in `_v5_reserved` on 2026-10-14.
+#[test]
+fn pool_value_formula_offsets_for_sdk() {
+    use percolator_stake::state::{
+        V5_RESERVED_CREATOR_SURPLUS_FORWARDED, V5_RESERVED_S2_BACKLOG_OWED,
+    };
+    use std::mem::offset_of;
+    assert_eq!(offset_of!(StakePool, total_deposited), 168);
+    assert_eq!(offset_of!(StakePool, total_lp_supply), 176);
+    assert_eq!(offset_of!(StakePool, total_flushed), 200);
+    assert_eq!(offset_of!(StakePool, total_returned), 208);
+    assert_eq!(offset_of!(StakePool, total_withdrawn), 216);
+    assert_eq!(offset_of!(StakePool, total_fees_earned), 256);
+    assert_eq!(offset_of!(StakePool, vault), 136);
+    assert_eq!(offset_of!(StakePool, total_recovered_from_wrapper), 384);
+    assert_eq!(offset_of!(StakePool, _v5_reserved), 456);
+    assert_eq!(456 + V5_RESERVED_CREATOR_SURPLUS_FORWARDED.start, 464);
+    assert_eq!(456 + V5_RESERVED_CREATOR_SURPLUS_FORWARDED.end, 472);
+    assert_eq!(456 + V5_RESERVED_S2_BACKLOG_OWED.start, 472);
+    assert_eq!(456 + V5_RESERVED_S2_BACKLOG_OWED.end, 480);
+    // The wrapper ledger (raw account offsets, header included).
+    use percolator_stake::state::*;
+    assert_eq!(WRAPPER_INS_UNITS_OFF_UNITS_TOTAL, 48);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_UNITS_STAKE, 64);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_UNITS_CREATOR, 80);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_RECEIVABLE, 96);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_SNAP_MINT, 112);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_SNAP_FREE, 128);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_SNAP_SLOT, 144);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_VERSION, 152);
+    assert_eq!(WRAPPER_INS_UNITS_OFF_CREATOR_PAID, 160);
+    assert_eq!(WRAPPER_INS_UNITS_LEN, 208);
+}
+
 #[allow(dead_code)]
 fn test_stake_pool_size_is_408_v4_history() {
     // v4 layout: v3's 392 + pending_cooldown_slots[8] + cooldown_proposed_at_slot[8]

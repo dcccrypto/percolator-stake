@@ -2830,13 +2830,20 @@ fn accrue_fees_inner(
     // AccrueFees instruction refuses explicitly (NoRealLpHolders) before reaching here.
     // S2 (F5, v5 FIRST_LOSS pools): fees the wrapper paid while the pool had no real staker
     // belong to nobody who staked for them. Consume them from the attribution cursor instead of
-    // leaving them for the FIRST staker to book (they stay as unbooked vault surplus, which the
-    // terminal recovery books to whoever holds LP then).
+    // leaving them for the FIRST staker to book. They stay as unbooked vault surplus and are
+    // recorded as owed to the creator (2026-10-14: before, the terminal recovery booked them to
+    // whoever held LP then, i.e. a staker who joined later still captured them at terminal); the
+    // terminal settlement forwards them to `pool.admin` (`math::terminal_creator_share`).
     if fee_delta > 0 && pool.pool_mode == 0 && pool.is_first_loss() && !pool.has_real_lp_holders() {
         pool.mode0_fees_attributed = pool
             .mode0_fees_attributed
             .checked_add(fee_delta)
             .ok_or(StakeError::Overflow)?;
+        let owed = pool
+            .s2_backlog_owed_atoms()
+            .checked_add(fee_delta)
+            .ok_or(StakeError::Overflow)?;
+        pool.set_s2_backlog_owed_atoms(owed);
         msg!("AccrueFees: {} pre-stake fee backlog consumed unbooked (S2)", fee_delta);
         return Ok(());
     }
@@ -3730,7 +3737,120 @@ fn process_return_insurance(
 //   * the tag-41 CPI names `pool.vault` as `dest_token` (key-checked below);
 //   * the sweep transfers INTO `pool.vault` only, from an account vault_auth owns.
 // Booking only ever credits the pool, and only while the wrapper market is
-// terminal, so no caller can move value between stakers or out of the pool.
+// terminal, so no caller can move value between stakers.
+//
+// The ONLY outflow (S1 / S2, v5): creator-owned value leaves `pool.vault` for a token account
+// of `pool.admin` (the creator), never anywhere else, and never booked staker value:
+//   * the creator-class insurance the wrapper attributes (`creator_paid_to_stake_atoms`);
+//   * the vault SURPLUS above the booked pool value when a FIRST_LOSS pool never deployed a
+//     staker atom or no real staker exists, else only the S2 pre-stake fee backlog
+//     (`terminal_creator_share`).
+// The caller cannot choose the recipient (key-derived from `pool.admin`) or the amounts.
+/// S1: transfer `amount` atoms from `pool.vault` to the creator's token account, signed by
+/// `vault_auth`. `creator` must be a writable SPL token account of the pool collateral whose
+/// owner is `pool.admin` (the creator); anyone can create that account, so the recovery cannot be
+/// blocked by the admin. No-op (and no checks) for `amount == 0`. Returns the atoms sent.
+fn forward_to_creator<'a>(
+    pool: &state::StakePool,
+    vault: &AccountInfo<'a>,
+    creator: &AccountInfo<'a>,
+    vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    vault_auth_seeds: &[&[u8]],
+    amount: u64,
+) -> Result<u64, ProgramError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    validate_account_writable(creator)?;
+    if *creator.owner != crate::spl_token::id() {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if creator.key == vault.key {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    {
+        let data = creator.try_borrow_data()?;
+        if data.len() < crate::spl_token::state::ACCOUNT_LEN
+            || data[0..32] != pool.collateral_mint
+            || data[32..64] != pool.admin
+        {
+            msg!("RecoverTerminalInsurance: S1 creator account must be pool.admin's collateral account");
+            return Err(StakeError::InvalidAccount.into());
+        }
+    }
+    let before = token_balance(vault)?;
+    invoke_signed(
+        &crate::spl_token::transfer(
+            token_program.key,
+            vault.key,
+            creator.key,
+            vault_auth.key,
+            &[],
+            amount,
+        )?,
+        &[
+            vault.clone(),
+            creator.clone(),
+            vault_auth.clone(),
+            token_program.clone(),
+        ],
+        &[vault_auth_seeds],
+    )?;
+    if before.checked_sub(token_balance(vault)?) != Some(amount) {
+        return Err(StakeError::CpiFailed.into());
+    }
+    Ok(amount)
+}
+
+/// S1 / S2 terminal settlement (2026-10-14): forward the creator's part of the vault surplus
+/// (`balance` above the booked pool value; `math::terminal_creator_share`) to the creator and
+/// update the S2 backlog and the S1 surplus counter. Called AFTER the wrapper fee accrual and
+/// BEFORE `book_terminal_recovery`, so the forwarded atoms are never booked to stakers. Fails
+/// with `CreatorAccountRequired` when something is owed and no creator account was passed (the
+/// alternative, booking the creator's atoms to stakers, is the bug this closes).
+fn settle_creator_surplus<'a>(
+    pool: &mut state::StakePool,
+    vault: &AccountInfo<'a>,
+    creator: Option<&AccountInfo<'a>>,
+    vault_auth: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    vault_auth_seeds: &[&[u8]],
+    balance: u64,
+) -> Result<u64, ProgramError> {
+    let surplus = balance.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
+    let backlog = pool.s2_backlog_owed_atoms();
+    let share =
+        crate::math::terminal_creator_share(surplus, backlog, pool.terminal_surplus_to_creator());
+    if share == 0 {
+        return Ok(0);
+    }
+    let creator = creator.ok_or(StakeError::CreatorAccountRequired)?;
+    let sent = forward_to_creator(
+        pool,
+        vault,
+        creator,
+        vault_auth,
+        token_program,
+        vault_auth_seeds,
+        share,
+    )?;
+    pool.set_s2_backlog_owed_atoms(backlog.saturating_sub(sent));
+    pool.set_creator_surplus_forwarded_atoms(
+        pool.creator_surplus_forwarded_atoms()
+            .checked_add(sent)
+            .ok_or(StakeError::Overflow)?,
+    );
+    msg!(
+        "RecoverTerminalInsurance: S1/S2 forwarded {} of terminal surplus {} to pool.admin (backlog owed {} -> {})",
+        sent,
+        surplus,
+        backlog,
+        pool.s2_backlog_owed_atoms()
+    );
+    Ok(sent)
+}
+
 fn process_recover_terminal_insurance(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3811,16 +3931,55 @@ fn process_recover_terminal_insurance(
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
     let first_loss = pool.is_first_loss();
-    let (v5_units, v5_creator, stray) = if first_loss {
+    // Accounts after [8]:
+    // * FIRST_LOSS: [9] the units ledger PDA (REQUIRED), [10] the creator's token account
+    //   (REQUIRED), [11] the optional stray. S1 (2026-10-14): the ledger may be UNCREATED. The
+    //   wrapper creates it (tag 116, Live only) on the first first-loss deposit or sync, so an
+    //   uncreated ledger with `total_flushed == 0` means no staker ever deposited: the market was
+    //   never unitised, the whole fund is the creator's seed, and the pre-units tag-41 CPI is
+    //   used. (Before, this refused for ever and the seed was stranded.)
+    // * FEE_ONLY: up to two optional token accounts in any order, told apart by their SPL owner
+    //   field: `vault_auth` -> the stray sweep (the pre-S1 [9]); `pool.admin` -> the creator's
+    //   account, needed whenever the terminal surplus belongs to the creator.
+    let (v5_units, creator, stray) = if first_loss {
         let units = *rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         let creator = *rest.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
         let (expected, _) = state::derive_wrapper_ins_units(percolator_program.key, market.key);
-        if *units.key != expected || units.owner != percolator_program.key {
+        if *units.key != expected {
             return Err(StakeError::InsuranceUnitsInvalid.into());
         }
-        (Some(units), Some(creator), rest.get(2).copied())
+        let unitised = if units.owner == percolator_program.key {
+            true
+        } else if units.data_is_empty() && pool.total_flushed == 0 {
+            false
+        } else {
+            return Err(StakeError::InsuranceUnitsInvalid.into());
+        };
+        (unitised.then_some(units), Some(creator), rest.get(2).copied())
     } else {
-        (None, None, rest.first().copied())
+        let mut creator: Option<&AccountInfo> = None;
+        let mut stray: Option<&AccountInfo> = None;
+        for ai in rest.iter().take(2).copied() {
+            if *ai.owner != crate::spl_token::id() {
+                return Err(ProgramError::IllegalOwner);
+            }
+            let token_owner: [u8; 32] = {
+                let data = ai.try_borrow_data()?;
+                if data.len() < crate::spl_token::state::ACCOUNT_LEN {
+                    return Err(StakeError::InvalidAccount.into());
+                }
+                data[32..64].try_into().map_err(|_| StakeError::InvalidAccount)?
+            };
+            if token_owner == vault_auth.key.to_bytes() && stray.is_none() {
+                stray = Some(ai);
+            } else if token_owner == pool.admin && creator.is_none() {
+                creator = Some(ai);
+            } else {
+                msg!("RecoverTerminalInsurance: account is neither a vault_auth stray nor pool.admin's");
+                return Err(StakeError::InvalidAccount.into());
+            }
+        }
+        (None, creator, stray)
     };
 
     // TERMINAL GATE. Booking a raw vault surplus is only safe once the market can
@@ -3957,51 +4116,29 @@ fn process_recover_terminal_insurance(
     // `creator_paid_to_stake - forwarded` to the creator (pool.admin's token account) BEFORE
     // the surplus is booked.
     let mut forwarded: u64 = 0;
-    if let (Some(units), Some(creator)) = (v5_units, v5_creator) {
+    if let (Some(units), Some(creator)) = (v5_units, creator) {
         let u = state::read_wrapper_ins_units(&units.try_borrow_data()?, &pool.slab)
             .ok_or(StakeError::InsuranceUnitsInvalid)?;
         let paid = u64::try_from(u.creator_paid_to_stake).map_err(|_| StakeError::Overflow)?;
         let owed = paid.saturating_sub(pool.creator_forwarded_atoms);
         if owed > 0 {
-            validate_account_writable(creator)?;
-            if *creator.owner != crate::spl_token::id() {
-                return Err(ProgramError::IllegalOwner);
-            }
-            {
-                let data = creator.try_borrow_data()?;
-                if data.len() < crate::spl_token::state::ACCOUNT_LEN
-                    || data[0..32] != pool.collateral_mint
-                    || data[32..64] != pool.admin
-                {
-                    msg!("RecoverTerminalInsurance: S1 creator account must be pool.admin's collateral account");
-                    return Err(StakeError::InvalidAccount.into());
-                }
-            }
             let send = owed.min(read_vault_balance(vault)?);
-            if send > 0 {
-                invoke_signed(
-                    &crate::spl_token::transfer(
-                        token_program.key,
-                        vault.key,
-                        creator.key,
-                        vault_auth.key,
-                        &[],
-                        send,
-                    )?,
-                    &[
-                        vault.clone(),
-                        creator.clone(),
-                        vault_auth.clone(),
-                        token_program.clone(),
-                    ],
-                    &[vault_auth_seeds],
-                )?;
-                pool.creator_forwarded_atoms = pool
-                    .creator_forwarded_atoms
-                    .checked_add(send)
-                    .ok_or(StakeError::Overflow)?;
-                forwarded = send;
-                msg!("RecoverTerminalInsurance: S1 forwarded {} of creator seed to pool.admin", send);
+            let sent = forward_to_creator(
+                pool,
+                vault,
+                creator,
+                vault_auth,
+                token_program,
+                vault_auth_seeds,
+                send,
+            )?;
+            pool.creator_forwarded_atoms = pool
+                .creator_forwarded_atoms
+                .checked_add(sent)
+                .ok_or(StakeError::Overflow)?;
+            forwarded = sent;
+            if sent > 0 {
+                msg!("RecoverTerminalInsurance: S1 forwarded {} of creator seed to pool.admin", sent);
             }
         }
     }
@@ -4016,12 +4153,35 @@ fn process_recover_terminal_insurance(
         .total_fees_earned
         .checked_sub(fees_before)
         .ok_or(StakeError::Overflow)?;
+
+    // S1 / S2 (2026-10-14): the part of the remaining surplus that is the creator's: all of it
+    // when a FIRST_LOSS pool never deployed a staker atom or no real staker exists (it would
+    // otherwise be booked to stakers as a windfall of the creator's seed, or stranded on the
+    // dead shares), else only the S2 pre-stake fee backlog. Forwarded BEFORE the rest is booked.
+    // A FEE_ONLY pool with real stakers books its surplus to them, as before S1.
+    let surplus_forwarded = settle_creator_surplus(
+        pool,
+        vault,
+        creator,
+        vault_auth,
+        token_program,
+        vault_auth_seeds,
+        balance,
+    )?;
+
+    let balance = read_vault_balance(vault)?;
     let (to_returned, to_fees) = pool.book_terminal_recovery(balance)?;
 
     // (5) The market is over for this pool: no more deposits or flushes.
     pool.set_market_resolved(true);
 
-    if moved == 0 && attributed == 0 && to_returned == 0 && to_fees == 0 && forwarded == 0 {
+    if moved == 0
+        && attributed == 0
+        && to_returned == 0
+        && to_fees == 0
+        && forwarded == 0
+        && surplus_forwarded == 0
+    {
         msg!("RecoverTerminalInsurance: nothing withdrawn, swept or booked");
         return Err(StakeError::NothingToRecover.into());
     }
@@ -4118,6 +4278,20 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
         return Err(StakeError::MarketNotTerminal.into());
     }
 
+    // S1 (2026-10-14): book any wrapper fee payout (tag 87) that reached the vault since the
+    // last accrual NOW, while the market is still readable: after the close the payout counter
+    // is gone, and an unbooked payout would be indistinguishable from the creator-owned surplus
+    // the post-close settlement forwards to the creator.
+    {
+        let balance = token_balance(vault)?;
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool = pool_from_data_mut(&mut pool_data[..])?;
+        if pool.pool_mode == 0 {
+            let paid = wrapper_fee_payouts(pool, market)?;
+            accrue_fees_inner(pool, balance, Some(paid))?;
+        }
+    }
+
     // CPI. No borrow of the pool account is held: the pool PDA is a CPI account
     // (the signer and the rent-refund destination).
     let lamports_before = pool_pda.lamports();
@@ -4182,14 +4356,24 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     let pool = pool_from_data_mut(&mut pool_data[..])?;
     // The market is Resolved (checked above) or now Closed: both terminal, so a
     // surplus in pool.vault may be booked (see `book_terminal_recovery`).
-    let (to_returned, to_fees) = pool.book_terminal_recovery(balance)?;
+    // S1 / S2 (2026-10-14): the creator's part of the surplus (`math::terminal_creator_share`)
+    // is NOT booked here; it stays in the vault and the next RecoverTerminalInsurance (amount 0
+    // works on a closed market) forwards it to pool.admin's token account.
+    let surplus = balance.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
+    let reserved = crate::math::terminal_creator_share(
+        surplus,
+        pool.s2_backlog_owed_atoms(),
+        pool.terminal_surplus_to_creator(),
+    );
+    let (to_returned, to_fees) = pool.book_terminal_recovery(balance - reserved)?;
     pool.set_market_resolved(true);
     msg!(
-        "AdminCloseSlab: closed={} swept {} into pool vault; booked returned {} + fees {}; refunded {} lamports to admin",
+        "AdminCloseSlab: closed={} swept {} into pool vault; booked returned {} + fees {}; {} left for the creator (S1); refunded {} lamports to admin",
         closed,
         swept,
         to_returned,
         to_fees,
+        reserved,
         refund
     );
     Ok(())
@@ -5911,5 +6095,91 @@ mod tests {
             Err(StakeError::InvalidPda.into()),
             "AdminResolveMarket must reject a slab account that doesn't match pool.slab"
         );
+    }
+
+    // ── S1 / S2 (2026-10-14): terminal surplus routing and the S2 backlog counter ──────────
+
+    fn v5_pool(risk_mode: u8) -> state::StakePool {
+        let mut p = state::StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.risk_mode = risk_mode;
+        p.pool_mode = 0;
+        p
+    }
+
+    /// S2: a wrapper fee payout accrued while a FIRST_LOSS pool has no real staker is consumed
+    /// from the cursor (not booked) AND recorded as owed to the creator. NEGATIVE CONTROL: on
+    /// aebbff6 the backlog counter does not exist (bytes 472..480 stay 0).
+    #[test]
+    fn s2_backlog_is_recorded_as_owed_to_the_creator() {
+        let mut p = v5_pool(state::RISK_MODE_FIRST_LOSS);
+        p.total_deposited = state::MINIMUM_LIQUIDITY + 1;
+        p.total_lp_supply = state::MINIMUM_LIQUIDITY; // dead shares only
+        p.set_fee_attribution_armed(true);
+        let pv = p.total_pool_value().unwrap();
+        accrue_fees_inner(&mut p, pv + 700, Some(500)).unwrap();
+        assert_eq!(p.total_fees_earned, 0, "not booked to the dead shares");
+        assert_eq!(p.mode0_fees_attributed, 500, "consumed from the cursor");
+        assert_eq!(p.s2_backlog_owed_atoms(), 500, "owed to the creator");
+        // A second payout while still empty accumulates; once a real staker exists, fees book.
+        accrue_fees_inner(&mut p, pv + 900, Some(700)).unwrap();
+        assert_eq!(p.s2_backlog_owed_atoms(), 700);
+        p.total_lp_supply = state::MINIMUM_LIQUIDITY + 10;
+        accrue_fees_inner(&mut p, pv + 1_000, Some(800)).unwrap();
+        assert_eq!(p.total_fees_earned, 100, "post-stake fees go to stakers");
+        assert_eq!(p.s2_backlog_owed_atoms(), 700, "backlog untouched by later fees");
+        // FEE_ONLY pools never record a backlog (they are paid nothing).
+        let mut q = v5_pool(state::RISK_MODE_FEE_ONLY);
+        q.total_lp_supply = state::MINIMUM_LIQUIDITY;
+        q.set_fee_attribution_armed(true);
+        accrue_fees_inner(&mut q, 500, Some(500)).unwrap();
+        assert_eq!(q.s2_backlog_owed_atoms(), 0);
+    }
+
+    /// S1 predicate: the whole terminal surplus is the creator's iff the pool is v5 and either
+    /// (FIRST_LOSS) never deployed a staker atom or has no real staker. A FEE_ONLY pool with
+    /// real stakers is NOT creator-takes-all here (held decision; unchanged from aebbff6).
+    /// NEGATIVE CONTROL: the predicate is new.
+    #[test]
+    fn s1_terminal_surplus_to_creator_predicate() {
+        let real = state::MINIMUM_LIQUIDITY + 1;
+        for (mode, flushed, lp, want) in [
+            (state::RISK_MODE_FEE_ONLY, 0u64, real, false),
+            (state::RISK_MODE_FEE_ONLY, 0, state::MINIMUM_LIQUIDITY, true),
+            (state::RISK_MODE_FIRST_LOSS, 0, real, true),
+            (state::RISK_MODE_FIRST_LOSS, 5, real, false),
+            (state::RISK_MODE_FIRST_LOSS, 5, state::MINIMUM_LIQUIDITY, true),
+            (state::RISK_MODE_FIRST_LOSS, 5, 0, true),
+            (state::RISK_MODE_LEGACY, 0, real, false),
+            (state::RISK_MODE_LEGACY, 5, 0, false),
+        ] {
+            let mut p = v5_pool(mode);
+            p.total_flushed = flushed;
+            p.total_lp_supply = lp;
+            assert_eq!(
+                p.terminal_surplus_to_creator(),
+                want,
+                "mode {mode} flushed {flushed} lp {lp}"
+            );
+        }
+    }
+
+    /// The v5 tail bytes this change claims (464..480) do not alias any other field, and the
+    /// S-6 flag at 456 is independent of them.
+    #[test]
+    fn s1_s2_reserved_bytes_do_not_alias() {
+        let mut p = v5_pool(state::RISK_MODE_FIRST_LOSS);
+        p.set_creator_surplus_forwarded_atoms(u64::MAX);
+        p.set_s2_backlog_owed_atoms(0x0102_0304_0506_0708);
+        p._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL] = 1;
+        assert_eq!(p.creator_surplus_forwarded_atoms(), u64::MAX);
+        assert_eq!(p.s2_backlog_owed_atoms(), 0x0102_0304_0506_0708);
+        assert_eq!(p.creator_forwarded_atoms, 0);
+        assert_eq!(p.sync_cooldown_slots, 0);
+        let bytes = bytemuck::bytes_of(&p);
+        assert_eq!(&bytes[464..472], &u64::MAX.to_le_bytes());
+        assert_eq!(&bytes[472..480], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(bytes[456], 1);
     }
 }
