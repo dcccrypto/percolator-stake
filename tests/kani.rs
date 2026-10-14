@@ -1154,15 +1154,17 @@ mod kani_proofs {
     /// PROOF S1 settlement conservation on the REAL `StakePool` (`terminal_surplus_to_creator`
     /// + `book_terminal_recovery`), in the order RecoverTerminalInsurance runs them: from a
     /// fully booked pool the wrapper releases `released` atoms; the creator is paid
-    /// `share = terminal_creator_share(released, backlog, pool.terminal_surplus_to_creator())`
-    /// out of the vault, and the rest is booked. Then:
+    /// `share = terminal_creator_share(released, pool.terminal_creator_owed_atoms(),
+    /// pool.terminal_surplus_to_creator())` out of the vault (owed = S2 backlog + FEE_ONLY seed
+    /// remaining, growth-plan reading), and the rest is booked. Then:
     ///   * `share + booked <= released` (nothing created) and pool value never exceeds the vault;
     ///   * creator-takes-all -> NOTHING is booked to stakers (pool value unchanged);
     ///   * otherwise, with real holders, the books absorb exactly `released - share`
     ///     (conservation: every released atom goes to the creator or the stakers).
     /// Bounded to 2^40 per field (as `kani_f9_pool_receives_exactly_what_wrapper_releases`).
     /// MUTANTS: (M1) book before forwarding (booked = released); (M2) predicate ignores
-    /// `total_flushed`; (M3) predicate ignores real holders.
+    /// `total_flushed`; (M3) predicate ignores real holders; (M4) owed ignores the seed already
+    /// forwarded (FEE_ONLY creator paid its seed twice: `share <= seed remaining` fails).
     #[kani::proof]
     #[kani::unwind(2)]
     fn kani_s1_terminal_settlement_conserves() {
@@ -1192,6 +1194,13 @@ mod kani_proofs {
         kani::assume(p.total_returned <= p.total_flushed);
         kani::assume(backlog <= B);
         p.set_s2_backlog_owed_atoms(backlog);
+        // FEE_ONLY growth-plan reading: a symbolic seed record and seed already forwarded.
+        let seed: u64 = kani::any();
+        let seed_fwd: u64 = kani::any();
+        kani::assume(seed <= B && seed_fwd <= B);
+        p.set_fee_only_creator_seed_atoms(seed);
+        p.set_creator_surplus_forwarded_atoms(seed_fwd);
+        let owed = p.terminal_creator_owed_atoms();
         let v0 = match p.total_pool_value() {
             Some(v) => v,
             None => return,
@@ -1199,7 +1208,7 @@ mod kani_proofs {
         let all = p.terminal_surplus_to_creator();
         let real = p.has_real_lp_holders();
         let balance = v0 + released;
-        let share = percolator_stake::math::terminal_creator_share(released, backlog, all);
+        let share = percolator_stake::math::terminal_creator_share(released, owed, all);
         let (r, f) = p.book_terminal_recovery(balance - share).expect("bounded input");
         let v1 = p.total_pool_value().expect("representable");
         assert!(share + r + f <= released, "nothing created");
@@ -1216,6 +1225,14 @@ mod kani_proofs {
         kani::cover!(all && released > 0 && real, "COVER: never-deployed pool with stakers");
         kani::cover!(all && released > 0 && !real, "COVER: no real stakers");
         kani::cover!(!all && share > 0 && r + f > 0, "COVER: backlog to creator, rest to stakers");
+        if p.risk_mode == percolator_stake::state::RISK_MODE_FEE_ONLY && !all {
+            // Growth-plan reading: the creator gets at most its seed remaining; stakers the rest.
+            assert!(share <= seed.saturating_sub(seed_fwd));
+        }
+        kani::cover!(
+            p.risk_mode == percolator_stake::state::RISK_MODE_FEE_ONLY && !all && share > 0 && r + f > 0,
+            "COVER: FEE_ONLY seed to creator, growth to stakers"
+        );
     }
 
     /// PROOF I-S1 (`kani_s3_admin_cannot_flush`), dispatch level on the REAL

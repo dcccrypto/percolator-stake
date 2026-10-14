@@ -68,6 +68,9 @@ const E_MARKET_NOT_TERMINAL: u32 = 30;
 const E_NOTHING_TO_RECOVER: u32 = 31;
 const E_UNSUPPORTED_WRAPPER_LAYOUT: u32 = 32;
 const E_CREATOR_ACCOUNT_REQUIRED: u32 = 46;
+/// FEE_ONLY growth-plan reading: the engine `insurance` balance in a market account (pinned
+/// v2.2 layout; `wrapper_layout::MARKET_INSURANCE_OFF`).
+const MARKET_INSURANCE_OFF: usize = percolator_stake::wrapper_layout::MARKET_INSURANCE_OFF;
 // Wrapper EngineLockActive.
 const W_ENGINE_LOCK_ACTIVE: u32 = 21;
 
@@ -429,7 +432,8 @@ fn world(name: &str) -> Option<World> {
         set_token_account(&mut w.svm, ca, &mint, &admin, 0);
     }
     w.alice = Some(deposit(&mut w, STAKE).expect("staker deposit while Live"));
-    // Real Bind (tag 19).
+    // Real Bind (tag 19). FEE_ONLY growth-plan reading: the pool is writable (the bind records
+    // the creator's seed = the engine insurance now, i.e. BUDGET).
     let (admin_k, payer_k) = (w.admin.insecure_clone(), w.payer.insecure_clone());
     send(
         &mut w.svm,
@@ -439,7 +443,7 @@ fn world(name: &str) -> Option<World> {
             program_id: w.stake_id,
             accounts: vec![
                 AccountMeta::new(w.admin.pubkey(), true),
-                AccountMeta::new_readonly(w.pool, false),
+                AccountMeta::new(w.pool, false),
                 AccountMeta::new_readonly(w.vault_auth, false),
                 AccountMeta::new(w.market, false),
                 AccountMeta::new_readonly(w.wrapper_id, false),
@@ -680,20 +684,18 @@ fn admin_close_slab(
 
 /// The headline: a stake-owned, bound, Resolved market with a 5M insurance budget.
 ///   BEFORE: CloseSlab (via the proxy) is refused 21 while the budget is outstanding.
-///   tag 29 (permissionless): exactly BUDGET moves wrapper -> pool.vault, and exactly
-///   BUDGET is booked to stakers.
+///   tag 29 (permissionless): exactly BUDGET moves wrapper -> pool.vault, and (S1,
+///   2026-10-14, growth-plan reading) exactly BUDGET is forwarded to the creator (pool.admin):
+///   the bind recorded the creator's seed = BUDGET (the whole fund; there is no growth here),
+///   and the creator gets min(seed remaining, surplus). Stakers' value is unchanged.
 ///   tag 30: the market retires to a tombstone, and the rent refund reaches the admin.
-///   The staker then withdraws principal + the whole budget (less dead-share dust).
 /// NEGATIVE CONTROL: on the pre-fix stake .so (2212e17), tag 29 and tag 30 do not
-/// exist (InvalidInstructionData), so this test fails at the first tag-29 assert.
-///
-/// S1 split (2026-10-14): who gets a FEE_ONLY pool's fund while real stakers exist is HELD for
-/// Khubair, so this build keeps the pre-S1 routing for it: tag 29 in the pre-S1 account shape
-/// (no creator account) still succeeds, the creator receives nothing and the budget is booked
-/// to the stakers. The held commit (FEE_ONLY -> creator) replaces this test.
+/// exist (InvalidInstructionData), so this test fails at the first tag-29 assert. On the
+/// pre-S1 .so (aebbff6) the budget is booked to the stakers instead: the creator-balance and
+/// pool-value asserts below fail (BUDGET booked as fees).
 #[test]
-fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
-    let Some(mut w) = world("f9_bound_resolved_market_returns_budget_to_stakers_and_retires")
+fn f9_bound_resolved_market_returns_budget_to_creator_and_retires() {
+    let Some(mut w) = world("f9_bound_resolved_market_returns_budget_to_creator_and_retires")
     else {
         return;
     };
@@ -721,7 +723,8 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
 
     let wv0 = token_amount(&w.svm, &w.wrapper_vault);
     assert_eq!(wv0, BUDGET);
-    // The pre-S1 account shape (no creator account) is accepted: nothing is owed to the creator.
+    // S1: without the creator's account the settlement refuses (it would otherwise have to book
+    // the creator's seed to the stakers), and nothing moves.
     let r = recover_terminal(
         &mut w,
         BUDGET,
@@ -730,28 +733,34 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
             ..DEFAULT_OPTS
         },
     );
+    assert_eq!(custom(&r), Some(E_CREATOR_ACCOUNT_REQUIRED), "{}", logs(&r));
+    assert_eq!(token_amount(&w.svm, &w.wrapper_vault), BUDGET, "nothing moved");
+    let r = recover_terminal(&mut w, BUDGET, DEFAULT_OPTS);
     assert!(r.is_ok(), "tag 29: {}", logs(&r));
     let pool1 = read_pool(&w.svm, &w.pool);
-    assert_eq!(token_amount(&w.svm, &w.creator_ata), 0, "FEE_ONLY with stakers: creator gets 0");
-    assert_eq!(pool1.creator_surplus_forwarded_atoms(), 0);
     assert_eq!(
         token_amount(&w.svm, &w.wrapper_vault),
         0,
         "wrapper released the whole budget"
     );
     assert_eq!(
-        token_amount(&w.svm, &w.vault),
-        STAKE + BUDGET,
-        "pool.vault received exactly the budget"
+        token_amount(&w.svm, &w.creator_ata),
+        BUDGET,
+        "S1: the creator got its whole seed back"
     );
     assert_eq!(
-        pool1.total_fees_earned - pool0.total_fees_earned,
-        BUDGET,
-        "stakers credited exactly the budget"
+        token_amount(&w.svm, &w.vault),
+        STAKE,
+        "pool.vault keeps exactly the stakers' principal"
     );
+    assert_eq!(
+        pool1.total_fees_earned, pool0.total_fees_earned,
+        "nothing booked to stakers"
+    );
+    assert_eq!(pool1.creator_surplus_forwarded_atoms(), BUDGET);
     assert_eq!(
         pool1.total_pool_value(),
-        Some(STAKE + BUDGET),
+        Some(STAKE),
         "pool value == vault balance"
     );
     assert!(
@@ -787,10 +796,7 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
     );
     let admin_l1 = w.svm.get_account(&w.admin.pubkey()).unwrap().lamports;
     assert!(admin_l1 > admin_l0, "rent refund forwarded to the admin");
-    assert_eq!(
-        read_pool(&w.svm, &w.pool).total_pool_value(),
-        Some(STAKE + BUDGET)
-    );
+    assert_eq!(read_pool(&w.svm, &w.pool).total_pool_value(), Some(STAKE));
 
     // Book-only on a closed market still works (and finds nothing).
     let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
@@ -804,13 +810,17 @@ fn f9_bound_resolved_market_returns_budget_to_stakers_and_retires() {
     );
 }
 
-/// Stakers actually get the budget: a staker who deposited while Live redeems their
-/// whole LP after the terminal recovery and receives principal + their pro-rata share
-/// of the budget. Withdraw works both with the slab account omitted and, while the
-/// market is still Resolved (not closed), with it passed.
+/// S1 (2026-10-14, growth-plan reading): the whole terminal budget is the creator's seed
+/// recorded at bind (no growth above it here), so it is not a windfall for stakers (growth is:
+/// `f9_fee_only_growth_above_seed_stays_with_stakers_forged_seed`). A staker who deposited while
+/// Live redeems exactly its principal after the terminal recovery (less nothing: the dead
+/// shares hold their own 1,000); the creator receives the whole budget. Withdraw works both
+/// with the slab account omitted and, while the market is still Resolved, with it passed.
+/// NEGATIVE CONTROL: on the pre-S1 .so (aebbff6) bob receives principal + ~half the budget
+/// and the creator 0, so both asserts fail.
 #[test]
-fn f9_staker_redeems_principal_plus_budget() {
-    let Some(mut w) = world("f9_staker_redeems_principal_plus_budget") else {
+fn f9_staker_redeems_principal_creator_gets_budget_s1() {
+    let Some(mut w) = world("f9_staker_redeems_principal_creator_gets_budget_s1") else {
         return;
     };
     // Second staker so we hold the keypair (world()'s first staker is dropped).
@@ -818,23 +828,19 @@ fn f9_staker_redeems_principal_plus_budget() {
     let bob_lp = token_amount(&w.svm, &bob.lp_ata);
     admin_resolve(&mut w);
     assert!(recover_terminal(&mut w, BUDGET, DEFAULT_OPTS).is_ok());
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET, "S1: creator seed returned");
     let slot = w.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
     w.svm.warp_to_slot(slot + 100);
     let before = token_amount(&w.svm, &bob.ata);
     let r = withdraw(&mut w, &bob, bob_lp, true);
     assert!(r.is_ok(), "withdraw: {}", logs(&r));
     let got = token_amount(&w.svm, &bob.ata) - before;
-    // Bob holds bob_lp of total_lp (2*STAKE, 1,000 dead). Pool value 2*STAKE + BUDGET.
     let pool = read_pool(&w.svm, &w.pool);
     eprintln!(
-        "F-9 redeem: bob got {got} for {bob_lp} LP; pool now value {:?}",
+        "S1 redeem: bob got {got} for {bob_lp} LP; pool now value {:?}",
         pool.total_pool_value()
     );
-    assert!(
-        got > STAKE + BUDGET / 2 - 1_000,
-        "bob gets principal + ~half the budget, got {got}"
-    );
-    assert!(got <= STAKE + BUDGET / 2, "and not more than his share");
+    assert!(got <= STAKE && got + 1 >= STAKE, "bob gets exactly his principal, got {got}");
 }
 
 /// JIT guard: once the WRAPPER is Resolved (here via tag 24, but equally by a
@@ -944,10 +950,13 @@ fn f9_recover_terminal_destination_is_pinned() {
 }
 
 /// Griefing 1: a third party front-runs with a DIRECT wrapper tag 41 into pool.vault.
-/// The tokens arrive unbooked; tag 29 (amount 0) books them for stakers.
+/// The tokens arrive unbooked; tag 29 (amount 0) settles them. S1 (2026-10-14, growth-plan
+/// reading): they are the creator's seed recorded at bind (BUDGET), so they go to the creator,
+/// never to the stakers (a staker would otherwise profit from this front-run).
+/// NEGATIVE CONTROL: on the pre-S1 .so the BUDGET is booked as staker fees.
 #[test]
-fn f9_third_party_direct_tag41_is_still_booked() {
-    let Some(mut w) = world("f9_third_party_direct_tag41_is_still_booked") else {
+fn f9_third_party_direct_tag41_is_still_settled_to_creator() {
+    let Some(mut w) = world("f9_third_party_direct_tag41_is_still_settled_to_creator") else {
         return;
     };
     admin_resolve(&mut w);
@@ -964,15 +973,18 @@ fn f9_third_party_direct_tag41_is_still_booked() {
     let r = recover_terminal(&mut w, 0, DEFAULT_OPTS);
     assert!(r.is_ok(), "{}", logs(&r));
     let p1 = read_pool(&w.svm, &w.pool);
-    assert_eq!(p1.total_fees_earned - p0.total_fees_earned, BUDGET);
-    assert_eq!(p1.total_pool_value(), Some(STAKE + BUDGET));
+    assert_eq!(p1.total_fees_earned, p0.total_fees_earned, "nothing booked to stakers");
+    assert_eq!(p1.total_pool_value(), Some(STAKE));
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET);
+    assert_eq!(token_amount(&w.svm, &w.vault), STAKE);
 }
 
 /// Griefing 2: a third party points wrapper tag 41 at a STRAY token account it
-/// created with owner = vault_auth. Tag 29 sweeps it (account 9) and books it.
+/// created with owner = vault_auth. Tag 29 sweeps it (the stray rides with the creator account
+/// in the optional tail, in either order) and S1 forwards it to the creator.
 #[test]
-fn f9_stray_vault_auth_payout_is_swept_and_booked() {
-    let Some(mut w) = world("f9_stray_vault_auth_payout_is_swept_and_booked") else {
+fn f9_stray_vault_auth_payout_is_swept_and_settled() {
+    let Some(mut w) = world("f9_stray_vault_auth_payout_is_swept_and_settled") else {
         return;
     };
     admin_resolve(&mut w);
@@ -1002,11 +1014,9 @@ fn f9_stray_vault_auth_payout_is_swept_and_booked() {
     );
     assert!(r.is_ok(), "{}", logs(&r));
     assert_eq!(token_amount(&w.svm, &stray), 0);
-    assert_eq!(token_amount(&w.svm, &w.vault), STAKE + BUDGET);
-    assert_eq!(
-        read_pool(&w.svm, &w.pool).total_pool_value(),
-        Some(STAKE + BUDGET)
-    );
+    assert_eq!(token_amount(&w.svm, &w.vault), STAKE);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), BUDGET);
+    assert_eq!(read_pool(&w.svm, &w.pool).total_pool_value(), Some(STAKE));
 }
 
 /// Tag 30 is admin-only, and requires a Resolved market.
@@ -1214,4 +1224,142 @@ fn f9_v5_first_loss_terminal_returns_creator_seed_s1() {
     )
     .unwrap();
     assert!(claim <= STAKE && claim + 2 >= STAKE - 1_000, "staker claim {claim} vs deposit {STAKE}");
+}
+
+// ── FEE_ONLY growth-plan reading (2026-10-14): seed recorded at bind, stakers keep growth ─────
+
+fn forge_fee_only_seed(w: &mut World, seed: u64) {
+    let mut acct = w.svm.get_account(&w.pool).unwrap();
+    acct.data[457..464].copy_from_slice(&seed.to_le_bytes()[..7]);
+    w.svm.set_account(w.pool, acct).unwrap();
+    assert_eq!(read_pool(&w.svm, &w.pool).fee_only_creator_seed_atoms(), seed);
+}
+
+fn bind_again(w: &mut World, pool_writable: bool) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let (admin_k, payer_k) = (w.admin.insecure_clone(), w.payer.insecure_clone());
+    let pool_meta = if pool_writable {
+        AccountMeta::new(w.pool, false)
+    } else {
+        AccountMeta::new_readonly(w.pool, false)
+    };
+    send(
+        &mut w.svm,
+        &payer_k,
+        &[&admin_k],
+        Instruction {
+            program_id: w.stake_id,
+            accounts: vec![
+                AccountMeta::new(w.admin.pubkey(), true),
+                pool_meta,
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new(w.market, false),
+                AccountMeta::new_readonly(w.wrapper_id, false),
+            ],
+            data: vec![19u8],
+        },
+    )
+}
+
+/// The real Bind (tag 19) on a FEE_ONLY pool records the creator's seed = the engine insurance
+/// balance read from the REAL wrapper market at byte 941 (pins `MARKET_INSURANCE_OFF` on the
+/// real .so: the raw bytes there are exactly the BUDGET the creator topped up). A FEE_ONLY bind
+/// with a read-only pool account is refused by stake (16) before any CPI; with a writable pool
+/// the repeat bind reaches the wrapper and fails there (already bound), not with 16.
+/// NEGATIVE CONTROL: on 3c715dc (no seed record) the record reads 0 and the read-only bind
+/// reaches the wrapper (not 16).
+#[test]
+fn f9_fee_only_bind_records_creator_seed_from_real_wrapper() {
+    let Some(mut w) = world("f9_fee_only_bind_records_creator_seed_from_real_wrapper") else {
+        return;
+    };
+    let m = w.svm.get_account(&w.market).unwrap();
+    let raw = u128::from_le_bytes(m.data[MARKET_INSURANCE_OFF..MARKET_INSURANCE_OFF + 16].try_into().unwrap());
+    assert_eq!(raw, BUDGET as u128, "PIN: engine insurance at byte 941 on the real wrapper");
+    assert_eq!(read_pool(&w.svm, &w.pool).fee_only_creator_seed_atoms(), BUDGET);
+    let r = bind_again(&mut w, false);
+    assert_eq!(custom(&r), Some(E_INVALID_ACCOUNT), "{}", logs(&r));
+    let r = bind_again(&mut w, true);
+    assert!(r.is_err());
+    assert_ne!(custom(&r), Some(E_INVALID_ACCOUNT), "{}", logs(&r));
+    assert_eq!(read_pool(&w.svm, &w.pool).fee_only_creator_seed_atoms(), BUDGET);
+}
+
+/// Growth above the seed stays with the FEE_ONLY stakers. FORGED: the seed record is lowered to
+/// 3M (as if the creator had seeded 3M and the fund had grown to the 5M BUDGET; the harness has
+/// no real fee path into a FEE_ONLY market's insurance). Two partial tag-29 withdrawals:
+///   2M -> all of it to the creator (seed first), stakers +0;
+///   3M -> 1M to the creator (seed remaining), 2M booked to stakers as fees.
+/// Without the creator account while seed remains: 46.
+/// NEGATIVE CONTROLS: on 1f694e1 (FEE_ONLY -> creator) the creator gets all 5M and stakers 0;
+/// on 3c715dc (held routing) the creator gets 0 and stakers 5M.
+#[test]
+fn f9_fee_only_growth_above_seed_stays_with_stakers_forged_seed() {
+    let Some(mut w) = world("f9_fee_only_growth_above_seed_stays_with_stakers_forged_seed") else {
+        return;
+    };
+    const SEED: u64 = 3_000_000;
+    forge_fee_only_seed(&mut w, SEED);
+    let p0 = read_pool(&w.svm, &w.pool);
+    admin_resolve(&mut w);
+    let r = recover_terminal(
+        &mut w,
+        2_000_000,
+        RecoverOpts {
+            no_creator: true,
+            ..DEFAULT_OPTS
+        },
+    );
+    assert_eq!(custom(&r), Some(E_CREATOR_ACCOUNT_REQUIRED), "{}", logs(&r));
+    let r = recover_terminal(&mut w, 2_000_000, DEFAULT_OPTS);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), 2_000_000, "seed first");
+    assert_eq!(p1.total_fees_earned, p0.total_fees_earned);
+    assert_eq!(p1.fee_only_seed_remaining(), 1_000_000);
+    let r = recover_terminal(&mut w, BUDGET - 2_000_000, DEFAULT_OPTS);
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p2 = read_pool(&w.svm, &w.pool);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED, "creator gets exactly its seed");
+    assert_eq!(p2.total_fees_earned - p0.total_fees_earned, BUDGET - SEED, "growth to stakers");
+    assert_eq!(p2.creator_surplus_forwarded_atoms(), SEED);
+    assert_eq!(p2.fee_only_seed_remaining(), 0);
+    assert_eq!(p2.total_pool_value(), Some(STAKE + BUDGET - SEED));
+    assert_eq!(token_amount(&w.svm, &w.vault), STAKE + BUDGET - SEED, "vault == books");
+    assert_eq!(token_amount(&w.svm, &w.wrapper_vault), 0);
+    // Nothing more is owed: the pre-S1 account shape now works and finds nothing.
+    let r = recover_terminal(
+        &mut w,
+        0,
+        RecoverOpts {
+            no_creator: true,
+            ..DEFAULT_OPTS
+        },
+    );
+    assert_eq!(custom(&r), Some(E_NOTHING_TO_RECOVER), "{}", logs(&r));
+}
+
+/// A FEE_ONLY pool with NO seed recorded (bound before this build; FORGED by zeroing the
+/// record) owes the creator nothing while real stakers exist: tag 29 in the pre-S1 shape books
+/// the whole budget to the stakers, exactly as aebbff6 did. This is the documented fallback.
+#[test]
+fn f9_fee_only_no_seed_record_books_budget_to_stakers_forged() {
+    let Some(mut w) = world("f9_fee_only_no_seed_record_books_budget_to_stakers_forged") else {
+        return;
+    };
+    forge_fee_only_seed(&mut w, 0);
+    let p0 = read_pool(&w.svm, &w.pool);
+    admin_resolve(&mut w);
+    let r = recover_terminal(
+        &mut w,
+        BUDGET,
+        RecoverOpts {
+            no_creator: true,
+            ..DEFAULT_OPTS
+        },
+    );
+    assert!(r.is_ok(), "{}", logs(&r));
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(p1.total_fees_earned - p0.total_fees_earned, BUDGET);
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), 0);
+    assert_eq!(p1.total_pool_value(), Some(STAKE + BUDGET));
 }

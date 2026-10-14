@@ -566,7 +566,9 @@ pub fn terminal_cpi_delta_ok(before: u64, after: u64, requested: u64) -> bool {
 ///
 /// * `creator_takes_all` (`StakePool::terminal_surplus_to_creator`: no staker atom was ever
 ///   deployed, or no real staker exists): the whole surplus;
-/// * otherwise only the S2 pre-stake fee backlog still owed, `min(surplus, backlog_owed)`.
+/// * otherwise only what is still owed, `min(surplus, backlog_owed)`: the S2 pre-stake fee
+///   backlog (FIRST_LOSS) or the seed remaining (FEE_ONLY growth-plan reading;
+///   `StakePool::terminal_creator_owed_atoms`).
 ///
 /// The rest (`surplus - share`) is booked for stakers exactly as before
 /// (`terminal_recovery_split`). Always `share <= surplus`, and `share <= backlog_owed` unless

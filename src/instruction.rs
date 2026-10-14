@@ -201,9 +201,15 @@ pub enum StakeInstruction {
     /// since been resolved (e.g. via `AdminResolveMarket`, tag 24) a repeat or
     /// late call fails with EngineLockActive instead, not Unauthorized.
     ///
+    /// FEE_ONLY pools (growth-plan reading, 2026-10-14): the bind also records the creator's
+    /// insurance seed = the market's engine insurance balance now (`_v5_reserved[1..8]`), which
+    /// caps what the terminal settlement returns to the creator; the pool account must then be
+    /// writable (`InvalidAccount`, 16, if not) and the market must be on the pinned layout
+    /// (`UnsupportedWrapperLayout`, 32).
+    ///
     /// Accounts:
     ///   0. `[signer]` Admin (current insurance_authority; must equal pool.admin)
-    ///   1. `[]` Pool PDA
+    ///   1. `[]` Pool PDA (`[writable]` for a FEE_ONLY pool: the seed record)
     ///   2. `[]` Vault authority PDA (the new authority; signed via CPI)
     ///   3. `[writable]` Slab / market account (wrapper-owned)
     ///   4. `[]` Percolator program
@@ -343,8 +349,9 @@ pub enum StakeInstruction {
     ///    fees (the normal `AccrueFees` path, Resolved only). (c) S1 / S2 (2026-10-14): forward
     ///    the creator's share of the remaining surplus (`math::terminal_creator_share`): ALL of
     ///    it when a FIRST_LOSS pool never deployed a staker atom (`total_flushed == 0`) or no
-    ///    real staker exists; otherwise only the S2 pre-stake fee backlog (always 0 on
-    ///    FEE_ONLY). (d) Book the rest by `StakePool::book_terminal_recovery`: up to
+    ///    real staker exists; otherwise only the S2 pre-stake fee backlog (FIRST_LOSS) or the
+    ///    creator's seed remaining (FEE_ONLY: the insurance recorded at bind minus what was
+    ///    already forwarded, so the stakers keep the growth above the seed). (d) Book the rest by `StakePool::book_terminal_recovery`: up to
     ///    `wrapper_recoverable()` as returned principal, the remainder as fees when real LP
     ///    holders exist. Settling the surplus rather than this call's own delta means a direct
     ///    wrapper tag-41 push into `pool.vault` by a third party is settled the same way.
@@ -380,7 +387,8 @@ pub enum StakeInstruction {
     /// their SPL owner: owner = vault_auth -> the stray to sweep; owner = `pool.admin` -> the
     /// creator's account, REQUIRED (`CreatorAccountRequired`, 46) whenever the settlement owes the
     /// creator something, which on a FEE_ONLY pool is any terminal surplus once no real staker
-    /// exists (with real stakers the surplus is booked to them, as before S1).
+    /// exists, and with real stakers `min(seed remaining, surplus)` (0 if no seed was recorded
+    /// at bind).
     RecoverTerminalInsurance { amount: u64 },
 
     /// 30: AdminCloseSlab — F-9. CPI proxy for the wrapper's CloseSlab (tag 13).

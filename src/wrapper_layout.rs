@@ -56,6 +56,13 @@ pub const GROUP_NEXT_MARKET_ID_OFF: usize = 629;
 /// Header-relative offset of the engine `mode` byte (0 Live, 1 Resolved, 2 Recovery).
 /// v2.1: 626; v2.2: 674.
 pub const GROUP_MODE_OFF: usize = 674;
+/// Header-relative offset of the engine `insurance` balance (u128 LE; the fund wrapper tag 41
+/// withdraws at terminal). v2.2: 349 = market_group_id 32 + `V16ConfigAccount` 297 +
+/// asset_slot_capacity 4 + vault 16. FEE_ONLY growth-plan reading only (2026-10-14): read once,
+/// at BindInsuranceAuthority, to record the creator's seed. `offset_of!` against engine
+/// 3ce4cbd1 (`MarketGroupV16HeaderAccount`: size 806, mode 674, next_market_id 629, i.e. the
+/// pinned layout); real-bytes pin `f9_fee_only_bind_records_creator_seed_from_real_wrapper`.
+pub const GROUP_INSURANCE_OFF: usize = 349;
 
 /// Fixed wrapper-owned region at the start of every asset slot (`Market.wrapper`).
 pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
@@ -89,6 +96,8 @@ pub const ASSET0_AUTHORITY_EPOCH_OFF: usize =
 pub const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = MARKET_GROUP_OFF + GROUP_NEXT_MARKET_ID_OFF;
 /// Engine `mode` byte.
 pub const MARKET_MODE_OFF: usize = MARKET_GROUP_OFF + GROUP_MODE_OFF;
+/// Engine `insurance` balance (u128 LE).
+pub const MARKET_INSURANCE_OFF: usize = MARKET_GROUP_OFF + GROUP_INSURANCE_OFF;
 /// Shortest market account that can hold the engine header (and so the `mode` byte).
 pub const MIN_MARKET_ACCOUNT_LEN: usize = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
 
@@ -103,10 +112,12 @@ const _: () = assert!(ASSET0_BACKING_FEE_SHORT_OFF == 1926);
 const _: () = assert!(ASSET0_TRADE_FEE_OFF == 1934);
 const _: () = assert!(MARKET_ASSET_GENERATION_FRONTIER_OFF == 1221);
 const _: () = assert!(MARKET_MODE_OFF == 1266);
+const _: () = assert!(MARKET_INSURANCE_OFF == 941);
 const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1398);
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);
+const _: () = assert!(GROUP_INSURANCE_OFF + 16 <= MARKET_GROUP_LEN);
 
 /// True iff `data` carries the wrapper magic and EXACTLY the pinned header VERSION. Every raw
 /// slab reader must call this before touching an offset in this module.

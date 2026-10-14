@@ -640,7 +640,7 @@ fn run_bind_insurance_authority(
         program_id: stake_id,
         accounts: vec![
             AccountMeta::new_readonly(admin.pubkey(), true),
-            AccountMeta::new_readonly(s.pool_pda, false),
+            AccountMeta::new(s.pool_pda, false), // writable: a FEE_ONLY bind records the creator seed
             AccountMeta::new_readonly(s.vault_auth, false),
             AccountMeta::new(s.market, false),
             AccountMeta::new_readonly(wrapper_id, false),

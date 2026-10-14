@@ -272,6 +272,8 @@ proptest! {
         lp in 0u64..1u64 << 50,
         released in 0u64..1u64 << 50,
         backlog in 0u64..1u64 << 50,
+        seed in 0u64..1u64 << 50,
+        seed_forwarded in 0u64..1u64 << 50,
     ) {
         use bytemuck::Zeroable;
         let mut p = state::StakePool::zeroed();
@@ -287,11 +289,16 @@ proptest! {
         p.total_fees_earned = fees;
         p.total_lp_supply = lp;
         p.set_s2_backlog_owed_atoms(backlog);
+        // FEE_ONLY growth-plan reading: a seed recorded at bind, part of it maybe already
+        // forwarded (ignored by FIRST_LOSS pools).
+        p.set_fee_only_creator_seed_atoms(seed);
+        p.set_creator_surplus_forwarded_atoms(seed_forwarded);
+        let owed = p.terminal_creator_owed_atoms();
         let v0 = p.total_pool_value().unwrap();
         let all = p.terminal_surplus_to_creator();
         let real = p.has_real_lp_holders();
         let balance = v0 + released;
-        let share = math::terminal_creator_share(released, backlog, all);
+        let share = math::terminal_creator_share(released, owed, all);
         let (r, f) = p.book_terminal_recovery(balance - share).unwrap();
         let v1 = p.total_pool_value().unwrap();
         prop_assert!(share + r + f <= released);
@@ -302,12 +309,21 @@ proptest! {
         } else {
             prop_assert!(real && (p.total_flushed > 0 || !first_loss));
             prop_assert_eq!(v1 + share, balance);
-            prop_assert_eq!(share, released.min(backlog));
+            prop_assert_eq!(share, released.min(owed));
         }
-        // S1 split (2026-10-14): a FEE_ONLY pool's fund goes to the creator only when no real
-        // staker exists; with real stakers the routing is HELD and unchanged from before S1.
-        if !first_loss {
+        // I-S1 (S-L1): booked staker value never falls when the creator is paid.
+        prop_assert!(v1 >= v0);
+        if first_loss {
+            prop_assert_eq!(owed, backlog, "FIRST_LOSS: no FEE_ONLY seed is ever owed");
+        } else {
+            // Growth-plan reading: creator-takes-all iff no real staker; otherwise the creator gets
+            // min(seed remaining, surplus) and the stakers keep the growth above the seed.
             prop_assert_eq!(all, !real, "FEE_ONLY: creator-takes-all iff no real staker");
+            if real {
+                let seed_rem = seed.saturating_sub(seed_forwarded);
+                prop_assert_eq!(share, released.min(seed_rem), "backlog never counts on FEE_ONLY");
+                prop_assert_eq!(v1 - v0, released.saturating_sub(seed_rem), "growth to stakers");
+            }
         }
     }
 }

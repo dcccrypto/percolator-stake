@@ -2202,9 +2202,9 @@ fn process_bind_insurance_authority(
     validate_account_owner(pool_pda, program_id)?;
     validate_account_not_empty(pool_pda)?;
 
-    // Read pool (immutable — we don't mutate stake state here) and copy out the
-    // fields we need so the borrow is released before the CPIs.
-    let (pool_slab, pool_percolator) = {
+    // Read pool and copy out the fields we need so the borrow is released before the CPIs.
+    // The pool is written only for a FEE_ONLY pool (the seed record below).
+    let (pool_slab, pool_percolator, fee_only) = {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool = pool_from_data(&pool_data[..])?;
         if pool.is_initialized != 1 {
@@ -2221,7 +2221,11 @@ fn process_bind_insurance_authority(
         if pool.admin != admin.key.to_bytes() {
             return Err(StakeError::Unauthorized.into());
         }
-        (pool.slab, pool.percolator_program)
+        (
+            pool.slab,
+            pool.percolator_program,
+            pool.risk_mode == state::RISK_MODE_FEE_ONLY,
+        )
     };
 
     // Bind to the pool's recorded market + wrapper program (prevents pointing the
@@ -2232,6 +2236,22 @@ fn process_bind_insurance_authority(
     if pool_percolator != percolator_program.key.to_bytes() {
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
+
+    // FEE_ONLY growth-plan reading (growth plan §2.10 S1 "record creator_seed_atoms at bind"):
+    // the market's engine insurance balance at the moment the pool takes custody of it is the
+    // creator's seed. Read from the pinned layout only (fail closed), BEFORE the CPIs (they do
+    // not move insurance). The pool account must be writable for a FEE_ONLY pool.
+    let fee_only_seed = if fee_only {
+        validate_account_writable(pool_pda)?;
+        if slab.owner != percolator_program.key {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let ins = state::read_wrapper_engine_insurance(&slab.try_borrow_data()?)
+            .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        Some(u64::try_from(ins).unwrap_or(u64::MAX))
+    } else {
+        None
+    };
 
     // Derive + verify the vault_auth PDA (the new authority for both CPIs).
     let (expected_vault_auth, vault_auth_bump) =
@@ -2264,6 +2284,16 @@ fn process_bind_insurance_authority(
         slab,       // market
         vault_auth_seeds,
     )?;
+
+    if let Some(seed) = fee_only_seed {
+        let mut pool_data = pool_pda.try_borrow_mut_data()?;
+        let pool = pool_from_data_mut(&mut pool_data[..])?;
+        pool.set_fee_only_creator_seed_atoms(seed);
+        msg!(
+            "BindInsuranceAuthority: FEE_ONLY creator seed recorded = {} atoms (engine insurance at bind)",
+            pool.fee_only_creator_seed_atoms()
+        );
+    }
 
     msg!("BindInsuranceAuthority: insurance_authority + insurance_operator bound to vault_auth PDA — local_authorized drain path blocked. Call BurnAssetAdmin (tag 21) to irrevocably seal.");
     Ok(())
@@ -3825,8 +3855,12 @@ fn settle_creator_surplus<'a>(
 ) -> Result<u64, ProgramError> {
     let surplus = balance.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
     let backlog = pool.s2_backlog_owed_atoms();
+    // FEE_ONLY growth-plan reading (2026-10-14): a FEE_ONLY creator is owed its seed remaining
+    // (`fee_only_seed_remaining`) instead of an S2 backlog, so it gets `min(seed remaining,
+    // surplus)` and the stakers the growth above it. FIRST_LOSS: the S2 backlog, unchanged.
+    let owed = pool.terminal_creator_owed_atoms();
     let share =
-        crate::math::terminal_creator_share(surplus, backlog, pool.terminal_surplus_to_creator());
+        crate::math::terminal_creator_share(surplus, owed, pool.terminal_surplus_to_creator());
     if share == 0 {
         return Ok(0);
     }
@@ -4163,7 +4197,8 @@ fn process_recover_terminal_insurance(
     // when a FIRST_LOSS pool never deployed a staker atom or no real staker exists (it would
     // otherwise be booked to stakers as a windfall of the creator's seed, or stranded on the
     // dead shares), else only the S2 pre-stake fee backlog. Forwarded BEFORE the rest is booked.
-    // A FEE_ONLY pool with real stakers books its surplus to them, as before S1.
+    // A FEE_ONLY pool with real stakers forwards only `min(seed remaining, surplus)` to the
+    // creator (growth-plan reading); the growth above the seed is booked to the stakers.
     let surplus_forwarded = settle_creator_surplus(
         pool,
         vault,
@@ -4367,7 +4402,7 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     let surplus = balance.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
     let reserved = crate::math::terminal_creator_share(
         surplus,
-        pool.s2_backlog_owed_atoms(),
+        pool.terminal_creator_owed_atoms(),
         pool.terminal_surplus_to_creator(),
     );
     let (to_returned, to_fees) = pool.book_terminal_recovery(balance - reserved)?;
@@ -6144,7 +6179,7 @@ mod tests {
 
     /// S1 predicate: the whole terminal surplus is the creator's iff the pool is v5 and either
     /// (FIRST_LOSS) never deployed a staker atom or has no real staker. A FEE_ONLY pool with
-    /// real stakers is NOT creator-takes-all here (held decision; unchanged from aebbff6).
+    /// real stakers is NOT creator-takes-all (growth-plan reading: seed remaining only).
     /// NEGATIVE CONTROL: the predicate is new.
     #[test]
     fn s1_terminal_surplus_to_creator_predicate() {
@@ -6168,6 +6203,73 @@ mod tests {
                 "mode {mode} flushed {flushed} lp {lp}"
             );
         }
+    }
+
+    /// FEE_ONLY growth-plan reading: the seed record (457..464, u56) round-trips, saturates at
+    /// 2^56 - 1, and "seed remaining" = record - creator surplus already forwarded, FEE_ONLY only.
+    /// The terminal share for a FEE_ONLY pool with real stakers is `min(seed remaining, surplus)`.
+    /// NEGATIVE CONTROL: on the split head without this commit (3c715dc) the record and
+    /// `terminal_creator_owed_atoms` do not exist and a FEE_ONLY share with stakers is 0.
+    #[test]
+    fn fee_only_seed_remaining_caps_the_creator_share() {
+        let mut p = v5_pool(state::RISK_MODE_FEE_ONLY);
+        p.total_lp_supply = state::MINIMUM_LIQUIDITY + 10; // real stakers
+        assert_eq!(p.fee_only_creator_seed_atoms(), 0);
+        assert_eq!(p.terminal_creator_owed_atoms(), 0, "no record: creator owed nothing");
+        p.set_fee_only_creator_seed_atoms(5_000_000);
+        assert_eq!(p.fee_only_creator_seed_atoms(), 5_000_000);
+        assert!(!p.terminal_surplus_to_creator());
+        let owed = p.terminal_creator_owed_atoms();
+        assert_eq!(owed, 5_000_000);
+        // Mode-exclusive: stray S2 backlog bytes never add to a FEE_ONLY creator's claim.
+        p.set_s2_backlog_owed_atoms(999);
+        assert_eq!(p.terminal_creator_owed_atoms(), 5_000_000);
+        p.set_s2_backlog_owed_atoms(0);
+        // Fund grew 5M -> 7M: creator 5M, stakers keep 2M of growth.
+        assert_eq!(crate::math::terminal_creator_share(7_000_000, owed, false), 5_000_000);
+        // Fund shrank to 3M: everything left is the creator's seed.
+        assert_eq!(crate::math::terminal_creator_share(3_000_000, owed, false), 3_000_000);
+        // After 3M forwarded, 2M of seed remains.
+        p.set_creator_surplus_forwarded_atoms(3_000_000);
+        assert_eq!(p.fee_only_seed_remaining(), 2_000_000);
+        p.set_creator_surplus_forwarded_atoms(9_000_000);
+        assert_eq!(p.fee_only_seed_remaining(), 0, "never negative");
+        // Saturation and isolation from the S-6 flag (456) and the 464..480 counters.
+        p.set_creator_surplus_forwarded_atoms(0);
+        p._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL] = 1;
+        p.set_fee_only_creator_seed_atoms(u64::MAX);
+        assert_eq!(p.fee_only_creator_seed_atoms(), state::FEE_ONLY_SEED_MAX);
+        assert_eq!(p._v5_reserved[state::V5_RESERVED_IDX_PENDING_BY_PROTOCOL], 1);
+        assert_eq!(p.creator_surplus_forwarded_atoms(), 0);
+        assert_eq!(p.s2_backlog_owed_atoms(), 0);
+        let bytes = bytemuck::bytes_of(&p);
+        assert_eq!(&bytes[457..464], &[0xff; 7]);
+        // FIRST_LOSS never has a FEE_ONLY seed remaining, whatever the bytes say.
+        let mut f = v5_pool(state::RISK_MODE_FIRST_LOSS);
+        f.set_fee_only_creator_seed_atoms(1_000);
+        f.set_s2_backlog_owed_atoms(7);
+        assert_eq!(f.fee_only_seed_remaining(), 0);
+        assert_eq!(f.terminal_creator_owed_atoms(), 7);
+    }
+
+    /// FEE_ONLY seed reader: pinned layout only, engine insurance at byte 941.
+    #[test]
+    fn fee_only_seed_reader_pinned_layout_only() {
+        let mut d = vec![0u8; state::WRAPPER_MIN_MARKET_LEN];
+        d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
+        d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
+        d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
+        d[941..957].copy_from_slice(&123_456u128.to_le_bytes());
+        assert_eq!(state::read_wrapper_engine_insurance(&d), Some(123_456));
+        let mut short = d.clone();
+        short.truncate(state::WRAPPER_MIN_MARKET_LEN - 1);
+        assert_eq!(state::read_wrapper_engine_insurance(&short), None);
+        let mut v18 = d.clone();
+        v18[8..10].copy_from_slice(&18u16.to_le_bytes());
+        assert_eq!(state::read_wrapper_engine_insurance(&v18), None);
+        let mut closed = d.clone();
+        closed[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_CLOSED_MARKET;
+        assert_eq!(state::read_wrapper_engine_insurance(&closed), None);
     }
 
     /// The v5 tail bytes this change claims (464..480) do not alias any other field, and the

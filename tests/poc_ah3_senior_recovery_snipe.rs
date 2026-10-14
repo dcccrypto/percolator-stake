@@ -406,7 +406,7 @@ fn bind_ix(c: &Ctx, admin: &Pubkey) -> Instruction {
         program_id: c.stake_id,
         accounts: vec![
             AccountMeta::new(*admin, true),
-            AccountMeta::new_readonly(c.pool_pda, false),
+            AccountMeta::new(c.pool_pda, false), // writable: a FEE_ONLY bind records the creator seed
             AccountMeta::new_readonly(c.vault_auth, false),
             AccountMeta::new(c.market, false),
             AccountMeta::new_readonly(c.wrapper_id, false),

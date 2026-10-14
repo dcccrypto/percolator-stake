@@ -349,6 +349,17 @@ pub const DEPLOY_TARGET_TIMELOCK_MIN_SLOTS: u64 = 216_000;
 /// S-6: `_v5_reserved[0]` (byte 456) = 1 while the pending target was proposed by the protocol
 /// authority (an admin proposal may not overwrite it).
 pub const V5_RESERVED_IDX_PENDING_BY_PROTOCOL: usize = 0;
+/// FEE_ONLY growth-plan reading (2026-10-14, branch `feat/v22-growth-stake-split-feeonly-plan`):
+/// `_v5_reserved[1..8]` (bytes 457..464, LE u56) = the creator's insurance seed of a FEE_ONLY pool:
+/// the market's engine insurance balance when the pool took custody of it
+/// (`BindInsuranceAuthority`, tag 19; a re-bind after a rotate-back overwrites it, since the creator
+/// could withdraw or add in between). 0 = no seed recorded (a pool bound before this build, or
+/// a market with no insurance at bind): the creator is then owed nothing from a FEE_ONLY fund
+/// while real stakers exist. Only 7 bytes are free here, so the record saturates at
+/// [`FEE_ONLY_SEED_MAX`] (2^56 - 1 atoms; a larger seed under-records, in the stakers' favour).
+pub const V5_RESERVED_FEE_ONLY_SEED: core::ops::Range<usize> = 1..8;
+/// Largest value the 7-byte FEE_ONLY seed record holds.
+pub const FEE_ONLY_SEED_MAX: u64 = (1u64 << 56) - 1;
 /// S1 (2026-10-14): `_v5_reserved[8..16]` (bytes 464..472, LE u64) = cumulative atoms of
 /// terminal vault SURPLUS forwarded to the creator (`pool.admin`) because no staker can own them
 /// (`StakePool::terminal_surplus_to_creator`) or because they are the S2 pre-stake backlog. Kept
@@ -1094,6 +1105,48 @@ impl StakePool {
         self.set_v5_u64(V5_RESERVED_S2_BACKLOG_OWED, v);
     }
 
+    /// FEE_ONLY seed record (bytes 457..464, u56 LE). See [`V5_RESERVED_FEE_ONLY_SEED`].
+    pub fn fee_only_creator_seed_atoms(&self) -> u64 {
+        let mut b = [0u8; 8];
+        b[..7].copy_from_slice(&self._v5_reserved[V5_RESERVED_FEE_ONLY_SEED]);
+        u64::from_le_bytes(b)
+    }
+
+    /// Records `v` atoms, saturating at [`FEE_ONLY_SEED_MAX`].
+    pub fn set_fee_only_creator_seed_atoms(&mut self, v: u64) {
+        let b = v.min(FEE_ONLY_SEED_MAX).to_le_bytes();
+        self._v5_reserved[V5_RESERVED_FEE_ONLY_SEED].copy_from_slice(&b[..7]);
+    }
+
+    /// Growth-plan §2.10 S1 "seed remaining" for a FEE_ONLY pool: the seed recorded at bind
+    /// minus what the terminal settlement has already forwarded to the creator
+    /// (`creator_surplus_forwarded_atoms`). 0 for every other risk mode (FIRST_LOSS seeds are
+    /// creator UNITS in the wrapper ledger, forwarded through `creator_paid_to_stake_atoms`).
+    /// Losses the fund took are NOT subtracted here: `min(seed remaining, surplus)` at settlement
+    /// means a fund that shrank below the seed goes wholly to the creator (the seed absorbs
+    /// losses only after the growth is gone), and the stakers keep only growth above the seed.
+    pub fn fee_only_seed_remaining(&self) -> u64 {
+        if self.risk_mode != RISK_MODE_FEE_ONLY {
+            return 0;
+        }
+        self.fee_only_creator_seed_atoms()
+            .saturating_sub(self.creator_surplus_forwarded_atoms())
+    }
+
+    /// What the terminal settlement may forward to the creator out of the surplus when the
+    /// creator does NOT take it all. Mode-exclusive, so neither term can leak into the other
+    /// mode even if its bytes were ever non-zero: FEE_ONLY -> the seed remaining only (the S2
+    /// backlog is FIRST_LOSS-only); every other mode -> the S2 backlog only. A cap: the share is
+    /// `min(surplus, this)`. Kani: `kani_s1_terminal_settlement_conserves` (share <= seed
+    /// remaining on FEE_ONLY).
+    pub fn terminal_creator_owed_atoms(&self) -> u64 {
+        if self.risk_mode == RISK_MODE_FEE_ONLY {
+            self.fee_only_seed_remaining()
+        } else {
+            self.s2_backlog_owed_atoms()
+        }
+    }
+
     /// S1 (growth plan §2.10; item 6 "creator seed return as creator units"): at terminal, does
     /// the WHOLE vault surplus (vault balance above the booked pool value, after the wrapper fee
     /// accrual) belong to the creator rather than to the stakers?
@@ -1108,9 +1161,9 @@ impl StakePool {
     ///   join (deposits are refused once the wrapper is terminal), so a surplus booked into pool
     ///   value would be owned by the dead shares only, i.e. stranded for ever (the 7.6k problem).
     ///
-    /// NOT decided here (HELD for Khubair, 2026-10-14): who gets a FEE_ONLY pool's terminal fund
-    /// while real stakers exist. This predicate leaves that case exactly as before S1 (the
-    /// surplus is booked to the stakers by `book_terminal_recovery`).
+    /// A FEE_ONLY pool WITH real stakers is not creator-takes-all (growth-plan reading,
+    /// 2026-10-14): the creator gets `min(fee_only_seed_remaining, surplus)` through
+    /// `terminal_creator_owed_atoms`, and the stakers keep the growth above the seed.
     ///
     /// v5 risk modes only (a legacy pool cannot be created by this program).
     pub fn terminal_surplus_to_creator(&self) -> bool {
@@ -1444,6 +1497,21 @@ pub fn read_wrapper_terminal(data: &[u8]) -> WrapperTerminal {
         }
         _ => WrapperTerminal::UnknownLayout,
     }
+}
+
+/// FEE_ONLY growth-plan reading: the engine `insurance` balance of a pinned-layout wrapper
+/// MARKET account (magic, VERSION 19, kind 1, length >= the engine header). `None` for anything
+/// else (closed tombstone, unpinned layout, short account): the caller refuses. The caller must
+/// already have checked the key (== `pool.slab`) and owner (== `pool.percolator_program`).
+pub fn read_wrapper_engine_insurance(data: &[u8]) -> Option<u128> {
+    if !crate::wrapper_layout::header_is_pinned(data)
+        || data.get(WRAPPER_OFF_KIND) != Some(&WRAPPER_KIND_MARKET)
+        || data.len() < WRAPPER_MIN_MARKET_LEN
+    {
+        return None;
+    }
+    let off = crate::wrapper_layout::MARKET_INSURANCE_OFF;
+    Some(u128::from_le_bytes(data.get(off..off + 16)?.try_into().ok()?))
 }
 
 pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
