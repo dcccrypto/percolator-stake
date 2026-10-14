@@ -1204,6 +1204,9 @@ mod kani_proofs {
         let v1 = p.total_pool_value().expect("representable");
         assert!(share + r + f <= released, "nothing created");
         assert!(v1 + share <= balance);
+        // I-S1 (restated, security review S-L1): the creator's terminal share comes only from
+        // UNBOOKED surplus — booked staker value never falls when the creator is paid.
+        assert!(v1 >= v0, "I-S1: creator share never reduces booked staker value");
         if all {
             assert_eq!(v1, v0, "creator takes all: nothing booked to stakers");
             assert_eq!(share, released);
