@@ -181,7 +181,8 @@ proptest! {
         returned_frac in 0u64..=1_000,
         recovered_frac in 0u64..=1_000,
         fees in 0u64..1u64 << 60,
-        lp in 0u64..1u64 << 62,
+        // Half the cases around the dead-share floor (zero real stakers / one real share).
+        lp in prop_oneof![0u64..=2 * state::MINIMUM_LIQUIDITY, 0u64..1u64 << 62],
         released in 0u64..1u64 << 62,
         seed in any::<u64>(),
         recorded in any::<bool>(),
