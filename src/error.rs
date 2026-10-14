@@ -147,6 +147,9 @@ pub enum StakeError {
     /// S-1 (security review 2026-10-05): the wrapper minted (top-up) or burned (recovery) a
     /// different number of stake units than `floor(a*U/I_mint)` / `ceil(r*U/I_free)`, or zero.
     InsuranceUnitsMismatch = 45,
+    /// S1 (2026-10-14): the terminal settlement owes the creator (`pool.admin`) part of the vault
+    /// surplus and no token account of `pool.admin` for the pool's collateral was passed.
+    CreatorAccountRequired = 46,
 }
 
 impl From<StakeError> for ProgramError {
@@ -205,6 +208,7 @@ pub fn error_hint(code: u32) -> &'static str {
         43 => "Nothing to sync — the deployed value is within the hysteresis band of the target, or there is no spare liquidity",
         44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid",
         45 => "Insurance units mismatch — the wrapper did not mint or burn the expected stake units; the sync was reverted",
+        46 => "Creator account required — the terminal insurance surplus belongs to the pool creator (pool.admin); pass pool.admin's token account for the pool collateral (S1)",
         _ => "Unknown error — check the error code and pool state",
     }
 }
