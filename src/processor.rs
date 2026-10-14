@@ -1810,7 +1810,12 @@ fn process_withdraw(
 // the insurance it created had no owner. v5 replaces it with the permissionless,
 // rate-limited `SyncInsuranceDeployment` (tag 31), which deploys toward a target share of
 // pool value through the wrapper's insurance-unit ledger. Tag 3 returns `DeprecatedV5`
-// (dispatch below). I-S1: no admin-signed path moves pool funds anywhere but to stakers.
+// (dispatch below). I-S1 (restated after S1, security review S-L1 2026-10-14): no
+// admin-signed path moves BOOKED pool value anywhere but to stakers. The one path that pays
+// `pool.admin` is RecoverTerminalInsurance's S1 forward, and it is capped at the vault balance
+// minus booked pool value (`math::terminal_creator_share`): only unbooked terminal surplus
+// (the creator's seed, or everything when stakers never took insurance risk) can go there.
+// Proof property: `kani_s1_terminal_settlement_conserves` asserts `v1 >= v0`.
 
 // ═══════════════════════════════════════════════════════════════
 // 4: UpdateConfig
