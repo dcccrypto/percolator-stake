@@ -43,7 +43,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 // v5: the stake program is loaded at the id the wrapper's devnet build PINS (A6DVNubv, the v2.1 fresh id), so the
 // wrapper recognises the pool's vault_auth as the STAKE unit class (Phase 4 item 6). Every other
 // F-9 assertion is id-independent.
-const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
+const STAKE_ID: &str = "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v2.2 (wrapper VERSION 19) market account length for capacity 1: 592 + 806 + 2437.

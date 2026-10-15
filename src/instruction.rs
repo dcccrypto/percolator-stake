@@ -399,6 +399,9 @@ pub enum StakeInstruction {
     ///   7. `[writable]` Collateral mint (read by CloseSlab only when it burns residue)
     ///   8. `[writable]` Pool vault token account (the sweep destination)
     ///   9. `[]` Percolator program (must equal pool.percolator_program)
+    ///  10. `[]` v5 FIRST_LOSS pools ONLY (GH#311): the wrapper's InsuranceUnitsV20 PDA. Required
+    ///      for a first-loss pool, so the creator's seed (paid into the vault by a terminal
+    ///      tag 41) is not booked to stakers; omitted/ignored for legacy pools.
     AdminCloseSlab,
 
     /// 4: Admin updates pool configuration.

@@ -1564,6 +1564,13 @@ fn process_withdraw(
             v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
             v5_system_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
         )?;
+        // GH#311: a permissionless DIRECT wrapper tag 41 can pay the stake-class value into
+        // pool.vault without this program booking it. Book it before pricing, exactly as tag 29
+        // does, but ONLY the stake class: the creator's seed that the same payment carried
+        // (`creator_paid_to_stake - forwarded`) is the creator's and stays out of the booking
+        // (tag 29 forwards it to pool.admin later). Gated on the bound market being terminal,
+        // so a Live-mode donation is still never booked (#290).
+        book_terminal_stake_class_before_pricing(pool, vault, fee_slab, &units)?;
         let deployed =
             crate::math::deployed_value(units.units_stake, units.units_total, units.snap_free)
                 .ok_or(StakeError::Overflow)?;
@@ -2670,6 +2677,44 @@ fn token_balance(ai: &AccountInfo) -> Result<u64, ProgramError> {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(acct.amount)
+}
+
+/// GH#311: first-loss Withdraw, terminal market. Book the stake-class part of the pool vault's
+/// surplus before pricing, so a withdrawer is not underpaid between a direct wrapper tag 41 and
+/// the next tag 29 / tag 30. `units` is the freshly refreshed wrapper ledger (`v5_read_units`).
+///
+/// A no-op unless the bound market is Resolved or Closed: before that the surplus can be a
+/// donation (#290) and must not be booked. `fee_slab` was already verified by `v5_read_units`
+/// to be this pool's market (key and owner).
+fn book_terminal_stake_class_before_pricing(
+    pool: &mut state::StakePool,
+    vault: &AccountInfo,
+    fee_slab: Option<&AccountInfo>,
+    units: &state::WrapperInsUnits,
+) -> ProgramResult {
+    let slab = match fee_slab {
+        Some(ai) => ai,
+        None => return Ok(()),
+    };
+    if slab.key.to_bytes() != pool.slab || slab.owner.to_bytes() != pool.percolator_program {
+        return Ok(());
+    }
+    let terminal = state::read_wrapper_terminal(&slab.try_borrow_data()?);
+    if terminal != state::WrapperTerminal::Resolved && terminal != state::WrapperTerminal::Closed {
+        return Ok(());
+    }
+    let balance = token_balance(vault)?;
+    let (to_returned, to_fees) =
+        pool.book_terminal_recovery_stake_class(balance, units.creator_paid_to_stake)?;
+    if to_returned > 0 || to_fees > 0 {
+        msg!(
+            "Withdraw: booked terminal stake-class surplus before pricing: returned {} + fees {} (creator-owed {} excluded)",
+            to_returned,
+            to_fees,
+            pool.creator_owed_atoms(units.creator_paid_to_stake)
+        );
+    }
+    Ok(())
 }
 
 /// #136 pre-accrue guard — shared by EVERY path that prices against pool balances
@@ -3957,9 +4002,13 @@ fn process_recover_terminal_insurance(
     // `creator_paid_to_stake - forwarded` to the creator (pool.admin's token account) BEFORE
     // the surplus is booked.
     let mut forwarded: u64 = 0;
+    // GH#311: the creator-class value recorded by the wrapper's terminal burn (0 on a legacy
+    // pool). Whatever part of it is still unforwarded below stays OUT of the booking.
+    let mut creator_paid_to_stake: u128 = 0;
     if let (Some(units), Some(creator)) = (v5_units, v5_creator) {
         let u = state::read_wrapper_ins_units(&units.try_borrow_data()?, &pool.slab)
             .ok_or(StakeError::InsuranceUnitsInvalid)?;
+        creator_paid_to_stake = u.creator_paid_to_stake;
         let paid = u64::try_from(u.creator_paid_to_stake).map_err(|_| StakeError::Overflow)?;
         let owed = paid.saturating_sub(pool.creator_forwarded_atoms);
         if owed > 0 {
@@ -4016,7 +4065,8 @@ fn process_recover_terminal_insurance(
         .total_fees_earned
         .checked_sub(fees_before)
         .ok_or(StakeError::Overflow)?;
-    let (to_returned, to_fees) = pool.book_terminal_recovery(balance)?;
+    let (to_returned, to_fees) =
+        pool.book_terminal_recovery_stake_class(balance, creator_paid_to_stake)?;
 
     // (5) The market is over for this pool: no more deposits or flushes.
     pool.set_market_resolved(true);
@@ -4064,6 +4114,7 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     let mint = next_account_info(accounts_iter)?; // 7: [writable] collateral mint
     let vault = next_account_info(accounts_iter)?; // 8: [writable] pool vault
     let percolator_program = next_account_info(accounts_iter)?; // 9: wrapper program
+    let v5_units_ai = accounts_iter.next(); // 10: GH#311 units ledger (required if first-loss)
 
     verify_token_program(token_program)?;
     let pool_bump =
@@ -4180,9 +4231,27 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     };
     let mut pool_data = pool_pda.try_borrow_mut_data()?;
     let pool = pool_from_data_mut(&mut pool_data[..])?;
+    // GH#311: on a v5 FIRST_LOSS pool the surplus holds the CREATOR's seed whenever a terminal
+    // tag 41 (this program's tag 29, or a permissionless direct call) paid creator-class value
+    // into the vault. That part is the creator's (tag 29 forwards it to pool.admin), so it is
+    // excluded from what is booked to stakers. The ledger lives in a wrapper-owned PDA that the
+    // CloseSlab above does not touch; read it now.
+    let creator_paid_to_stake: u128 = if pool.is_first_loss() {
+        let units = v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let (expected, _) = state::derive_wrapper_ins_units(percolator_program.key, market.key);
+        if *units.key != expected || units.owner != percolator_program.key {
+            return Err(StakeError::InsuranceUnitsInvalid.into());
+        }
+        state::read_wrapper_ins_units(&units.try_borrow_data()?, &pool.slab)
+            .ok_or(StakeError::InsuranceUnitsInvalid)?
+            .creator_paid_to_stake
+    } else {
+        0
+    };
     // The market is Resolved (checked above) or now Closed: both terminal, so a
     // surplus in pool.vault may be booked (see `book_terminal_recovery`).
-    let (to_returned, to_fees) = pool.book_terminal_recovery(balance)?;
+    let (to_returned, to_fees) =
+        pool.book_terminal_recovery_stake_class(balance, creator_paid_to_stake)?;
     pool.set_market_resolved(true);
     msg!(
         "AdminCloseSlab: closed={} swept {} into pool vault; booked returned {} + fees {}; refunded {} lamports to admin",

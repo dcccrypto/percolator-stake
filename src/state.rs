@@ -985,6 +985,41 @@ impl StakePool {
         Ok((to_returned, to_fees))
     }
 
+    /// GH#311: creator-class value the wrapper paid into `pool.vault` at a terminal tag 41
+    /// that stake has NOT yet forwarded to the creator: `creator_paid_to_stake - forwarded`.
+    ///
+    /// The wrapper's `ins_units_terminal_burn` records, in `creator_paid_to_stake`, the part of
+    /// a stake-authority tag 41 that exceeded the STAKE class's own value (the creator's
+    /// seed, paid into the stake vault). Tag 29 forwards it to `pool.admin` and advances
+    /// `creator_forwarded_atoms`. Until then it sits in `pool.vault` and belongs to the creator.
+    pub fn creator_owed_atoms(&self, creator_paid_to_stake: u128) -> u64 {
+        let paid = u64::try_from(creator_paid_to_stake).unwrap_or(u64::MAX);
+        paid.saturating_sub(self.creator_forwarded_atoms)
+    }
+
+    /// GH#311: [`StakePool::book_terminal_recovery`] for a first-loss (unit-class) pool,
+    /// booking ONLY the stake-class part of the vault surplus.
+    ///
+    /// `book_terminal_recovery` sees "vault surplus" and cannot tell the stake class from the
+    /// creator class. After a terminal tag 41 (tag 29's CPI, or a permissionless DIRECT call)
+    /// the surplus holds both, and the creator's share (`creator_owed_atoms`) must reach the
+    /// creator, never the stakers. So it is excluded from the balance that is offered for
+    /// booking: `book_terminal_recovery(vault_balance - creator_owed)`. Everything else is
+    /// unchanged, so with `creator_paid_to_stake == 0` (or already forwarded) this IS
+    /// `book_terminal_recovery(vault_balance)`.
+    ///
+    /// Idempotent and order-independent: the owed amount stays excluded until tag 29 forwards
+    /// it (which advances `creator_forwarded_atoms`), so booking before or after the forward
+    /// books the same stake-class value and never books the creator's seed.
+    pub fn book_terminal_recovery_stake_class(
+        &mut self,
+        vault_balance: u64,
+        creator_paid_to_stake: u128,
+    ) -> Result<(u64, u64), crate::error::StakeError> {
+        let owed = self.creator_owed_atoms(creator_paid_to_stake);
+        self.book_terminal_recovery(vault_balance.saturating_sub(owed))
+    }
+
     /// Tranche pools: the largest amount by which a permissionless
     /// `RecoverFlushedInsurance` (tag 23) could raise [`StakePool::senior_balance`]
     /// from the current state. Zero means `senior_balance()` is invariant under every
@@ -1621,6 +1656,81 @@ mod tests {
         let mut p = f9_pool(10_000_000, 0, 10_001_000);
         assert_eq!(p.book_terminal_recovery(9_000_000).unwrap(), (0, 0));
         assert_eq!(p.total_pool_value(), Some(10_000_000));
+    }
+
+    // GH#311: the PoC shape. 12M staked, 6M flushed (stake class), 6M liquid; a DIRECT terminal
+    // tag 41 of 11M (6M stake value + 5M creator seed) lands in the vault: balance 17M.
+    fn gh311_pool() -> StakePool {
+        f9_pool(12_000_000, 6_000_000, 12_001_000)
+    }
+
+    #[test]
+    fn test_gh311_stake_class_booking_excludes_the_creator_seed() {
+        let mut p = gh311_pool();
+        assert_eq!(p.total_pool_value(), Some(6_000_000));
+        // vault: 6M liquid + 11M paid in.
+        let (r, f) = p
+            .book_terminal_recovery_stake_class(17_000_000, 5_000_000)
+            .unwrap();
+        assert_eq!((r, f), (6_000_000, 0), "only the stake class is booked");
+        assert_eq!(
+            p.total_pool_value(),
+            Some(12_000_000),
+            "== the stakers' own 12M"
+        );
+        // The naive booking is what over-paid: it would have absorbed the seed too.
+        let mut naive = gh311_pool();
+        naive.book_terminal_recovery(17_000_000).unwrap();
+        assert_eq!(naive.total_pool_value(), Some(17_000_000));
+    }
+
+    #[test]
+    fn test_gh311_without_creator_value_it_is_book_terminal_recovery() {
+        let mut a = gh311_pool();
+        let mut b = gh311_pool();
+        assert_eq!(
+            a.book_terminal_recovery_stake_class(12_000_000, 0).unwrap(),
+            b.book_terminal_recovery(12_000_000).unwrap()
+        );
+        assert_eq!(a.total_pool_value(), b.total_pool_value());
+    }
+
+    #[test]
+    fn test_gh311_forwarded_seed_is_no_longer_excluded_and_nothing_double_books() {
+        let mut p = gh311_pool();
+        p.book_terminal_recovery_stake_class(17_000_000, 5_000_000)
+            .unwrap();
+        // Tag 29 forwards the seed: vault 12M, creator_forwarded 5M.
+        p.creator_forwarded_atoms = 5_000_000;
+        assert_eq!(p.creator_owed_atoms(5_000_000), 0);
+        assert_eq!(
+            p.book_terminal_recovery_stake_class(12_000_000, 5_000_000)
+                .unwrap(),
+            (0, 0),
+            "no double booking"
+        );
+        assert_eq!(p.total_pool_value(), Some(12_000_000));
+        // Re-running before the forward is equally a no-op.
+        let mut q = gh311_pool();
+        q.book_terminal_recovery_stake_class(17_000_000, 5_000_000)
+            .unwrap();
+        assert_eq!(
+            q.book_terminal_recovery_stake_class(17_000_000, 5_000_000)
+                .unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn test_gh311_owed_larger_than_balance_saturates() {
+        let mut p = gh311_pool();
+        assert_eq!(
+            p.book_terminal_recovery_stake_class(1_000, u128::MAX)
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(p.creator_owed_atoms(u128::MAX), u64::MAX);
+        assert_eq!(p.total_pool_value(), Some(6_000_000));
     }
 
     #[test]
