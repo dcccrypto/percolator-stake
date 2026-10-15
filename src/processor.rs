@@ -1532,7 +1532,13 @@ fn process_withdraw(
     // the withdrawer realizes their fair share of earned fees (and the HWM floor sees true
     // TVL) rather than redeeming at the stale pre-accrual price. Reads the vault balance
     // before the vault->user transfer below; pool.vault verified above.
-    pre_accrue_fee_modes(pool, vault, fee_slab, false)?;
+    // GH#309: once the bound market is a CloseSlab tombstone there is no live market to
+    // read wrapper fee payouts from, and no further fees can ever accrue. Take the same
+    // "no slab" path a pool that passes none already takes, instead of failing the
+    // withdrawal outright and trapping the staker's funds in the vault.
+    let post_close = slab_is_closed_tombstone(pool, fee_slab)?;
+    let accrual_slab = if post_close { None } else { fee_slab };
+    pre_accrue_fee_modes(pool, vault, accrual_slab, false)?;
 
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
@@ -1556,17 +1562,28 @@ fn process_withdraw(
         // v5: pool value = liquid + deployed units at the wrapper's EXIT (free) reading (the
         // lower one), so a leaver never takes more than its share; the payout must fit the
         // LIQUID value (the deployed part returns through a sync recovery on a healthy market).
-        let units = v5_read_units(
-            pool,
-            user,
-            fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?,
-            v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
-            v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
-            v5_system_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
-        )?;
-        let deployed =
+        //
+        // GH#309: after CloseSlab there is no live market to read units from -- and nothing
+        // left to read. The wrapper only closes a TERMINAL market, and stake tag 29
+        // (RecoverTerminalInsurance) books the recovered insurance into `total_returned`,
+        // so it is already counted by `total_pool_value()` below. Price against the liquid
+        // value alone. This is the conservative direction: `pv = liquid + deployed >=
+        // liquid`, so a zero `deployed` can only pay LESS than the live path, never more,
+        // and `liquid_withdrawal_ok` still caps the payout at the vault's real balance.
+        let deployed = if post_close {
+            0
+        } else {
+            let units = v5_read_units(
+                pool,
+                user,
+                fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                v5_system_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
             crate::math::deployed_value(units.units_stake, units.units_total, units.snap_free)
-                .ok_or(StakeError::Overflow)?;
+                .ok_or(StakeError::Overflow)?
+        };
         let liquid = pool.total_pool_value().ok_or(StakeError::Overflow)?;
         let pv = crate::math::pool_value_v5(liquid, deployed).ok_or(StakeError::Overflow)?;
         let w = crate::math::calc_collateral_for_withdraw(pool.total_lp_supply, pv, lp_amount)
@@ -3005,6 +3022,25 @@ fn wrapper_fee_payouts(
         msg!("#290: slab is not a live wrapper market account");
         StakeError::InvalidAccount.into()
     })
+}
+
+/// GH#309: true iff `slab` is this pool's bound wrapper market AND that market is a
+/// CloseSlab tombstone. `state::read_wrapper_terminal` fails closed, so anything that is
+/// not the exact pinned tombstone (wrong magic / VERSION / kind / length) returns `false`
+/// and takes the unchanged live-market path.
+fn slab_is_closed_tombstone(
+    pool: &state::StakePool,
+    slab: Option<&AccountInfo>,
+) -> Result<bool, ProgramError> {
+    let slab_ai = match slab {
+        Some(ai) => ai,
+        None => return Ok(false),
+    };
+    if slab_ai.key.to_bytes() != pool.slab || slab_ai.owner.to_bytes() != pool.percolator_program {
+        return Ok(false);
+    }
+    let data = slab_ai.try_borrow_data()?;
+    Ok(state::read_wrapper_terminal(&data) == state::WrapperTerminal::Closed)
 }
 
 /// Accrue trading fees from the percolator engine to the LP vault.
