@@ -1898,3 +1898,350 @@ fn f9_v5_first_loss_withdraw_succeeds_after_close_slab() {
         "the payout came out of pool.vault"
     );
 }
+
+// ── GH#309 port onto the close-out split (0f88ff1): exact pro-rata after CloseSlab ─────────
+
+/// Stake tag 29 in the v5 FIRST_LOSS shape ([9] units ledger, [10] the creator's account).
+fn recover_terminal_v5(
+    w: &mut World,
+    amount: u64,
+) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let units = percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0;
+    let caller = Pubkey::new_unique();
+    let mut data = vec![29u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let payer = w.payer.insecure_clone();
+    send(
+        &mut w.svm,
+        &payer,
+        &[],
+        Instruction {
+            program_id: w.stake_id,
+            accounts: vec![
+                AccountMeta::new_readonly(caller, false),
+                AccountMeta::new(w.pool, false),
+                AccountMeta::new(w.vault, false),
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new(w.market, false),
+                AccountMeta::new(w.wrapper_vault, false),
+                AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+                AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+                AccountMeta::new_readonly(w.wrapper_id, false),
+                AccountMeta::new(units, false),
+                AccountMeta::new(w.creator_ata, false),
+            ],
+            data,
+        },
+    )
+}
+
+/// A FIRST_LOSS world with alice (STAKE) plus `extra` stakers, run through the real F-9
+/// retirement: resolve (24) -> RecoverTerminalInsurance (29, v5 shape) -> AdminCloseSlab (30),
+/// then warped past the cooldown. Returns the world and the stakers (alice first).
+fn first_loss_closed_world(name: &str, extra: &[u64]) -> Option<(World, Vec<Staker>)> {
+    RISK_MODE.with(|c| c.set(1));
+    let mut w = match world(name) {
+        Some(w) => w,
+        None => {
+            RISK_MODE.with(|c| c.set(2));
+            return None;
+        }
+    };
+    let mut stakers = vec![w.alice.take().unwrap()];
+    for &amt in extra {
+        stakers.push(deposit(&mut w, amt).expect("FIRST_LOSS deposit while Live"));
+    }
+    RISK_MODE.with(|c| c.set(2));
+    assert!(read_pool(&w.svm, &w.pool).is_first_loss());
+    assert!(
+        read_pool(&w.svm, &w.pool).creator_seed_recorded(),
+        "bind recorded the seed"
+    );
+    admin_resolve(&mut w);
+    let r = recover_terminal_v5(&mut w, BUDGET);
+    assert!(r.is_ok(), "v5 terminal recovery: {}", logs(&r));
+    let admin = w.admin.insecure_clone();
+    let r = admin_close_slab(&mut w, &admin);
+    assert!(r.is_ok(), "AdminCloseSlab: {}", logs(&r));
+    if terminal(&w.svm, &w.market) != WrapperTerminal::Closed {
+        let r = admin_close_slab(&mut w, &admin);
+        assert!(r.is_ok(), "AdminCloseSlab#2: {}", logs(&r));
+    }
+    assert_eq!(
+        terminal(&w.svm, &w.market),
+        WrapperTerminal::Closed,
+        "tombstone"
+    );
+    let slot = w.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    w.svm.warp_to_slot(slot + 100);
+    Some((w, stakers))
+}
+
+/// Everything a post-close FIRST_LOSS withdrawal must leave alone.
+#[derive(Debug, PartialEq, Eq)]
+struct Untouchable {
+    creator_balance: u64,
+    seed_atoms: u64,
+    seed_recorded: bool,
+    forwarded: u64,
+    unclaimed: u64,
+    /// pool.vault minus the booked value = the creator's not-yet-forwarded seed + unclaimed.
+    unbooked_in_vault: u64,
+    fees_earned: u64,
+}
+
+fn untouchable(w: &World) -> Untouchable {
+    let p = read_pool(&w.svm, &w.pool);
+    Untouchable {
+        creator_balance: token_amount(&w.svm, &w.creator_ata),
+        seed_atoms: p.creator_seed_atoms(),
+        seed_recorded: p.creator_seed_recorded(),
+        forwarded: p.creator_total_forwarded_atoms(),
+        unclaimed: p.terminal_unclaimed_atoms(),
+        unbooked_in_vault: token_amount(&w.svm, &w.vault) - p.total_pool_value().unwrap(),
+        fees_earned: p.total_fees_earned,
+    }
+}
+
+/// One post-close withdrawal of `lp`: asserts the payout is EXACTLY
+/// `floor(lp * total_pool_value / total_lp_supply)` of the state just before it, that it
+/// leaves pool.vault, that the booked value falls by exactly the payout, and that the
+/// creator's seed / forwarded total / unclaimed record / unbooked vault remainder / fee ledger
+/// are unchanged. Returns the payout.
+fn post_close_withdraw_exact(w: &mut World, s: &Staker, lp: u64) -> u64 {
+    let p0 = read_pool(&w.svm, &w.pool);
+    let expect = percolator_stake::math::calc_collateral_for_withdraw(
+        p0.total_lp_supply,
+        p0.total_pool_value().unwrap(),
+        lp,
+    )
+    .unwrap();
+    let (u0, v0, b0) = (
+        untouchable(w),
+        token_amount(&w.svm, &w.vault),
+        token_amount(&w.svm, &s.ata),
+    );
+    let r = withdraw_v5(w, s, lp, true);
+    assert!(r.is_ok(), "post-close FIRST_LOSS withdraw: {}", logs(&r));
+    let paid = token_amount(&w.svm, &s.ata) - b0;
+    assert_eq!(
+        paid, expect,
+        "exactly the pro-rata share of the booked value"
+    );
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        v0 - paid,
+        "paid out of pool.vault"
+    );
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(
+        p1.total_pool_value().unwrap(),
+        p0.total_pool_value().unwrap() - paid
+    );
+    assert_eq!(p1.total_lp_supply, p0.total_lp_supply - lp);
+    assert_eq!(
+        untouchable(w),
+        u0,
+        "seed / unclaimed / unbooked remainder untouched"
+    );
+    paid
+}
+
+/// GH#309 on the close-out split: three FIRST_LOSS stakers of different sizes leave one after
+/// another after the market is a tombstone. Each gets EXACTLY its pro-rata share of the booked
+/// value (no dilution: never less than its share priced at the first post-close state), the
+/// creator's seed record / forwarded total / balance and the unclaimed record never move, and at
+/// the end the vault holds exactly the dead-share value plus the unbooked remainder.
+/// NEGATIVE CONTROL: on the deployed 0f88ff1 bytes the first withdrawal fails 16.
+#[test]
+fn f9_v5_first_loss_post_close_withdrawals_are_exact_pro_rata() {
+    let Some((mut w, stakers)) = first_loss_closed_world(
+        "f9_v5_first_loss_post_close_withdrawals_are_exact_pro_rata",
+        &[3_333_337, 25_000_001],
+    ) else {
+        return;
+    };
+    let p0 = read_pool(&w.svm, &w.pool);
+    let u0 = untouchable(&w);
+    assert_eq!(
+        u0.creator_balance, BUDGET,
+        "tag 29 returned the seed before the close"
+    );
+    assert_eq!(u0.forwarded, BUDGET);
+    let vault0 = token_amount(&w.svm, &w.vault);
+    let mut total_paid = 0u64;
+    for s in &stakers {
+        let lp = token_amount(&w.svm, &s.lp_ata);
+        assert!(lp > 0);
+        let floor0 = percolator_stake::math::calc_collateral_for_withdraw(
+            p0.total_lp_supply,
+            p0.total_pool_value().unwrap(),
+            lp,
+        )
+        .unwrap();
+        let paid = post_close_withdraw_exact(&mut w, s, lp);
+        assert!(
+            paid >= floor0,
+            "no dilution: {paid} < share at the first post-close state {floor0}"
+        );
+        total_paid += paid;
+    }
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert!(!p1.has_real_lp_holders(), "only the dead shares remain");
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        vault0 - total_paid,
+        "conservation"
+    );
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        p1.total_pool_value().unwrap() + u0.unbooked_in_vault,
+        "vault == dead-share value + unbooked remainder (to the atom)"
+    );
+    assert_eq!(untouchable(&w), u0);
+}
+
+/// The withdrawal never reaches value that is in pool.vault but not booked to the stakers.
+/// FORGED after the real close: the unclaimed record is set and 7,777,777 extra atoms (the
+/// creator's not-yet-forwarded seed + unclaimed growth) are put into pool.vault. The payout is
+/// identical to the one computed from the books alone, the extra atoms stay, and the fee ledger
+/// does not move (a mode-0 pool books nothing when the market is a tombstone).
+#[test]
+fn f9_v5_first_loss_post_close_withdraw_ignores_unbooked_vault_value_forged() {
+    let Some((mut w, stakers)) = first_loss_closed_world(
+        "f9_v5_first_loss_post_close_withdraw_ignores_unbooked_vault_value_forged",
+        &[4_000_000],
+    ) else {
+        return;
+    };
+    const EXTRA: u64 = 7_777_777;
+    let mut acct = w.svm.get_account(&w.pool).unwrap();
+    {
+        let p: &mut StakePool = bytemuck::from_bytes_mut(&mut acct.data[..STAKE_POOL_SIZE]);
+        p.set_terminal_unclaimed_atoms(EXTRA - 1_000_000);
+    }
+    w.svm.set_account(w.pool, acct).unwrap();
+    let bal = token_amount(&w.svm, &w.vault);
+    let (vault, mint, va) = (w.vault, w.mint, w.vault_auth);
+    set_token_account(&mut w.svm, vault, &mint, &va, bal + EXTRA);
+    let u0 = untouchable(&w);
+    assert_eq!(u0.unclaimed, EXTRA - 1_000_000);
+    for s in &stakers {
+        let lp = token_amount(&w.svm, &s.lp_ata);
+        post_close_withdraw_exact(&mut w, s, lp);
+    }
+    assert_eq!(
+        untouchable(&w),
+        u0,
+        "extra atoms and unclaimed record untouched"
+    );
+    assert!(token_amount(&w.svm, &w.vault) >= EXTRA);
+}
+
+/// The post-close path is taken ONLY for the pool's own bound market. A wrapper-owned 16-byte
+/// tombstone at ANOTHER address (forged) is not this pool's slab, so the withdrawal takes the
+/// unchanged live path and fails (the live market reader refuses the tombstone); omitting the
+/// slab is still NotEnoughAccountKeys. Nothing moves.
+#[test]
+fn f9_v5_first_loss_foreign_tombstone_is_not_post_close() {
+    RISK_MODE.with(|c| c.set(1));
+    let Some(mut w) = world("f9_v5_first_loss_foreign_tombstone_is_not_post_close") else {
+        RISK_MODE.with(|c| c.set(2));
+        return;
+    };
+    RISK_MODE.with(|c| c.set(2));
+    // A real tombstone to copy: retire a SECOND world's market and take its bytes.
+    let Some((w2, _)) = first_loss_closed_world("f9_v5_first_loss_foreign_tombstone_src", &[])
+    else {
+        return;
+    };
+    let tomb = w2.svm.get_account(&w2.market).unwrap();
+    assert_eq!(read_wrapper_terminal(&tomb.data), WrapperTerminal::Closed);
+    let fake = Pubkey::new_unique();
+    let mut fake_acct = tomb.clone();
+    fake_acct.owner = w.wrapper_id;
+    w.svm.set_account(fake, fake_acct).unwrap();
+    let slot = w.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    w.svm.warp_to_slot(slot + 100);
+    let alice = w.alice.take().unwrap();
+    let lp = token_amount(&w.svm, &alice.lp_ata);
+    let (v0, p0) = (
+        token_amount(&w.svm, &w.vault),
+        w.svm.get_account(&w.pool).unwrap().data,
+    );
+    // Real market swapped for the foreign tombstone in the [10] slot.
+    let real_market = w.market;
+    w.market = fake;
+    let r = withdraw_v5(&mut w, &alice, lp, true);
+    w.market = real_market;
+    assert!(
+        r.is_err(),
+        "a foreign tombstone must not unlock the post-close path"
+    );
+    // No slab at all: the v5 branch still requires it.
+    let r2 = withdraw_v5(&mut w, &alice, lp, false);
+    assert!(
+        matches!(
+            r2.as_ref().map_err(|e| e.err.clone()),
+            Err(TransactionError::InstructionError(
+                2,
+                InstructionError::NotEnoughAccountKeys
+            ))
+        ),
+        "{}",
+        logs(&r2)
+    );
+    assert_eq!(token_amount(&w.svm, &w.vault), v0);
+    assert_eq!(
+        w.svm.get_account(&w.pool).unwrap().data,
+        p0,
+        "pool unchanged"
+    );
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 24, .. proptest::prelude::ProptestConfig::default() })]
+
+    /// Real program, random FIRST_LOSS book after a real CloseSlab: 1..=3 extra stakers of
+    /// random size, each staker withdraws a random fraction in a random order (some twice).
+    /// CONSERVATION: pool.vault falls by exactly the sum paid, the booked value by the same,
+    /// and the unbooked remainder (seed / unclaimed) and the creator's balance never move.
+    /// NO DILUTION: every payout is >= the share priced at the first post-close state.
+    #[test]
+    fn f9_v5_first_loss_post_close_conservation_and_no_dilution(
+        extra in proptest::collection::vec(1_000_001u64..60_000_000, 1..=3),
+        fracs in proptest::collection::vec(1u64..=10, 8),
+        order_seed in 0u64..1_000,
+    ) {
+        let Some((mut w, stakers)) =
+            first_loss_closed_world("f9_v5_first_loss_post_close_conservation_and_no_dilution", &extra)
+        else {
+            return Ok(());
+        };
+        let p0 = read_pool(&w.svm, &w.pool);
+        let (pv0, sup0) = (p0.total_pool_value().unwrap(), p0.total_lp_supply);
+        let u0 = untouchable(&w);
+        let vault0 = token_amount(&w.svm, &w.vault);
+        let n = stakers.len();
+        let mut total = 0u64;
+        for (k, f) in fracs.iter().enumerate() {
+            let s = &stakers[((order_seed as usize) + k * 7) % n];
+            let held = token_amount(&w.svm, &s.lp_ata);
+            if held == 0 {
+                continue;
+            }
+            let lp = if *f == 10 { held } else { (held * f / 10).max(1) };
+            let floor0 = percolator_stake::math::calc_collateral_for_withdraw(sup0, pv0, lp).unwrap();
+            if floor0 == 0 {
+                continue;
+            }
+            let paid = post_close_withdraw_exact(&mut w, s, lp);
+            proptest::prop_assert!(paid >= floor0, "dilution: {} < {}", paid, floor0);
+            total += paid;
+        }
+        proptest::prop_assert_eq!(token_amount(&w.svm, &w.vault), vault0 - total);
+        let p1 = read_pool(&w.svm, &w.pool);
+        proptest::prop_assert_eq!(p1.total_pool_value().unwrap(), pv0 - total);
+        proptest::prop_assert_eq!(untouchable(&w), u0);
+    }
+}
