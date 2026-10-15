@@ -1003,4 +1003,78 @@ mod kani_proofs {
             "COVER: dead shares, principal only"
         );
     }
+
+    /// PROOF (GH#311 class attribution): starting from a fully booked pool, a terminal tag 41
+    /// pays `released` atoms into pool.vault, of which the wrapper recorded `paid` as
+    /// creator-class value (`creator_paid_to_stake`, paid <= released) and stake has already
+    /// forwarded `forwarded <= paid` of it to the creator. `book_terminal_recovery_stake_class`
+    /// then books the stake class ONLY:
+    ///   * the creator-owed part (`paid - forwarded`) is never booked: the vault always keeps
+    ///     at least that much above pool value;
+    ///   * with real holders, pool value rises by EXACTLY `released - owed`;
+    ///   * with `owed == 0` it is identical to `book_terminal_recovery` (tag 29's old result);
+    ///   * re-running at the same balance books nothing (no double booking, order independent).
+    /// Runs on the REAL `StakePool` methods, tranches off, bounded to 2^40 per field.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_gh311_stake_class_booking_never_books_creator_value() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        const B: u64 = 1 << 40;
+        let mut p = StakePool::zeroed();
+        p.is_initialized = 1;
+        p.set_discriminator();
+        p.total_deposited = kani::any();
+        p.total_withdrawn = kani::any();
+        p.total_flushed = kani::any();
+        p.total_returned = kani::any();
+        p.total_recovered_from_wrapper = kani::any();
+        p.total_fees_earned = kani::any();
+        p.total_lp_supply = kani::any();
+        let released: u64 = kani::any();
+        let paid: u64 = kani::any();
+        p.creator_forwarded_atoms = kani::any();
+        kani::assume(p.total_deposited <= B && p.total_withdrawn <= B && p.total_flushed <= B);
+        kani::assume(p.total_returned <= B && p.total_fees_earned <= B && released <= B);
+        kani::assume(p.total_recovered_from_wrapper <= p.total_returned);
+        kani::assume(p.total_returned <= p.total_flushed);
+        // Wrapper/stake invariants: the creator value is part of the payment, and stake never
+        // forwards more than the wrapper recorded.
+        kani::assume(paid <= released);
+        kani::assume(p.creator_forwarded_atoms <= paid);
+        let v0 = match p.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let owed = p.creator_owed_atoms(paid as u128);
+        assert_eq!(owed, paid - p.creator_forwarded_atoms);
+        let real = p.has_real_lp_holders();
+        let balance = v0 + released;
+        let mut plain = p;
+        let (r, f) = match p.book_terminal_recovery_stake_class(balance, paid as u128) {
+            Ok(x) => x,
+            Err(_) => panic!("refused a bounded input"),
+        };
+        let v1 = p.total_pool_value().expect("value stays representable");
+        assert!(v1 <= balance - owed, "the creator-owed part is never booked");
+        assert_eq!(v1, v0 + r + f);
+        if real {
+            assert_eq!(v1, v0 + (released - owed), "CONSERVATION: stake class only");
+        }
+        if owed == 0 {
+            let (r2, f2) = plain.book_terminal_recovery(balance).unwrap();
+            assert_eq!((r, f), (r2, f2), "owed == 0 is the unchanged booking");
+        }
+        // Idempotent at the same balance.
+        let again = p.book_terminal_recovery_stake_class(balance, paid as u128).unwrap();
+        assert_eq!(again, (0, 0));
+        kani::cover!(real && owed > 0 && r > 0 && f > 0, "COVER: owed excluded, both legs booked");
+        kani::cover!(real && owed > 0 && released > owed, "COVER: partial exclusion, stake part booked");
+        kani::cover!(owed == 0 && released > 0 && real, "COVER: nothing owed (legacy / forwarded)");
+        kani::cover!(!real && owed > 0, "COVER: dead shares only, owed excluded");
+        kani::cover!(
+            owed > 0 && p.creator_forwarded_atoms > 0,
+            "COVER: a partial forward already happened"
+        );
+    }
 }

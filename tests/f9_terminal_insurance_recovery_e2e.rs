@@ -43,7 +43,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 // v5: the stake program is loaded at the id the wrapper's devnet build PINS (A6DVNubv, the v2.1 fresh id), so the
 // wrapper recognises the pool's vault_auth as the STAKE unit class (Phase 4 item 6). Every other
 // F-9 assertion is id-independent.
-const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
+const STAKE_ID: &str = "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v2.2 (wrapper VERSION 19) market account length for capacity 1: 592 + 806 + 2437.
@@ -640,20 +640,29 @@ fn admin_close_slab(
     let pool_dest = Pubkey::new_unique();
     let (mint, pool) = (w.mint, w.pool);
     set_token_account(&mut w.svm, pool_dest, &mint, &pool, 0);
+    let mut accounts = vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+        AccountMeta::new(w.market, false),
+        AccountMeta::new(w.wrapper_vault, false),
+        AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+        AccountMeta::new(pool_dest, false),
+        AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+        AccountMeta::new(w.mint, false),
+        AccountMeta::new(w.vault, false),
+        AccountMeta::new_readonly(w.wrapper_id, false),
+    ];
+    // GH#311: a v5 FIRST_LOSS pool needs the wrapper's units ledger as account 10 so tag 30
+    // books the stake class only.
+    if read_pool(&w.svm, &w.pool).is_first_loss() {
+        accounts.push(AccountMeta::new_readonly(
+            percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0,
+            false,
+        ));
+    }
     let ix = Instruction {
         program_id: w.stake_id,
-        accounts: vec![
-            AccountMeta::new(signer.pubkey(), true),
-            AccountMeta::new(w.pool, false),
-            AccountMeta::new(w.market, false),
-            AccountMeta::new(w.wrapper_vault, false),
-            AccountMeta::new_readonly(w.wrapper_vault_auth, false),
-            AccountMeta::new(pool_dest, false),
-            AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
-            AccountMeta::new(w.mint, false),
-            AccountMeta::new(w.vault, false),
-            AccountMeta::new_readonly(w.wrapper_id, false),
-        ],
+        accounts,
         data: vec![30u8],
     };
     let payer = w.payer.insecure_clone();
