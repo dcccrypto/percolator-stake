@@ -1755,3 +1755,145 @@ fn closeout_m1b_stale_kf_cohort_bind_waits_forged() {
     assert!(r.is_ok(), "control: {}", logs(&r));
     assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
 }
+
+/// Withdraw with the v5 FIRST_LOSS account tail (market, units ledger, wrapper program,
+/// system program). `withdraw` above only appends the market, which is the non-v5 shape.
+fn withdraw_v5(
+    w: &mut World,
+    s: &Staker,
+    lp: u64,
+    pass_tail: bool,
+) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let (dpda, _) = derive_deposit_pda(&w.stake_id, &w.pool, &s.kp.pubkey());
+    let mut data = vec![2u8];
+    data.extend_from_slice(&lp.to_le_bytes());
+    let mut accounts = vec![
+        AccountMeta::new(s.kp.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+        AccountMeta::new(s.lp_ata, false),
+        AccountMeta::new(w.lp_mint, false),
+        AccountMeta::new(w.vault, false),
+        AccountMeta::new(s.ata, false),
+        AccountMeta::new_readonly(w.vault_auth, false),
+        AccountMeta::new(dpda, false),
+        AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+        AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+    ];
+    if pass_tail {
+        accounts.push(AccountMeta::new(w.market, false));
+        accounts.push(AccountMeta::new(
+            percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0,
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(w.wrapper_id, false));
+        accounts.push(AccountMeta::new_readonly(system_program::id(), false));
+    }
+    let payer = w.payer.insecure_clone();
+    send(
+        &mut w.svm,
+        &payer,
+        &[&s.kp],
+        Instruction {
+            program_id: w.stake_id,
+            accounts,
+            data,
+        },
+    )
+}
+
+/// GH#309 regression: a FIRST_LOSS staker must still be able to withdraw after the bound
+/// market has been retired with `AdminCloseSlab` (tag 30).
+///
+/// Before the fix the v5 branch required a LIVE wrapper market on both of its reads, so
+/// every post-close withdrawal reverted — `InvalidAccount` with the slab tail (the
+/// tombstone is not a live market) and `NotEnoughAccountKeys` without it, because the v5
+/// branch makes the slab mandatory. The staker's whole balance stayed in `pool.vault`
+/// with no instruction able to release it. `f9_v5_first_loss_terminal_returns_creator_seed_s1`
+/// computes the claim off-chain and never calls Withdraw, so it did not cover this.
+///
+/// Post-close the deployed leg is already liquid: the wrapper only closes a TERMINAL
+/// market, and tag 29 books the recovered insurance into `total_returned`, so
+/// `total_pool_value()` is the whole pool value here.
+#[test]
+fn f9_v5_first_loss_withdraw_succeeds_after_close_slab() {
+    RISK_MODE.with(|c| c.set(1));
+    let Some(mut w) = world("f9_v5_first_loss_withdraw_succeeds_after_close_slab") else {
+        return;
+    };
+    RISK_MODE.with(|c| c.set(2));
+    assert!(read_pool(&w.svm, &w.pool).is_first_loss());
+
+    admin_resolve(&mut w);
+
+    // tag 29, v5 shape (same call as the S1 test above): the creator seed goes back to the
+    // creator and the pool's terminal surplus is booked to stakers.
+    let units = percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0;
+    let creator_ata = Pubkey::new_unique();
+    let (mint, admin_key) = (w.mint, w.admin.pubkey());
+    set_token_account(&mut w.svm, creator_ata, &mint, &admin_key, 0);
+    let caller = Pubkey::new_unique();
+    let mut data = vec![29u8];
+    data.extend_from_slice(&BUDGET.to_le_bytes());
+    let payer = w.payer.insecure_clone();
+    let r = send(
+        &mut w.svm,
+        &payer,
+        &[],
+        Instruction {
+            program_id: w.stake_id,
+            accounts: vec![
+                AccountMeta::new_readonly(caller, false),
+                AccountMeta::new(w.pool, false),
+                AccountMeta::new(w.vault, false),
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new(w.market, false),
+                AccountMeta::new(w.wrapper_vault, false),
+                AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+                AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+                AccountMeta::new_readonly(w.wrapper_id, false),
+                AccountMeta::new(units, false),
+                AccountMeta::new(creator_ata, false),
+            ],
+            data,
+        },
+    );
+    assert!(r.is_ok(), "v5 terminal recovery: {}", logs(&r));
+
+    // tag 30: retire the market to a tombstone.
+    let admin = w.admin.insecure_clone();
+    let r = admin_close_slab(&mut w, &admin);
+    assert!(r.is_ok(), "AdminCloseSlab: {}", logs(&r));
+    if terminal(&w.svm, &w.market) != WrapperTerminal::Closed {
+        // the P1 fee-rebook step can need a second call
+        let r = admin_close_slab(&mut w, &admin);
+        assert!(r.is_ok(), "AdminCloseSlab#2: {}", logs(&r));
+    }
+    assert_eq!(
+        terminal(&w.svm, &w.market),
+        WrapperTerminal::Closed,
+        "the market is a tombstone"
+    );
+
+    let slot = w.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    w.svm.warp_to_slot(slot + 100);
+
+    let alice = w.alice.take().unwrap();
+    let lp = token_amount(&w.svm, &alice.lp_ata);
+    assert!(lp > 0, "the staker holds LP");
+    let before = token_amount(&w.svm, &alice.ata);
+    let vault_before = token_amount(&w.svm, &w.vault);
+
+    let r = withdraw_v5(&mut w, &alice, lp, true);
+    assert!(
+        r.is_ok(),
+        "first-loss withdraw after CloseSlab must succeed: {}",
+        logs(&r)
+    );
+    let paid = token_amount(&w.svm, &alice.ata) - before;
+    assert!(paid > 0, "the staker was paid");
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        vault_before - paid,
+        "the payout came out of pool.vault"
+    );
+}
