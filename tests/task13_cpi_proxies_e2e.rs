@@ -661,18 +661,17 @@ struct Env {
     payer: Keypair,
 }
 
-/// Returns None (and the caller skips) when the .so artifacts are absent, so
-/// this file behaves like the other cross-program e2e suites in this repo.
+/// Panics when a .so artifact is absent (GH#311 S-3: a missing artifact is a hard
+/// failure, never a silent skip), like the other cross-program e2e suites in this repo.
 fn env() -> Option<Env> {
     if !stake_so().exists() || !wrapper_so().exists() {
-        eprintln!(
-            "SKIP task13 proxies e2e: .so missing (stake={} wrapper={}) — \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) task13 proxies e2e: .so missing (stake={} wrapper={}) — \
              run `cargo build-sbf` here and `cargo build-sbf --features devnet` \
              in percolator-prog",
             stake_so().display(),
             wrapper_so().display()
         );
-        return None;
     }
     let mut svm = LiteSVM::new();
     let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();

@@ -431,18 +431,17 @@ struct World {
     admin: Keypair,
 }
 
-/// Real InitMarket (wrapper) -> real InitPool (stake, mode 0). `None` if the .so
-/// artifacts are missing (the suite's SKIP convention).
+/// Real InitMarket (wrapper) -> real InitPool (stake, mode 0). Panics if a .so artifact is
+/// missing (GH#311 S-3: never a silent skip).
 fn world() -> Option<World> {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP mode0_fee_attribution_e2e: .so missing (stake={} wrapper={})",
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) mode0_fee_attribution_e2e: .so missing (stake={} wrapper={})",
             so.display(),
             wso.display()
         );
-        return None;
     }
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();

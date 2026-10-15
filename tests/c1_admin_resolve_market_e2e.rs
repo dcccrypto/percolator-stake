@@ -383,21 +383,18 @@ fn setup_resolved_ready_market(
     (market, mint, wrapper_vault, pool_pda)
 }
 
-/// Returns `None` (and logs a skip message) if either .so is missing, matching
-/// the graceful-skip convention used by `n6_marketauth_rotation_e2e.rs` and
-/// `v17_stake_insurance_e2e.rs` — `cargo test` without a prior `cargo build-sbf`
-/// should skip these e2e tests rather than fail the whole suite.
+/// Panics if either .so is missing (GH#311 S-3: a skipped e2e passes vacuously, so a
+/// missing artifact is a hard failure). Build them first (`cargo build-sbf`).
 fn common_svm_setup() -> Option<(LiteSVM, Pubkey, Pubkey, Pubkey, Keypair, Keypair)> {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP: .so missing (stake={} wrapper={}) -- run `cargo build-sbf --no-default-features` \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3): .so missing (stake={} wrapper={}) -- run `cargo build-sbf --no-default-features` \
              in percolator-stake and percolator-prog first",
             so.display(),
             wso.display()
         );
-        return None;
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();

@@ -449,14 +449,13 @@ fn mode0_deposit_priced_after_crystallization_not_before() {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP mode0_deposit_priced_after_crystallization_not_before: .so missing \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) mode0_deposit_priced_after_crystallization_not_before: .so missing \
              (stake={} wrapper={}) -- run `cargo build-sbf --no-default-features` in \
              percolator-stake and percolator-prog first",
             so.display(),
             wso.display()
         );
-        return;
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();
