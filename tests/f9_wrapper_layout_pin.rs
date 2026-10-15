@@ -321,7 +321,8 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
         );
         ran += 1;
     }
-    if ran == 0 {
-        eprintln!("SKIP: no wrapper .so available; set F9_WRAPPER_SOS");
-    }
+    assert!(
+        ran > 0,
+        "no wrapper .so available (set F9_WRAPPER_SOS): a run that checks nothing is a failure, not a skip (GH#311 S-3)"
+    );
 }

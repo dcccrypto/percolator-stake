@@ -1053,6 +1053,40 @@ impl StakePool {
         Ok(booked)
     }
 
+    /// CLOSE-OUT RULE booking WITHOUT a forward (GH#311, and AdminCloseSlab): book a terminal
+    /// `vault_balance` for the stakers exactly as RecoverTerminalInsurance (29) would, but leave
+    /// the creator's close-out share in the vault, unbooked, for the next tag 29 to forward:
+    ///
+    /// ```text
+    /// surplus  = vault_balance - total_pool_value()                 (saturating)
+    /// reserved = closeout_creator_share(surplus, creator_class_released)
+    /// book_closeout_remainder(vault_balance - reserved)
+    /// ```
+    ///
+    /// With the same `creator_class_released` this books to the stakers exactly what tag 29 books
+    /// after forwarding (tag 29 forwards `reserved` and then books `vault_balance - reserved`),
+    /// and a later tag 29 then forwards exactly `reserved` and books nothing more (Kani
+    /// `kani_gh311_book_before_withdraw_equals_tag29`). Passing `None` on a unitised FIRST_LOSS
+    /// market reserves the seed cap alone, which is >= the true share (AdminCloseSlab has no units
+    /// account); the excess is booked by the next tag 29. The caller must have proved the market
+    /// terminal. Returns `(reserved, to_returned, to_fees)`.
+    pub fn book_terminal_surplus_excluding_creator_share(
+        &mut self,
+        vault_balance: u64,
+        creator_class_released: Option<u64>,
+    ) -> Result<(u64, u64, u64), crate::error::StakeError> {
+        use crate::error::StakeError;
+        let surplus =
+            vault_balance.saturating_sub(self.total_pool_value().ok_or(StakeError::Overflow)?);
+        let reserved = self.closeout_creator_share(surplus, creator_class_released);
+        // reserved <= surplus <= vault_balance (closeout_creator_share caps at surplus).
+        let bookable = vault_balance
+            .checked_sub(reserved)
+            .ok_or(StakeError::Overflow)?;
+        let (to_returned, to_fees) = self.book_closeout_remainder(bookable)?;
+        Ok((reserved, to_returned, to_fees))
+    }
+
     /// Tranche pools: the largest amount by which a permissionless
     /// `RecoverFlushedInsurance` (tag 23) could raise [`StakePool::senior_balance`]
     /// from the current state. Zero means `senior_balance()` is invariant under every
@@ -1880,6 +1914,158 @@ mod tests {
         let (r, f) = p.book_terminal_recovery(1_000 + 5_000_000).unwrap();
         assert_eq!((r, f), (0, 0), "F3: nothing booked to the dead shares");
         assert_eq!(p.total_fees_earned, 0);
+    }
+
+    // ── GH#311 (close-out line): Withdraw books exactly what tag 29 books ──
+
+    /// FIRST_LOSS pool of the e2e scene: 12M deposited, 6M deployed, seed `seed` recorded.
+    fn gh311_fl_pool(seed: u64) -> StakePool {
+        let mut p = f9_pool(12_000_000, 6_000_000, 12_000_000);
+        p.risk_mode = RISK_MODE_FIRST_LOSS;
+        p.record_creator_seed(seed);
+        p
+    }
+
+    /// Tag 29 after a direct tag 41 (amount 0): forward the share, book the rest. Returns the
+    /// atoms forwarded and leaves `vault` at its post-forward balance.
+    fn gh311_tag29(p: &mut StakePool, vault: &mut u64, released: Option<u64>) -> u64 {
+        let surplus = *vault - p.total_pool_value().unwrap();
+        let c = p.closeout_creator_share(surplus, released);
+        *vault -= c;
+        p.set_creator_surplus_forwarded_atoms(p.creator_surplus_forwarded_atoms() + c);
+        p.book_closeout_remainder(*vault).unwrap();
+        c
+    }
+
+    /// For each (seed, creator class released): booking before a Withdraw leaves the stakers'
+    /// booked value EXACTLY where tag 29 leaves it, reserves exactly tag 29's creator share, and
+    /// a later tag 29 forwards that share and books nothing more.
+    #[test]
+    fn gh311_withdraw_booking_equals_tag29_booking_first_loss() {
+        // (seed at bind, creator class released, case)
+        for (seed, released) in [
+            (5_000_000u64, 5_000_000u64), // plain: the models agree
+            (3_000_000, 5_000_000),       // growth above the seed: 2M to the stakers
+            (5_000_000, 4_230_770),       // creator class lost value: creator gets what is left
+            (5_000_000, 0),               // partial tag 41 inside the stake class
+        ] {
+            let fund = 6_000_000 + released;
+            let balance = 6_000_000 + fund; // liquid + the direct tag-41 payment
+            let mut a = gh311_fl_pool(seed);
+            let mut va = balance;
+            let ca = gh311_tag29(&mut a, &mut va, Some(released));
+            assert_eq!(ca, seed.min(released), "tag 29 forwards min(seed, released)");
+
+            let mut b = gh311_fl_pool(seed);
+            let (reserved, r, f) = b
+                .book_terminal_surplus_excluding_creator_share(balance, Some(released))
+                .unwrap();
+            assert_eq!(reserved, ca, "seed {seed} released {released}: reserved == tag 29 share");
+            assert_eq!(
+                b.total_pool_value(),
+                a.total_pool_value(),
+                "seed {seed} released {released}: stakers priced at tag 29's books"
+            );
+            assert_eq!((b.total_returned, b.total_fees_earned), (a.total_returned, a.total_fees_earned));
+            assert_eq!(r + f, fund - reserved);
+            assert_eq!(balance - b.total_pool_value().unwrap(), reserved, "only the share unbooked");
+            // A later tag 29 forwards exactly the reserved share and books nothing twice.
+            let mut vb = balance;
+            let before = (b.total_returned, b.total_fees_earned);
+            let cb = gh311_tag29(&mut b, &mut vb, Some(released));
+            assert_eq!(cb, reserved);
+            assert_eq!((b.total_returned, b.total_fees_earned), before, "no double booking");
+            assert_eq!(vb, va);
+            assert_eq!(b.total_pool_value(), a.total_pool_value());
+        }
+    }
+
+    /// Idempotent: a second booking at the same balance books nothing and reserves the same.
+    #[test]
+    fn gh311_withdraw_booking_is_idempotent() {
+        let mut p = gh311_fl_pool(3_000_000);
+        let first = p
+            .book_terminal_surplus_excluding_creator_share(17_000_000, Some(5_000_000))
+            .unwrap();
+        assert_eq!(first, (3_000_000, 6_000_000, 2_000_000));
+        let second = p
+            .book_terminal_surplus_excluding_creator_share(17_000_000, Some(5_000_000))
+            .unwrap();
+        assert_eq!(second, (3_000_000, 0, 0));
+    }
+
+    /// FEE_ONLY (`None`, the seed alone): growth above the seed is booked, the seed is not.
+    #[test]
+    fn gh311_withdraw_booking_fee_only_books_growth_only() {
+        let mut p = f9_pool(12_000_000, 0, 12_000_000);
+        p.risk_mode = RISK_MODE_FEE_ONLY;
+        p.record_creator_seed(3_000_000);
+        let (reserved, r, f) = p
+            .book_terminal_surplus_excluding_creator_share(12_000_000 + 5_000_000, None)
+            .unwrap();
+        assert_eq!((reserved, r, f), (3_000_000, 0, 2_000_000));
+        assert_eq!(p.total_pool_value(), Some(14_000_000));
+        // Fund below the seed: everything is the creator's, nothing is booked.
+        let mut q = f9_pool(12_000_000, 0, 12_000_000);
+        q.risk_mode = RISK_MODE_FEE_ONLY;
+        q.record_creator_seed(5_000_000);
+        let got = q
+            .book_terminal_surplus_excluding_creator_share(12_000_000 + 4_000_000, None)
+            .unwrap();
+        assert_eq!(got, (4_000_000, 0, 0));
+        assert_eq!(q.total_pool_value(), Some(12_000_000));
+    }
+
+    /// AdminCloseSlab's `None` on a unitised FIRST_LOSS market reserves the seed cap, which is
+    /// >= the true share; never less (the creator can never be shorted by the close).
+    #[test]
+    fn gh311_close_slab_none_reserves_at_least_the_true_share() {
+        for released in [0u64, 4_230_770, 5_000_000, 7_000_000] {
+            let mut exact = gh311_fl_pool(5_000_000);
+            let mut capped = gh311_fl_pool(5_000_000);
+            let bal = 6_000_000 + 6_000_000 + released;
+            let (re, _, _) = exact
+                .book_terminal_surplus_excluding_creator_share(bal, Some(released))
+                .unwrap();
+            let (rc, _, _) = capped.book_terminal_surplus_excluding_creator_share(bal, None).unwrap();
+            assert!(rc >= re, "released {released}: seed-cap reservation {rc} >= share {re}");
+            assert!(capped.total_pool_value() <= exact.total_pool_value());
+        }
+    }
+
+    /// Legacy (non-v5) pool: no creator share; the whole surplus is booked, as tag 29 does.
+    #[test]
+    fn gh311_withdraw_booking_legacy_books_everything() {
+        let mut p = f9_pool(10_000_000, 4_000_000, 10_001_000);
+        let got = p.book_terminal_surplus_excluding_creator_share(11_000_000, Some(9)).unwrap();
+        assert_eq!(got, (0, 4_000_000, 1_000_000));
+    }
+
+    /// Dead shares only: nothing booked, the non-creator rest recorded unclaimed (as tag 29).
+    #[test]
+    fn gh311_withdraw_booking_no_real_staker_books_nothing() {
+        let mut p = f9_pool(1_000, 0, MINIMUM_LIQUIDITY);
+        p.risk_mode = RISK_MODE_FEE_ONLY;
+        p.record_creator_seed(3_000_000);
+        let got = p
+            .book_terminal_surplus_excluding_creator_share(1_000 + 5_000_000, None)
+            .unwrap();
+        assert_eq!(got, (3_000_000, 0, 0));
+        assert_eq!(p.total_pool_value(), Some(1_000));
+        assert_eq!(p.terminal_unclaimed_atoms(), 2_000_000);
+    }
+
+    /// Balance at or below the booked value: nothing reserved, nothing booked.
+    #[test]
+    fn gh311_withdraw_booking_no_surplus_is_a_no_op() {
+        let mut p = gh311_fl_pool(5_000_000);
+        let v0 = p.total_pool_value();
+        assert_eq!(
+            p.book_terminal_surplus_excluding_creator_share(5_000_000, Some(5_000_000))
+                .unwrap(),
+            (0, 0, 0)
+        );
+        assert_eq!(p.total_pool_value(), v0);
     }
 
     #[test]

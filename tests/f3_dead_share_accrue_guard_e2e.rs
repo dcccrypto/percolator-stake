@@ -449,17 +449,16 @@ struct World {
     accts: InitPoolAccounts,
 }
 
-/// Real InitPool (mode 0), ready for deposits. None if either .so is missing.
+/// Real InitPool (mode 0), ready for deposits. Panics if either .so is missing (GH#311 S-3).
 fn world(test_name: &str) -> Option<World> {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP {test_name}: .so missing (stake={} wrapper={})",
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) {test_name}: .so missing (stake={} wrapper={})",
             so.display(),
             wso.display()
         );
-        return None;
     }
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();

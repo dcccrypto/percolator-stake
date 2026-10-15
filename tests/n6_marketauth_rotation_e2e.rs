@@ -336,14 +336,13 @@ fn initpool_rotates_marketauth_to_pool_pda() {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP initpool_rotates_marketauth_to_pool_pda: .so missing (stake={} wrapper={}) \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) initpool_rotates_marketauth_to_pool_pda: .so missing (stake={} wrapper={}) \
              -- run `cargo build-sbf --no-default-features` in percolator-stake and \
              percolator-prog first",
             so.display(),
             wso.display()
         );
-        return;
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();
@@ -449,8 +448,7 @@ fn initpool_reverts_atomically_if_caller_is_not_marketauth() {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!("SKIP initpool_reverts_atomically_if_caller_is_not_marketauth: .so missing");
-        return;
+        panic!("MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) initpool_reverts_atomically_if_caller_is_not_marketauth: .so missing");
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();
@@ -524,8 +522,7 @@ fn initpool_requires_writable_slab() {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!("SKIP initpool_requires_writable_slab: .so missing");
-        return;
+        panic!("MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) initpool_requires_writable_slab: .so missing");
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();

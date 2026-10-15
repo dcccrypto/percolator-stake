@@ -44,14 +44,12 @@ fn set_market_resolved_rejects_undersized_pool_184() {
     let so = stake_so();
     if !so.exists() {
         // Build artifact not present (e.g. cargo test without a prior
-        // build-sbf). Skip rather than fail — the unit/build-sbf gate covers
-        // the rest. Print so the skip is visible in CI logs.
-        eprintln!(
-            "SKIP set_market_resolved_rejects_undersized_pool_184: stake .so missing at {} \
+        // build-sbf): fail, never skip (GH#311 S-3: a skip passes vacuously).
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) set_market_resolved_rejects_undersized_pool_184: stake .so missing at {} \
              — run `cargo build-sbf --no-default-features` first",
             so.display()
         );
-        return;
     }
 
     let mut svm = LiteSVM::new();

@@ -301,12 +301,11 @@ fn forge_unbudgeted_claim(w: &mut World, x: u64) {
 fn world(name: &str) -> Option<World> {
     let (so, wso) = (stake_so(), wrapper_so());
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP {name}: .so missing (stake={} wrapper={})",
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) {name}: .so missing (stake={} wrapper={})",
             so.display(),
             wso.display()
         );
-        return None;
     }
     let mut svm = LiteSVM::new().with_spl_programs();
     let stake_id = Pubkey::from_str(STAKE_ID).unwrap();

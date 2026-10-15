@@ -1534,6 +1534,33 @@ fn process_withdraw(
     // before the vault->user transfer below; pool.vault verified above.
     pre_accrue_fee_modes(pool, vault, fee_slab, false)?;
 
+    // v5 FIRST_LOSS (no tranches: refused on FIRST_LOSS): refresh and read the wrapper's unit
+    // ledger once, BEFORE the terminal booking below, which needs its creator-class figure.
+    // Same accounts and checks as before (PDA, owner, market, wrapper, fresh snap_slot); only
+    // the read moved up from the pricing arm.
+    let v5_units = if !pool.tranche_enabled() && pool.is_first_loss() {
+        Some(v5_read_units(
+            pool,
+            user,
+            fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            v5_system_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
+        )?)
+    } else {
+        None
+    };
+
+    // GH#311 (close-out line): a permissionless direct wrapper tag 41 may already have paid a
+    // Resolved market's insurance into pool.vault. Book it now, exactly as tag 29 would, so this
+    // withdrawal is not priced against unbooked value (the creator's close-out share stays
+    // unbooked for tag 29 to forward).
+    let creator_class_released = match v5_units {
+        Some(u) => Some(u64::try_from(u.creator_paid_to_stake).map_err(|_| StakeError::Overflow)?),
+        None => None,
+    };
+    book_terminal_surplus_before_pricing(pool, vault, fee_slab, creator_class_released)?;
+
     // PERC-303: Determine withdrawal amount based on tranche
     let withdrawal_amount = if pool.tranche_enabled() && is_junior {
         // Junior withdrawal: valued against junior sub-pool after loss absorption.
@@ -1556,14 +1583,8 @@ fn process_withdraw(
         // v5: pool value = liquid + deployed units at the wrapper's EXIT (free) reading (the
         // lower one), so a leaver never takes more than its share; the payout must fit the
         // LIQUID value (the deployed part returns through a sync recovery on a healthy market).
-        let units = v5_read_units(
-            pool,
-            user,
-            fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?,
-            v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
-            v5_wrapper_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
-            v5_system_ai.ok_or(ProgramError::NotEnoughAccountKeys)?,
-        )?;
+        // The ledger was read above (this arm is reached only without tranches).
+        let units = v5_units.ok_or(StakeError::InsuranceUnitsInvalid)?;
         let deployed =
             crate::math::deployed_value(units.units_stake, units.units_total, units.snap_free)
                 .ok_or(StakeError::Overflow)?;
@@ -2855,6 +2876,66 @@ fn pre_accrue_fee_modes(
             acct.amount
         };
         accrue_fees_inner(pool, current_balance, wrapper_paid)?;
+    }
+    Ok(())
+}
+
+/// GH#311 (close-out line): before a Withdraw prices, book a TERMINAL vault surplus exactly as
+/// RecoverTerminalInsurance (tag 29) would, keeping the creator's close-out share unbooked.
+///
+/// Wrapper tag 41 is permissionless on a Resolved market (W4-PAYOUT): anyone can pay the
+/// market's insurance into `pool.vault` without a stake instruction. Before this, only tag 29 /
+/// tag 30 booked that surplus, so a Withdraw landing in between priced against the unbooked
+/// value and under-paid (50% in the PoC); the difference went to the remaining stakers.
+///
+/// Rule (`StakePool::book_terminal_surplus_excluding_creator_share`): `reserved =
+/// closeout_creator_share(vault - booked, creator_class_released)` stays in the vault for tag 29
+/// to forward; `vault - reserved` is booked with `book_closeout_remainder`, the same call tag 29
+/// makes after its forward. So the withdrawer is priced at exactly what tag 29 would book, the
+/// creator never loses its share, and a later tag 29 books nothing twice.
+///
+/// Gated, like tag 29, on the bound market being RESOLVED (read from the wrapper's own mode):
+/// * Live / Recovery: nothing is booked (#290: a Live-mode donation is not recovery).
+/// * Closed tombstone: unreachable here (`pre_accrue_fee_modes` needs a live market account for
+///   a mode-0 pool), and AdminCloseSlab books at the close.
+/// * No slab passed (optional on FEE_ONLY / legacy Withdraw): nothing is booked; redeeming at
+///   the unbooked price can only under-pay the withdrawer, never over-pay.
+/// * Unpinned layout: nothing is booked (never worse than before).
+///
+/// `creator_class_released`: FIRST_LOSS = the wrapper's `creator_paid_to_stake` from the ledger
+/// the Withdraw has just refreshed and checked (`v5_read_units`: PDA, owner, market, fresh
+/// snap_slot), exactly the figure tag 29 reads; otherwise `None`, as tag 29 uses.
+///
+/// The caller must have verified `pool.vault == vault.key`, and must call this after
+/// `pre_accrue_fee_modes` (tag-87 fees first, as tag 29 does) and before its own transfer.
+fn book_terminal_surplus_before_pricing(
+    pool: &mut state::StakePool,
+    vault: &AccountInfo,
+    slab: Option<&AccountInfo>,
+    creator_class_released: Option<u64>,
+) -> ProgramResult {
+    if pool.pool_mode != 0 {
+        return Ok(());
+    }
+    let Some(slab) = slab else {
+        return Ok(());
+    };
+    if slab.key.to_bytes() != pool.slab || slab.owner.to_bytes() != pool.percolator_program {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if state::read_wrapper_terminal(&slab.try_borrow_data()?) != state::WrapperTerminal::Resolved {
+        return Ok(());
+    }
+    let balance = token_balance(vault)?;
+    let (reserved, to_returned, to_fees) =
+        pool.book_terminal_surplus_excluding_creator_share(balance, creator_class_released)?;
+    if to_returned > 0 || to_fees > 0 {
+        msg!(
+            "Withdraw: terminal surplus booked before pricing: returned {} + fees {}; {} left for the creator's close-out share",
+            to_returned,
+            to_fees,
+            reserved
+        );
     }
     Ok(())
 }
@@ -4458,9 +4539,9 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
     // alone (`None`): it is >= the creator's true share (the unitised FIRST_LOSS cap is lower or
     // equal), so the booking below can never take the creator's atoms; any excess is booked to
     // the stakers by that next call.
-    let surplus = balance.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
-    let reserved = pool.closeout_creator_share(surplus, None);
-    let (to_returned, to_fees) = pool.book_closeout_remainder(balance - reserved)?;
+    // Same booking as a terminal Withdraw (GH#311), with the seed cap alone (`None`).
+    let (reserved, to_returned, to_fees) =
+        pool.book_terminal_surplus_excluding_creator_share(balance, None)?;
     pool.set_market_resolved(true);
     msg!(
         "AdminCloseSlab: closed={} swept {} into pool vault; booked returned {} + fees {}; {} reserved for the creator's seed return; unclaimed {}; refunded {} lamports to admin",

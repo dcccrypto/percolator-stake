@@ -403,14 +403,13 @@ fn mode0_pool_accrues_fees_via_real_accrue_fees_instruction() {
     let so = stake_so();
     let wso = wrapper_so();
     if !so.exists() || !wso.exists() {
-        eprintln!(
-            "SKIP mode0_pool_accrues_fees_via_real_accrue_fees_instruction: .so missing \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) mode0_pool_accrues_fees_via_real_accrue_fees_instruction: .so missing \
              (stake={} wrapper={}) -- run `cargo build-sbf --no-default-features` in \
              percolator-stake and percolator-prog first",
             so.display(),
             wso.display()
         );
-        return;
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();

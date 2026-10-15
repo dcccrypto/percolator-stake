@@ -337,12 +337,11 @@ fn deposit_ix(
 fn deposit_pda_squat_adoption() {
     let so = stake_so();
     if !so.exists() {
-        eprintln!(
-            "SKIP deposit_pda_squat_adoption: stake .so missing at {} \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) deposit_pda_squat_adoption: stake .so missing at {} \
              -- run `cargo build-sbf --no-default-features` first",
             so.display()
         );
-        return;
     }
 
     // ---- LiteSVM setup ----
@@ -534,12 +533,11 @@ fn deposit_pda_squat_adoption() {
 fn deposit_pda_clean_path_unaffected() {
     let so = stake_so();
     if !so.exists() {
-        eprintln!(
-            "SKIP deposit_pda_clean_path_unaffected: stake .so missing at {} \
+        panic!(
+            "MISSING ARTIFACT (a hard failure, never a skip: GH#311 S-3) deposit_pda_clean_path_unaffected: stake .so missing at {} \
              -- run `cargo build-sbf --no-default-features` first",
             so.display()
         );
-        return;
     }
 
     let mut svm = LiteSVM::new().with_spl_programs();

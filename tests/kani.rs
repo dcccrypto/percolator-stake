@@ -1308,6 +1308,106 @@ mod kani_proofs {
         kani::cover!(c1 > 0 && c2 > 0, "COVER: seed returned across two calls");
     }
 
+    /// PROOF GH#311 (`kani_gh311_book_before_withdraw_equals_tag29`) on the REAL `StakePool`.
+    /// A permissionless direct wrapper tag 41 leaves `released` unbooked atoms in a terminal
+    /// pool's vault (from a fully booked pool). Compare:
+    ///   A. tag 29: forward `closeout_creator_share`, then `book_closeout_remainder`;
+    ///   B. Withdraw's pre-pricing booking (`book_terminal_surplus_excluding_creator_share`, the
+    ///      vault untouched), then a later tag 29.
+    /// Then: B's booking reserves EXACTLY A's creator share, leaves the stakers' booked value
+    /// EXACTLY at A's (the withdrawer is priced as if tag 29 had run), never books the creator's
+    /// atoms (`value <= balance - reserved`), and the later tag 29 forwards exactly that share and
+    /// books nothing (no double booking); the end states agree (value and unclaimed record).
+    /// FIRST_LOSS (with or without a unitised creator-class figure) and FEE_ONLY, with or
+    /// without real stakers, any earlier forward; bounded u32 state (no tranche: refused on
+    /// FIRST_LOSS, and the split only divides the fee leg).
+    /// MUTANTS: (M1) the 0f88ff1 Withdraw (no booking: value stays v0 < A's whenever stakers are
+    /// owed something); (M2) book the whole surplus (the creator's share booked to stakers);
+    /// (M3) the #312 rule on this line (exclude all of `creator class released - forwarded`:
+    /// under-books the growth above the seed).
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn kani_gh311_book_before_withdraw_equals_tag29() {
+        use bytemuck::Zeroable;
+        use percolator_stake::state::StakePool;
+        let mut a = StakePool::zeroed();
+        a.is_initialized = 1;
+        a.set_discriminator();
+        let first_loss: bool = kani::any();
+        a.risk_mode = if first_loss {
+            percolator_stake::state::RISK_MODE_FIRST_LOSS
+        } else {
+            percolator_stake::state::RISK_MODE_FEE_ONLY
+        };
+        a.total_deposited = kani::any::<u32>() as u64;
+        a.total_withdrawn = kani::any::<u32>() as u64;
+        a.total_flushed = if first_loss { kani::any::<u32>() as u64 } else { 0 };
+        a.total_returned = kani::any::<u32>() as u64;
+        a.total_recovered_from_wrapper = kani::any::<u32>() as u64;
+        a.total_fees_earned = kani::any::<u32>() as u64;
+        a.total_lp_supply = kani::any::<u32>() as u64;
+        kani::assume(a.total_recovered_from_wrapper <= a.total_returned);
+        kani::assume(a.total_returned <= a.total_flushed || !first_loss);
+        let seed = kani::any::<u32>() as u64;
+        let fwd = kani::any::<u32>() as u64;
+        let released = kani::any::<u32>() as u64;
+        a.record_creator_seed(seed);
+        a.set_creator_surplus_forwarded_atoms(fwd);
+        let cc = if first_loss && kani::any() { Some(kani::any::<u32>() as u64) } else { None };
+        let v0 = match a.total_pool_value() {
+            Some(v) => v,
+            None => return,
+        };
+        let real = a.has_real_lp_holders();
+        let balance = v0 + released;
+        let mut b = a; // the same pool, the Withdraw-first ordering
+
+        // A: tag 29 after the direct tag 41.
+        let creator = a.closeout_creator_share(released, cc);
+        a.set_creator_surplus_forwarded_atoms(fwd + creator);
+        a.book_closeout_remainder(balance - creator).expect("bounded input");
+        let va = a.total_pool_value().expect("representable");
+
+        // B: Withdraw's booking (nothing leaves the vault), then a later tag 29.
+        let (reserved, rb, fb) = b
+            .book_terminal_surplus_excluding_creator_share(balance, cc)
+            .expect("bounded input");
+        let vb = b.total_pool_value().expect("representable");
+        assert_eq!(reserved, creator, "reserves exactly tag 29's creator share");
+        assert_eq!(vb, va, "the withdrawer is priced at tag 29's books");
+        assert!(vb <= balance - reserved, "never books the creator's atoms");
+        assert_eq!(vb, v0 + rb + fb);
+        let c2 = b.closeout_creator_share(balance - vb, cc);
+        assert_eq!(c2, reserved, "the later tag 29 forwards exactly the reserved share");
+        b.set_creator_surplus_forwarded_atoms(fwd + c2);
+        let (r2, f2) = b.book_closeout_remainder(balance - c2).expect("bounded input");
+        assert_eq!((r2, f2), (0, 0), "no double booking");
+        assert_eq!(b.total_pool_value(), Some(va));
+        assert_eq!(b.terminal_unclaimed_atoms(), a.terminal_unclaimed_atoms());
+
+        kani::cover!(
+            real && first_loss && reserved > 0 && rb > 0 && fb > 0,
+            "COVER: FIRST_LOSS, principal + fees booked, creator share reserved"
+        );
+        kani::cover!(
+            real && matches!(cc, Some(x) if x > seed) && reserved > 0 && reserved < released && vb > v0,
+            "COVER: growth above the seed booked to the stakers (#312 would exclude it)"
+        );
+        kani::cover!(
+            real && matches!(cc, Some(x) if x < seed && x > fwd) && reserved > 0,
+            "COVER: creator class lost value, creator gets what is left"
+        );
+        kani::cover!(
+            real && !first_loss && reserved > 0 && fb > 0,
+            "COVER: FEE_ONLY, seed reserved, growth booked"
+        );
+        kani::cover!(
+            !real && reserved > 0 && b.terminal_unclaimed_atoms() > 0,
+            "COVER: no real staker, nothing booked, rest unclaimed"
+        );
+        kani::cover!(fwd > 0 && reserved > 0, "COVER: after an earlier forward");
+    }
+
     /// PROOF I-S1 (`kani_s3_admin_cannot_flush`), dispatch level on the REAL
     /// `processor::process`: tag 3 (FlushToInsurance) and tag 23 (RecoverFlushedInsurance) are
     /// `Err(DeprecatedV5)` for ANY amount and ANY caller, before a single account is read (the
