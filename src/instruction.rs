@@ -169,6 +169,13 @@ pub enum StakeInstruction {
     ///
     /// v5 FIRST_LOSS: the deployed units are priced at the wrapper's EXIT (free) reading and
     /// the payout must fit the pool's LIQUID value (`LiquidityBufferExhausted` otherwise).
+    ///
+    /// GH#311: when account 10 is passed and the wrapper market is RESOLVED, the vault surplus
+    /// (e.g. paid in by a permissionless direct wrapper tag 41) is booked BEFORE pricing, exactly
+    /// as `RecoverTerminalInsurance` would book it, except the creator's close-out share
+    /// (`StakePool::closeout_creator_share`; FIRST_LOSS: capped by the creator class released,
+    /// read from account 11), which stays unbooked for `RecoverTerminalInsurance` to forward.
+    /// A Live market books nothing (#290). No account changes.
     Withdraw { lp_amount: u64 },
 
     /// 3: CPI into percolator wrapper's TopUpInsurance to move collateral from
