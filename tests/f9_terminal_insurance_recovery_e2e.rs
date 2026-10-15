@@ -640,20 +640,29 @@ fn admin_close_slab(
     let pool_dest = Pubkey::new_unique();
     let (mint, pool) = (w.mint, w.pool);
     set_token_account(&mut w.svm, pool_dest, &mint, &pool, 0);
+    let mut accounts = vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+        AccountMeta::new(w.market, false),
+        AccountMeta::new(w.wrapper_vault, false),
+        AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+        AccountMeta::new(pool_dest, false),
+        AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+        AccountMeta::new(w.mint, false),
+        AccountMeta::new(w.vault, false),
+        AccountMeta::new_readonly(w.wrapper_id, false),
+    ];
+    // GH#311: a v5 FIRST_LOSS pool needs the wrapper's units ledger as account 10 so tag 30
+    // books the stake class only.
+    if read_pool(&w.svm, &w.pool).is_first_loss() {
+        accounts.push(AccountMeta::new_readonly(
+            percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0,
+            false,
+        ));
+    }
     let ix = Instruction {
         program_id: w.stake_id,
-        accounts: vec![
-            AccountMeta::new(signer.pubkey(), true),
-            AccountMeta::new(w.pool, false),
-            AccountMeta::new(w.market, false),
-            AccountMeta::new(w.wrapper_vault, false),
-            AccountMeta::new_readonly(w.wrapper_vault_auth, false),
-            AccountMeta::new(pool_dest, false),
-            AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
-            AccountMeta::new(w.mint, false),
-            AccountMeta::new(w.vault, false),
-            AccountMeta::new_readonly(w.wrapper_id, false),
-        ],
+        accounts,
         data: vec![30u8],
     };
     let payer = w.payer.insecure_clone();
