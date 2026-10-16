@@ -2100,41 +2100,82 @@ fn f9_v5_first_loss_post_close_withdrawals_are_exact_pro_rata() {
     assert_eq!(untouchable(&w), u0);
 }
 
-/// The withdrawal never reaches value that is in pool.vault but not booked to the stakers.
-/// FORGED after the real close: the unclaimed record is set and 7,777,777 extra atoms (the
-/// creator's not-yet-forwarded seed + unclaimed growth) are put into pool.vault. The payout is
-/// identical to the one computed from the books alone, the extra atoms stay, and the fee ledger
-/// does not move (a mode-0 pool books nothing when the market is a tombstone).
+/// Unbooked value in pool.vault on the tombstone is booked EXACTLY as a tag 29 (amount 0) on the
+/// tombstone would book it, before the withdrawal prices (#313 gate condition 3; this test pinned
+/// "books nothing" before that condition was implemented). FORGED after the real close: the
+/// unclaimed record is set and 7,777,777 extra atoms are put into pool.vault. The creator's
+/// close-out share was already forwarded by the tag 29 before the close, so the whole extra is the
+/// stakers'. CONTROL: tag 29 (amount 0) books it first, then every staker exits. The direct path
+/// must pay every staker the same, give the creator nothing more, and leave the same vault, and a
+/// tag 29 afterwards must book nothing twice.
 #[test]
-fn f9_v5_first_loss_post_close_withdraw_ignores_unbooked_vault_value_forged() {
-    let Some((mut w, stakers)) = first_loss_closed_world(
-        "f9_v5_first_loss_post_close_withdraw_ignores_unbooked_vault_value_forged",
+fn f9_v5_first_loss_post_close_withdraw_books_unbooked_vault_value_as_tag29_forged() {
+    const EXTRA: u64 = 7_777_777;
+    fn forge(w: &mut World) {
+        let mut acct = w.svm.get_account(&w.pool).unwrap();
+        {
+            let p: &mut StakePool = bytemuck::from_bytes_mut(&mut acct.data[..STAKE_POOL_SIZE]);
+            p.set_terminal_unclaimed_atoms(EXTRA - 1_000_000);
+        }
+        w.svm.set_account(w.pool, acct).unwrap();
+        let bal = token_amount(&w.svm, &w.vault);
+        let (vault, mint, va) = (w.vault, w.mint, w.vault_auth);
+        set_token_account(&mut w.svm, vault, &mint, &va, bal + EXTRA);
+    }
+    fn exit_each(w: &mut World, stakers: &[Staker]) -> Vec<u64> {
+        stakers
+            .iter()
+            .map(|s| {
+                let lp = token_amount(&w.svm, &s.lp_ata);
+                let b0 = token_amount(&w.svm, &s.ata);
+                let r = withdraw_v5(w, s, lp, true);
+                assert!(r.is_ok(), "post-close FIRST_LOSS withdraw: {}", logs(&r));
+                token_amount(&w.svm, &s.ata) - b0
+            })
+            .collect()
+    }
+    let Some((mut c, c_stakers)) = first_loss_closed_world(
+        "f9_v5_first_loss_post_close_books_unbooked_control",
         &[4_000_000],
     ) else {
         return;
     };
-    const EXTRA: u64 = 7_777_777;
-    let mut acct = w.svm.get_account(&w.pool).unwrap();
-    {
-        let p: &mut StakePool = bytemuck::from_bytes_mut(&mut acct.data[..STAKE_POOL_SIZE]);
-        p.set_terminal_unclaimed_atoms(EXTRA - 1_000_000);
-    }
-    w.svm.set_account(w.pool, acct).unwrap();
-    let bal = token_amount(&w.svm, &w.vault);
-    let (vault, mint, va) = (w.vault, w.mint, w.vault_auth);
-    set_token_account(&mut w.svm, vault, &mint, &va, bal + EXTRA);
-    let u0 = untouchable(&w);
-    assert_eq!(u0.unclaimed, EXTRA - 1_000_000);
-    for s in &stakers {
-        let lp = token_amount(&w.svm, &s.lp_ata);
-        post_close_withdraw_exact(&mut w, s, lp);
-    }
-    assert_eq!(
-        untouchable(&w),
-        u0,
-        "extra atoms and unclaimed record untouched"
+    forge(&mut c);
+    let r = recover_terminal_v5(&mut c, 0);
+    assert!(r.is_ok(), "control tag 29 (amount 0) on the tombstone: {}", logs(&r));
+    let c_paid = exit_each(&mut c, &c_stakers);
+
+    let Some((mut w, stakers)) = first_loss_closed_world(
+        "f9_v5_first_loss_post_close_books_unbooked_direct",
+        &[4_000_000],
+    ) else {
+        return;
+    };
+    forge(&mut w);
+    let creator0 = token_amount(&w.svm, &w.creator_ata);
+    let paid = exit_each(&mut w, &stakers);
+    assert_eq!(paid, c_paid, "every staker gets the tag-29-first control's payout");
+    assert!(
+        paid.iter().sum::<u64>() > c_paid.len() as u64,
+        "PIN: the payouts are non-trivial"
     );
-    assert!(token_amount(&w.svm, &w.vault) >= EXTRA);
+    assert_eq!(token_amount(&w.svm, &w.vault), token_amount(&c.svm, &c.vault), "same residue");
+    assert_eq!(
+        token_amount(&w.svm, &w.creator_ata),
+        token_amount(&c.svm, &c.creator_ata),
+        "the creator gets nothing more on either path"
+    );
+    let p0 = read_pool(&w.svm, &w.pool);
+    let r = recover_terminal_v5(&mut w, 0);
+    assert!(
+        r.is_ok() || custom(&r) == Some(31),
+        "tag 29 afterwards: {}",
+        logs(&r)
+    );
+    let p1 = read_pool(&w.svm, &w.pool);
+    assert_eq!(p1.total_returned, p0.total_returned, "no double booking (principal)");
+    assert_eq!(p1.total_fees_earned, p0.total_fees_earned, "no double booking (fees)");
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), creator0);
 }
 
 /// The post-close path is taken ONLY for the pool's own bound market. A wrapper-owned 16-byte
