@@ -1282,3 +1282,125 @@ fn gh311_fo_withdraw_without_slab_books_nothing() {
     assert!(paid <= BOB, "no booking without the slab (paid {paid})");
     assert_eq!(w.tpv(), tpv_before - paid);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GH#309 port on the close-out line (#313 gate condition 3 / F-3): a Withdraw on the CloseSlab
+// tombstone books with the units figure before it prices
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// tag 41 -> tag 30 -> Withdraw (no tag 29 in between): tag 30 reserved the seed cap alone; the
+/// Withdraw reads the surviving units ledger raw and books whatever the seed cap over-reserved,
+/// so bob is paid exactly the tag-29-first control. A later tag 29 (amount 0) then forwards the
+/// creator's exact share and books nothing twice. Kind::Loss is F-3's case (seed > true share);
+/// Plain and Growth pin that nothing else moves.
+fn direct41_close_then_withdraw(kind: Kind) {
+    let c = control(kind);
+    let (mut w, _alice, bob) = fl_scene(kind);
+    assert!(direct_tag41(&mut w, FUND).is_ok());
+    let r = close_slab(&mut w);
+    assert!(r.is_ok(), "AdminCloseSlab: {}", logs(&r));
+    assert_eq!(w.terminal(), WrapperTerminal::Closed);
+    let seed = w.pool().creator_seed_atoms();
+    assert_eq!(
+        w.vault_balance() - w.tpv(),
+        seed,
+        "{kind:?}: tag 30 reserves the seed cap"
+    );
+    assert!(
+        w.units().is_some(),
+        "PIN: the units ledger survives CloseSlab"
+    );
+    let share = fl_creator_share(&w, kind);
+    if kind == Kind::Loss {
+        assert!(share < seed, "PIN: F-3 scene, seed {seed} > share {share}");
+    }
+    let paid = exit_all(&mut w, &bob, Tail::V5);
+    assert_eq!(
+        paid, c.bob_paid,
+        "{kind:?}: Withdraw on the tombstone pays the control (got {paid}, control {})",
+        c.bob_paid
+    );
+    assert_eq!(
+        w.vault_balance() - w.tpv(),
+        share,
+        "{kind:?}: only the creator's true share left unbooked"
+    );
+    let before = w.pool();
+    let r = recover_terminal(&mut w, 0);
+    assert!(r.is_ok(), "tag 29 on the tombstone: {}", logs(&r));
+    assert_eq!(
+        token_amount(&w.svm, &w.creator_ata),
+        c.creator_got,
+        "{kind:?}: creator gets the control's share"
+    );
+    let after = w.pool();
+    assert_eq!(after.total_returned, before.total_returned, "no double booking (principal)");
+    assert_eq!(after.total_fees_earned, before.total_fees_earned, "no double booking (fees)");
+    assert_eq!(w.vault_balance(), w.tpv(), "vault == books");
+}
+
+#[test]
+fn gh309_fl_direct_tag41_close_slab_then_withdraw_pays_the_control() {
+    direct41_close_then_withdraw(Kind::Plain);
+}
+
+#[test]
+fn gh309_fl_growth_direct_tag41_close_slab_then_withdraw_pays_the_control_forged_seed() {
+    direct41_close_then_withdraw(Kind::Growth);
+}
+
+#[test]
+fn gh309_fl_loss_direct_tag41_close_slab_then_withdraw_pays_the_control_forged_ledger() {
+    direct41_close_then_withdraw(Kind::Loss);
+}
+
+/// On the tombstone account 11 must still be the units PDA for this market (raw read, same checks
+/// as tag 29): a random key is refused before anything is booked.
+#[test]
+fn gh309_fl_tombstone_withdraw_with_a_wrong_units_account_is_refused() {
+    let (mut w, _alice, bob) = fl_scene(Kind::Loss);
+    assert!(direct_tag41(&mut w, FUND).is_ok());
+    assert!(close_slab(&mut w).is_ok());
+    assert_eq!(w.terminal(), WrapperTerminal::Closed);
+    let before = w.pool();
+    let lp = token_amount(&w.svm, &bob.lp_ata);
+    let r = withdraw(&mut w, &bob, lp, Tail::V5WrongUnits);
+    assert_eq!(custom(&r), Some(E_INSURANCE_UNITS_INVALID), "{}", logs(&r));
+    let after = w.pool();
+    assert_eq!(after.total_returned, before.total_returned);
+    assert_eq!(after.total_fees_earned, before.total_fees_earned);
+}
+
+/// On the tombstone a units ledger that is not the wrapper's (same address, foreign owner) is
+/// refused: the raw read checks the owner, as tag 29 does.
+#[test]
+fn gh309_fl_tombstone_withdraw_with_a_foreign_owned_units_ledger_is_refused() {
+    let (mut w, _alice, bob) = fl_scene(Kind::Loss);
+    assert!(direct_tag41(&mut w, FUND).is_ok());
+    assert!(close_slab(&mut w).is_ok());
+    let mut acct = w.svm.get_account(&w.units).unwrap();
+    acct.owner = Pubkey::new_unique();
+    let units = w.units;
+    w.svm.set_account(units, acct).unwrap();
+    let lp = token_amount(&w.svm, &bob.lp_ata);
+    let r = withdraw(&mut w, &bob, lp, Tail::V5);
+    assert_eq!(custom(&r), Some(E_INSURANCE_UNITS_INVALID), "{}", logs(&r));
+}
+
+/// FEE_ONLY on the tombstone: tag 30 already booked with the seed cap, which IS the FEE_ONLY
+/// share (`None`, as tag 29 uses), so the Withdraw books nothing more and pays the control.
+#[test]
+fn gh309_fo_growth_direct_tag41_close_slab_then_withdraw_pays_the_control_forged_seed() {
+    let c = fo_control(true);
+    let (mut w, _alice, bob) = fo_scene(true);
+    assert!(direct_tag41(&mut w, SEED).is_ok());
+    let r = close_slab(&mut w);
+    assert!(r.is_ok(), "AdminCloseSlab: {}", logs(&r));
+    assert_eq!(w.terminal(), WrapperTerminal::Closed);
+    let paid = exit_all(&mut w, &bob, Tail::Slab);
+    assert_eq!(paid, c.bob_paid, "FEE_ONLY: bob gets what the control pays");
+    assert_eq!(w.vault_balance() - w.tpv(), SEED_LOW, "the seed stays unbooked");
+    assert!(recover_terminal(&mut w, 0).is_ok());
+    assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED_LOW);
+    assert_eq!(w.vault_balance(), w.tpv(), "vault == books");
+}
