@@ -1544,8 +1544,11 @@ fn process_withdraw(
     // ledger once, BEFORE the terminal booking below, which needs its creator-class figure.
     // Same accounts and checks as before (PDA, owner, market, wrapper, fresh snap_slot); only
     // the read moved up from the pricing arm.
-    // GH#309: not on a CloseSlab tombstone (the wrapper cannot refresh a closed market's
-    // ledger); that path prices against the liquid value alone (below).
+    //
+    // GH#309 tombstone: the wrapper cannot refresh the ledger of a closed market, but the ledger
+    // survives CloseSlab and its `creator_paid_to_stake` is final. Read it raw, exactly as tag 29
+    // does on a tombstone (`v5_read_units_closed`), so the booking below uses the units figure and
+    // not the seed cap (#313 gate condition 3 / F-3). It is not used for pricing (see below).
     let first_loss_v5 = !pool.tranche_enabled() && pool.is_first_loss();
     let v5_units = if first_loss_v5 && !post_close {
         Some(v5_read_units(
@@ -1559,12 +1562,18 @@ fn process_withdraw(
     } else {
         None
     };
+    let closed_units = if first_loss_v5 && post_close {
+        v5_read_units_closed(pool, v5_units_ai.ok_or(ProgramError::NotEnoughAccountKeys)?)?
+    } else {
+        None
+    };
 
     // GH#311 (close-out line): a permissionless direct wrapper tag 41 may already have paid a
     // Resolved market's insurance into pool.vault. Book it now, exactly as tag 29 would, so this
     // withdrawal is not priced against unbooked value (the creator's close-out share stays
-    // unbooked for tag 29 to forward).
-    let creator_class_released = match v5_units {
+    // unbooked for tag 29 to forward). On a tombstone this also books what AdminCloseSlab
+    // reserved above the creator's true share (it reserves the seed cap alone).
+    let creator_class_released = match v5_units.or(closed_units) {
         Some(u) => Some(u64::try_from(u.creator_paid_to_stake).map_err(|_| StakeError::Overflow)?),
         None => None,
     };
@@ -2802,6 +2811,33 @@ fn v5_read_units<'a>(
     Ok(u)
 }
 
+/// GH#309 port (#313 gate condition 3): read the unit ledger of a CloseSlab TOMBSTONE without a
+/// refresh (the wrapper cannot refresh a closed market; the ledger survives CloseSlab, and its
+/// `creator_paid_to_stake` is final once the market is terminal). Same checks as tag 29 on a
+/// tombstone: the PDA under `pool.percolator_program` for `pool.slab`, owned by the wrapper, and
+/// the pinned layout bound to this market. An UNCREATED ledger is accepted only when no staker
+/// principal was ever flushed (`total_flushed == 0`: never unitised) and gives `None`, the seed
+/// cap, as tag 29 uses. The caller must already have proved `pool.slab` is the tombstone.
+fn v5_read_units_closed(
+    pool: &state::StakePool,
+    ins_units: &AccountInfo<'_>,
+) -> Result<Option<state::WrapperInsUnits>, ProgramError> {
+    let wrapper = Pubkey::new_from_array(pool.percolator_program);
+    let (expected, _) = state::derive_wrapper_ins_units(&wrapper, &pool.slab_pubkey());
+    if *ins_units.key != expected {
+        return Err(StakeError::InsuranceUnitsInvalid.into());
+    }
+    if *ins_units.owner == wrapper {
+        let u = state::read_wrapper_ins_units(&ins_units.try_borrow_data()?, &pool.slab)
+            .ok_or(StakeError::InsuranceUnitsInvalid)?;
+        return Ok(Some(u));
+    }
+    if ins_units.data_is_empty() && pool.total_flushed == 0 {
+        return Ok(None);
+    }
+    Err(StakeError::InsuranceUnitsInvalid.into())
+}
+
 /// S-1: re-read the wrapper's unit ledger after a sync CPI (same account checks as
 /// `v5_read_units`: owner = the pool's wrapper, layout, market, class invariant).
 fn v5_units_after_cpi(
@@ -2918,17 +2954,21 @@ fn pre_accrue_fee_modes(
 /// makes after its forward. So the withdrawer is priced at exactly what tag 29 would book, the
 /// creator never loses its share, and a later tag 29 books nothing twice.
 ///
-/// Gated, like tag 29, on the bound market being RESOLVED (read from the wrapper's own mode):
+/// Gated, like tag 29, on the bound market being TERMINAL (read from the wrapper's own bytes):
+/// * Resolved: books as above.
+/// * Closed tombstone (GH#309 port, #313 gate condition 3): books the same way. AdminCloseSlab
+///   reserved the seed cap alone (`None`), which is >= the creator's true share on a unitised
+///   FIRST_LOSS market; with the units figure this books that excess to the stakers before the
+///   withdrawer is priced, exactly as a tag 29 (amount 0) on the tombstone would.
 /// * Live / Recovery: nothing is booked (#290: a Live-mode donation is not recovery).
-/// * Closed tombstone: unreachable here (`pre_accrue_fee_modes` needs a live market account for
-///   a mode-0 pool), and AdminCloseSlab books at the close.
 /// * No slab passed (optional on FEE_ONLY / legacy Withdraw): nothing is booked; redeeming at
 ///   the unbooked price can only under-pay the withdrawer, never over-pay.
 /// * Unpinned layout: nothing is booked (never worse than before).
 ///
 /// `creator_class_released`: FIRST_LOSS = the wrapper's `creator_paid_to_stake` from the ledger
 /// the Withdraw has just refreshed and checked (`v5_read_units`: PDA, owner, market, fresh
-/// snap_slot), exactly the figure tag 29 reads; otherwise `None`, as tag 29 uses.
+/// snap_slot; on a tombstone `v5_read_units_closed`: PDA, owner, market, no refresh), exactly
+/// the figure tag 29 reads; otherwise `None`, as tag 29 uses.
 ///
 /// The caller must have verified `pool.vault == vault.key`, and must call this after
 /// `pre_accrue_fee_modes` (tag-87 fees first, as tag 29 does) and before its own transfer.
@@ -2947,8 +2987,11 @@ fn book_terminal_surplus_before_pricing(
     if slab.key.to_bytes() != pool.slab || slab.owner.to_bytes() != pool.percolator_program {
         return Err(StakeError::InvalidAccount.into());
     }
-    if state::read_wrapper_terminal(&slab.try_borrow_data()?) != state::WrapperTerminal::Resolved {
-        return Ok(());
+    match state::read_wrapper_terminal(&slab.try_borrow_data()?) {
+        state::WrapperTerminal::Resolved | state::WrapperTerminal::Closed => {}
+        state::WrapperTerminal::NotTerminal | state::WrapperTerminal::UnknownLayout => {
+            return Ok(())
+        }
     }
     let balance = token_balance(vault)?;
     let (reserved, to_returned, to_fees) =
