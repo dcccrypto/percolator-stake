@@ -1404,3 +1404,50 @@ fn gh309_fo_growth_direct_tag41_close_slab_then_withdraw_pays_the_control_forged
     assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED_LOW);
     assert_eq!(w.vault_balance(), w.tpv(), "vault == books");
 }
+
+/// On the tombstone account 11 must be the units PDA itself: a wrapper-owned COPY of the real
+/// ledger (same bytes, same market) at another address is refused (35), so the raw read cannot be
+/// fed a stale or doctored copy.
+#[test]
+fn gh309_fl_tombstone_withdraw_with_a_copied_units_ledger_is_refused() {
+    let (mut w, _alice, bob) = fl_scene(Kind::Loss);
+    assert!(direct_tag41(&mut w, FUND).is_ok());
+    assert!(close_slab(&mut w).is_ok());
+    let copy = Pubkey::new_unique();
+    let acct = w.svm.get_account(&w.units).unwrap();
+    assert_eq!(acct.owner, w.wrapper_id, "PIN: the copy is wrapper-owned");
+    w.svm.set_account(copy, acct).unwrap();
+    let real = w.units;
+    w.units = copy;
+    let lp = token_amount(&w.svm, &bob.lp_ata);
+    let r = withdraw(&mut w, &bob, lp, Tail::V5);
+    w.units = real;
+    assert_eq!(custom(&r), Some(E_INSURANCE_UNITS_INVALID), "{}", logs(&r));
+}
+
+/// On the tombstone an UNCREATED units ledger is accepted only when no staker principal was ever
+/// flushed; here 6M was (`total_flushed > 0`), so an emptied PDA is refused (35) rather than
+/// falling back to the seed cap.
+#[test]
+fn gh309_fl_tombstone_withdraw_with_an_uncreated_ledger_after_a_flush_is_refused() {
+    let (mut w, _alice, bob) = fl_scene(Kind::Loss);
+    assert!(direct_tag41(&mut w, FUND).is_ok());
+    assert!(close_slab(&mut w).is_ok());
+    assert!(w.pool().total_flushed > 0, "PIN: the scene flushed principal");
+    let units = w.units;
+    w.svm
+        .set_account(
+            units,
+            solana_sdk::account::Account {
+                lamports: 0,
+                data: vec![],
+                owner: system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let lp = token_amount(&w.svm, &bob.lp_ata);
+    let r = withdraw(&mut w, &bob, lp, Tail::V5);
+    assert_eq!(custom(&r), Some(E_INSURANCE_UNITS_INVALID), "{}", logs(&r));
+}
