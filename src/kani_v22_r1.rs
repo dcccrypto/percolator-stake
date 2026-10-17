@@ -282,3 +282,143 @@ fn kani_v22_st7d_book_fee_delta_routes_to_real_holders() {
         kani::cover!(!p.tranche_enabled() && j == 0, "non-tranche: all to senior");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// Kani review 2026-10-14 (stake lane, ~/wt-v22-kanirev/review/stake-sweep.md). ADDITIVE ONLY: the
+// harnesses above are unchanged. Run with `--lib -Z stubbing`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Log-only stubs. `msg!` = `solana_msg::sol_log(&format!(..))`; on the host target `sol_log` is a
+/// `println!`, whose stdout LineWriter runs `memchr_naive` over a symbolic-length string: the frozen
+/// st7c run spent its whole 1,802 s unwinding that loop (7,164 `Unwinding loop ... memchr_naive`
+/// lines, 0 SAT calls; ~/percolator-ops/artifacts/kani-v22-final/run/logs/
+/// percolator-stake:kani_v22_st7c_no_real_lp_nothing_booked.log). Neither function writes program
+/// state, so replacing them by no-ops is exact for every state assertion below.
+fn rv_sol_log_noop(_m: &str) {}
+fn rv_format_empty(_a: core::fmt::Arguments<'_>) -> String {
+    String::new()
+}
+
+/// RV-7: ST-7c (`kani_v22_st7c_no_real_lp_nothing_booked`, NO-VERDICT) with ONLY the log stubs
+/// added; body, assumes, asserts and covers identical. Mutants ST-M8 / ST-M9.
+#[kani::proof]
+#[kani::stub(solana_program::log::sol_log, rv_sol_log_noop)]
+#[kani::stub(std::fmt::format, rv_format_empty)]
+fn rv_st7c_no_real_lp_nothing_booked_logstub() {
+    let (mut p, g) = any_pool(0, false);
+    p.pool_mode = kani::any::<bool>() as u8;
+    p.risk_mode = kani::any();
+    p.total_deposited = kani::any::<u32>() as u64;
+    p.total_withdrawn = kani::any::<u32>() as u64;
+    p.total_flushed = kani::any::<u32>() as u64;
+    p.total_returned = kani::any::<u32>() as u64;
+    p.total_fees_earned = kani::any::<u32>() as u64;
+    p.total_recovered_from_wrapper = kani::any::<u32>() as u64;
+    p.mode0_fees_attributed = kani::any::<u32>() as u64;
+    p.set_fee_attribution_armed(kani::any());
+    p.set_junior_balance(kani::any::<u32>() as u64);
+    assert_eq!(p.real_lp_supply(), 0);
+    let pv0 = p.total_pool_value();
+    kani::assume(pv0.is_some());
+    let (fees0, jb0) = (p.total_fees_earned, p.junior_balance());
+    let bal = kani::any::<u32>() as u64;
+    let paid: Option<u128> = if kani::any() { Some(kani::any::<u32>() as u128) } else { None };
+    let mut q = p;
+    let r = accrue_fees_inner(&mut q, bal, paid);
+    if r.is_ok() {
+        assert_eq!((q.total_fees_earned, q.junior_balance()), (fees0, jb0), "nothing booked");
+        assert_eq!(q.total_pool_value(), pv0);
+    }
+    let mut t = p;
+    let tr = t.book_terminal_recovery(bal);
+    let t_ok = tr.is_ok();
+    if let Ok((_, to_fees)) = tr {
+        assert_eq!(to_fees, 0, "F-9 books no fee leg without real LP");
+        assert_eq!((t.total_fees_earned, t.junior_balance()), (fees0, jb0));
+    }
+    kani::cover!(t_ok, "F-9 Ok reached (review round 3 T2)");
+    let two = !g.legacy && g.ds == M && g.dj == M;
+    kani::cover!(two && p.pool_mode == 1 && r.is_ok() && bal > pv0.unwrap(), "two floors, mode-1 surplus, skipped");
+    kani::cover!(
+        p.pool_mode == 0 && p.is_first_loss() && r.is_ok() && q.mode0_fees_attributed > p.mode0_fees_attributed,
+        "S2 backlog consumed unbooked"
+    );
+    kani::cover!(two && bal > pv0.unwrap() + p.wrapper_recoverable(), "F-9 surplus beyond recoverable, no fee leg");
+    // review add: the accrue asserts are reached with a real surplus on BOTH modes
+    kani::cover!(r.is_ok() && p.pool_mode == 0 && paid.is_some() && bal > pv0.unwrap(), "mode-0 surplus, nothing booked");
+}
+
+/// RV-8: ST-7b (`kani_v22_st7b_floor_flags_track_dead_shares`, PASS 3/3) verbatim plus covers on
+/// the UNFLAGGED branch (f == 0), whose assert had no cover in the original.
+#[kani::proof]
+#[kani::unwind(4)]
+fn rv_st7b_floor_flags_unflagged_covered() {
+    let (mut p, mut g) = any_pool(u16::MAX as u64, true);
+    let mut unflagged_nonempty = false;
+    let mut unflagged_empty_after_burn = false;
+    let mut k = 0;
+    while k < 3 {
+        let before = p.floor_flags();
+        let op: u8 = kani::any();
+        let lp = kani::any::<u16>() as u64;
+        let mut burned = false;
+        match op % 5 {
+            0 => {
+                let sb = if p.tranche_enabled() { p.senior_total_lp() } else { p.total_lp_supply };
+                if let Ok(minted) = apply_minimum_liquidity_lock(sb, lp) {
+                    if sb == 0 {
+                        p.record_floor_lock(false);
+                        g.ds = M;
+                    }
+                    p.total_lp_supply += lp;
+                    g.rs += minted;
+                }
+            }
+            1 => {
+                if p.tranche_enabled() {
+                    let jb = p.junior_total_lp();
+                    if let Ok(minted) = apply_minimum_liquidity_lock(jb, lp) {
+                        if jb == 0 {
+                            p.record_floor_lock(true);
+                            g.dj = M;
+                        }
+                        p.total_lp_supply += lp;
+                        p.set_junior_total_lp(jb + lp);
+                        g.rj += minted;
+                    }
+                }
+            }
+            2 => {
+                let b = lp.min(g.rs);
+                p.total_lp_supply -= b;
+                g.rs -= b;
+                burned = b > 0;
+            }
+            3 => {
+                let b = lp.min(g.rj);
+                p.total_lp_supply -= b;
+                p.set_junior_total_lp(p.junior_total_lp() - b);
+                g.rj -= b;
+                burned = b > 0;
+            }
+            _ => p.set_tranche_enabled(true),
+        }
+        let f = p.floor_flags();
+        assert_eq!(before & !f, 0, "a floor flag never clears");
+        assert_eq!(p.real_lp_supply(), g.rs + g.rj, "real LP exact");
+        assert_eq!(p.total_lp_supply, g.ds + g.dj + g.rs + g.rj);
+        if f == 0 {
+            unflagged_nonempty |= p.total_lp_supply > M && g.rs + g.rj > 0;
+            unflagged_empty_after_burn |= burned && p.total_lp_supply == M;
+            assert!(g.ds + g.dj == if p.total_lp_supply == 0 { 0 } else { M }, "unflagged: empty or one legacy floor");
+        } else {
+            assert_eq!(f & !(FLOOR_SENIOR | FLOOR_JUNIOR), 0);
+            assert_eq!(f & FLOOR_SENIOR != 0, g.ds == M, "senior bit iff senior holds its dead floor");
+            assert_eq!(f & FLOOR_JUNIOR != 0, g.dj == M, "junior bit iff junior holds its dead floor");
+            assert_eq!((p.real_senior_lp(), p.real_junior_lp()), (g.rs, g.rj));
+        }
+        k += 1;
+    }
+    kani::cover!(unflagged_nonempty, "unflagged legacy pool with real LP checked after a step");
+    kani::cover!(unflagged_empty_after_burn, "unflagged legacy pool burned down to its one floor");
+}

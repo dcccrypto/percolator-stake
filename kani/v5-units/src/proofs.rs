@@ -49,3 +49,46 @@ fn st3_recover_burn_matches_wrapper() {
     );
     assert_eq!(stake, ins_units_to_burn(r as u128, u, i));
 }
+
+// ── Kani review 2026-10-14 (stake lane): z3 copies of ST-3a / ST-3b. ADDITIVE ONLY; the bodies are
+// the originals verbatim, only the solver differs. Both sides compute `a.checked_mul(b)` then a
+// u128 division, so under SAT two separate multiplier/divider circuits must be proved equal (the
+// frozen run: NO-VERDICT 1,803 s each); z3 reasons at word level, where equal terms collapse.
+
+/// RV-9: ST-3a under z3.
+#[kani::proof]
+#[kani::solver(z3)]
+fn rv_st3_topup_units_match_wrapper_z3() {
+    let a: u32 = kani::any();
+    let u: u32 = kani::any();
+    let i: u32 = kani::any();
+    let (a, u, i) = (a as u64, u as u128, i as u128);
+    let stake = expected_topup_units(a, u, i);
+    if ins_units_reset_needed(u, i) {
+        kani::cover!(true, "reset arm (U > 0, I_mint == 0)");
+        assert_eq!(stake, ins_units_for_topup(a as u128, 0, i));
+        assert_eq!(stake, Some(a as u128));
+    } else {
+        kani::cover!(u == 0, "genesis arm");
+        kani::cover!(u > 0 && i > 0 && stake != Some(a as u128), "pro-rata arm, not 1:1");
+        assert_eq!(stake, ins_units_for_topup(a as u128, u, i));
+    }
+}
+
+/// RV-10: ST-3b under z3.
+#[kani::proof]
+#[kani::solver(z3)]
+fn rv_st3_recover_burn_matches_wrapper_z3() {
+    let r: u32 = kani::any();
+    let u: u32 = kani::any();
+    let i: u32 = kani::any();
+    let (r, u, i) = (r as u64, u as u128, i as u128);
+    let stake = expected_recover_burn(r, u, i);
+    kani::cover!(stake.is_some(), "a burn is computed");
+    kani::cover!(stake.is_none() && u > 0 && i > 0, "r above I_free refused");
+    kani::cover!(
+        stake.is_some_and(|b| b * i != r as u128 * u),
+        "inexact division (the ceil rounds up)"
+    );
+    assert_eq!(stake, ins_units_to_burn(r as u128, u, i));
+}
