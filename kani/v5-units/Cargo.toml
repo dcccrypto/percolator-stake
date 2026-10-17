@@ -1,0 +1,24 @@
+[package]
+name = "stake-v5-units-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ST-3: stake v5 expected units == the wrapper's unit ledger. Path-includes the PRODUCTION files (stake src/math.rs; wrapper src/p4_rescue_ins.rs, src/vault_lp_v18.rs, src/growth_v19.rs); no copies."
+
+# Standalone so it builds against the sibling worktrees without the wrapper's Solana deps.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# growth_v19.rs (path-included) calls percolator::band_rent.
+percolator = { path = "../../../percolator" }
+
+[features]
+# The wrapper files carry #[cfg(feature = "devnet")] items (growth_v19 band caps): build the
+# deployed flavour with `--features devnet`; the harnesses here do not depend on those items.
+devnet = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
