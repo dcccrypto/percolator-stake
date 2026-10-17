@@ -35,8 +35,8 @@
 //! Tag 28 MOVED from Group B to Group A. Wrapper #455 re-gated tag 55 on
 //! marketauth ("like every other market-wide setter"), and `InitPool` rotates
 //! marketauth to the pool PDA — so the pool PDA is now the correct signer and
-//! vault_auth is refused. See the note on `tag55_*` for why that test is
-//! ignored until the wrapper carrying #455 is deployed.
+//! vault_auth is refused. The `tag55_*` test was ignored until a wrapper carrying
+//! #455 was deployed; it is live since the deployed wrapper c659c91d includes it.
 //!
 //! Wrapper tag 51 is the setter for `backing_trade_fee_bps`. On a staked market
 //! nobody could set it, which is the mechanical root of the standing
@@ -1064,9 +1064,6 @@ fn tag51_backing_fee_direct_dies_after_bind_and_proxy_restores_it() {
 /// WRAPPER_DEPLOYED past #455 (0cc58c7c), the #287 drift guard fails and forces
 /// this file's pin to be bumped. Delete this attribute in the same commit.
 #[test]
-#[ignore = "GH#286: needs a wrapper deployed at/after #455; the deployed wrapper \
-            gates tag 55 on the per-asset authority, the new one on marketauth, \
-            and the proxy can only present one signer"]
 fn tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it() {
     let Some(mut e) = env() else { return };
 
