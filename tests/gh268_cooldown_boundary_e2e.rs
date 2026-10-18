@@ -5,6 +5,8 @@
 //! withdrawal at exactly `last_deposit_slot + cooldown_slots` passed and every configured
 //! cooldown was one slot short at the edge.
 //!
+//! Also pins AUD-FC-B6: a FIRST_LOSS Withdraw needs the staker writable, not the fee payer.
+//!
 //! Real stake .so + real wrapper .so under LiteSVM, same harness as
 //! `f3_dead_share_accrue_guard_e2e.rs` (FIRST_LOSS pool, real InitPool / Deposit / Withdraw).
 //! Rebuild `target/deploy/percolator_stake.so` after changing source, or these tests exercise
@@ -615,6 +617,48 @@ fn gh268_redeposit_restarts_an_exclusive_cooldown() {
     try_withdraw(&mut w, &s, lp).unwrap_or_else(|e| {
         panic!(
             "past the restarted boundary.\nLogs:\n{}",
+            e.meta.logs.join("\n")
+        )
+    });
+    assert_eq!(token_amount(&w.svm, &s.lp_ata), 0);
+}
+
+/// AUD-FC-B6 (assessed, not a program bug): a FIRST_LOSS Withdraw does NOT need the staker as
+/// the transaction fee payer. It needs the staker WRITABLE, because it is the payer of the
+/// wrapper units-refresh CPI (tag 116 takes its payer writable). Every test in this file signs
+/// with a separate fee payer (`w.payer`) and a writable staker and succeeds; a READ-ONLY staker
+/// is refused by the runtime with PrivilegeEscalation, and nothing moves. The account doc for
+/// Withdraw (and Deposit) account 0 now says `[signer, writable]`.
+#[test]
+fn fcb6_withdraw_needs_a_writable_staker_not_the_fee_payer() {
+    let mut w = world("fcb6_withdraw_needs_a_writable_staker_not_the_fee_payer", 5);
+    let s = deposit(&mut w, 2_000);
+    let lp = token_amount(&w.svm, &s.lp_ata);
+    let boundary = last_deposit_slot(&w, &s) + 5;
+    warp_to(&mut w, boundary + 1);
+
+    // Read-only staker, separate fee payer: refused before any token moves.
+    let mut ix = withdraw_ix(w.stake_id, &s.kp.pubkey(), &w.accts, s.ata, s.lp_ata, lp);
+    ix.accounts[0] = AccountMeta::new_readonly(s.kp.pubkey(), true);
+    w.svm.expire_blockhash();
+    let err = send(&mut w.svm, &w.payer, &[&s.kp], ix)
+        .expect_err("a read-only staker cannot pay the units-refresh CPI");
+    assert_eq!(
+        err.err,
+        solana_sdk::transaction::TransactionError::InstructionError(
+            2,
+            solana_sdk::instruction::InstructionError::PrivilegeEscalation
+        ),
+        "logs:\n{}",
+        err.meta.logs.join("\n")
+    );
+    assert_eq!(token_amount(&w.svm, &s.lp_ata), lp);
+
+    // Writable staker, still NOT the fee payer: succeeds.
+    assert_ne!(w.payer.pubkey(), s.kp.pubkey());
+    try_withdraw(&mut w, &s, lp).unwrap_or_else(|e| {
+        panic!(
+            "writable staker, separate fee payer.\nLogs:\n{}",
             e.meta.logs.join("\n")
         )
     });

@@ -107,7 +107,10 @@ pub enum StakeInstruction {
     /// 1: Deposit collateral into the stake vault. Mints LP tokens pro-rata.
     ///
     /// Accounts:
-    ///   0. `[signer]` User depositing
+    ///   0. `[signer, writable]` User depositing. Writable because it pays: the deposit PDA's
+    ///      rent on first use, and on v5 FIRST_LOSS pools the wrapper units-refresh CPI (tag
+    ///      116 takes its payer writable). It does NOT have to be the transaction fee payer
+    ///      (AUD-FC-B6); a read-only staker fails with PrivilegeEscalation.
     ///   1. `[writable]` Pool PDA
     ///   2. `[writable]` User's collateral token account (source)
     ///   3. `[writable]` Pool vault token account (destination)
@@ -145,10 +148,14 @@ pub enum StakeInstruction {
         hysteresis_bps: u16,
     },
 
-    /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown.
+    /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown, which is exclusive at
+    /// its boundary: the slot must be > `last_deposit_slot + cooldown_slots` (GH#268).
     ///
     /// Accounts:
-    ///   0. `[signer]` User withdrawing
+    ///   0. `[signer, writable]` User withdrawing. Writable on v5 FIRST_LOSS pools: it pays the
+    ///      wrapper units-refresh CPI (tag 116 takes its payer writable). It does NOT have to be
+    ///      the transaction fee payer (AUD-FC-B6); a read-only staker fails with
+    ///      PrivilegeEscalation.
     ///   1. `[writable]` Pool PDA
     ///   2. `[writable]` User's LP token account (source, tokens burned)
     ///   3. `[writable]` LP mint (to burn)

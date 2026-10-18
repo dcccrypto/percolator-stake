@@ -79,3 +79,59 @@ fn init_trading_pool_doc_still_defers_to_init_pool() {
         "InitTradingPool doc no longer defers to InitPool's account list: {block:#?}"
     );
 }
+
+/// Body of `fn <name>(` in processor.rs, up to the next top-level `fn`.
+fn processor_fn_body(name: &str) -> &'static str {
+    let start = PROCESSOR_RS
+        .find(&format!("\nfn {name}("))
+        .unwrap_or_else(|| panic!("{name} not found"));
+    let rest = &PROCESSOR_RS[start + 1..];
+    let end = rest[1..].find("\nfn ").map(|e| e + 1).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn account0_flags(variant_decl: &str) -> &'static str {
+    let block = doc_block_for(variant_decl);
+    let line = block
+        .iter()
+        .find(|l| l.contains("0. `["))
+        .unwrap_or_else(|| panic!("{variant_decl:?} doc has no account-0 line: {block:#?}"));
+    line.split('`').nth(1).expect("account line has no `[..]` flag group")
+}
+
+/// AUD-FC-B6: the staker is the payer of the deposit-PDA rent (Deposit) and, on v5 FIRST_LOSS
+/// pools, of the wrapper units-refresh CPI (Deposit and Withdraw; `cpi_refresh_ins_units` passes
+/// it as `AccountMeta::new(payer, true)`). The runtime therefore needs the staker WRITABLE in the
+/// outer transaction, otherwise the CPI fails with PrivilegeEscalation. The doc listed it as
+/// `[signer]` only, so a relayer-style client (fee payer != staker) following the doc built a
+/// transaction that always fails. If the handler passes `user` as a payer, the doc must say
+/// `writable`.
+#[test]
+fn fc_b6_staker_is_documented_writable_where_it_pays() {
+    let deposit = processor_fn_body("process_deposit");
+    assert!(
+        deposit.contains("create_or_adopt_pda(\n            deposit_pda,\n            user,")
+            && deposit.contains("v5_read_units(\n            pool,\n            user,"),
+        "precondition: process_deposit pays the deposit PDA and the units refresh from `user`; \
+         if that changed, revisit this test"
+    );
+    let withdraw = processor_fn_body("process_withdraw");
+    assert!(
+        withdraw.contains("v5_read_units(") && withdraw.contains("            user,\n"),
+        "precondition: process_withdraw pays the units refresh from `user`; if that changed, \
+         revisit this test"
+    );
+    let cpi_rs = include_str!("../src/cpi.rs");
+    assert!(
+        cpi_rs.contains("AccountMeta::new(*payer.key, true),"),
+        "precondition: the units-refresh CPI takes its payer writable"
+    );
+    for decl in ["    Deposit { amount: u64 },", "    Withdraw { lp_amount: u64 },"] {
+        let flags = account0_flags(decl);
+        assert!(
+            flags.contains("signer") && flags.contains("writable"),
+            "{decl:?} documents the staker as {flags}, but the handler makes it a payer, so it \
+             must be writable (AUD-FC-B6)"
+        );
+    }
+}
