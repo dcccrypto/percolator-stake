@@ -18,6 +18,11 @@
 //! Drives the real `percolator_stake.so` against the real `percolator_prog.so` through
 //! LiteSVM dispatch; no pool state is hand-set. Conventions follow
 //! `mode0_pre_accrue_dilution_e2e.rs` and `v17_stake_insurance_e2e.rs`.
+//!
+//! AUD-T2-3 (2026-10-18): the five PoC / regression tests built on a real FlushToInsurance / RecoverFlushedInsurance were
+//! permanently `#[ignore]`d (v5 answers tags 3 and 23 with DeprecatedV5 = 34) and have been
+//! deleted. First-loss behaviour is covered by tests/v5_first_loss.rs and the wrapper
+//! p4_wave_d cross-program tests.
 
 use litesvm::LiteSVM;
 use percolator_stake::state::{
@@ -25,11 +30,11 @@ use percolator_stake::state::{
 };
 use solana_sdk::{
     account::Account,
-    instruction::{AccountMeta, Instruction, InstructionError},
+    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signer::{keypair::Keypair, Signer},
     system_program,
-    transaction::{Transaction, TransactionError},
+    transaction::Transaction,
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -41,11 +46,7 @@ const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
-/// `StakeError::InsuranceLossOutstanding` (src/error.rs).
-const ERR_INSURANCE_LOSS_OUTSTANDING: u32 = 24;
-
 const GENESIS: u64 = 1_000_000;
-const FLUSH: u64 = 900_000;
 const ATTACK: u64 = 100_000;
 
 // ── artifacts ────────────────────────────────────────────────────────────────
@@ -169,13 +170,6 @@ fn send(
     send_batch(svm, payer, signers, vec![ix])
 }
 
-fn custom_code(err: &litesvm::types::FailedTransactionMetadata) -> Option<u32> {
-    match err.err {
-        TransactionError::InstructionError(_, InstructionError::Custom(c)) => Some(c),
-        _ => None,
-    }
-}
-
 // ── wrapper market ───────────────────────────────────────────────────────────
 
 fn encode_init_market_v17() -> Vec<u8> {
@@ -271,8 +265,6 @@ struct Ctx {
     vault_auth: Pubkey,
     vault: Pubkey,
     lp_mint: Pubkey,
-    wrapper_vault: Pubkey,
-    wrapper_vault_auth: Pubkey,
 }
 
 fn init_pool_ix(c: &Ctx, admin: &Pubkey, cooldown_slots: u64, deposit_cap: u64) -> Instruction {
@@ -348,61 +340,6 @@ fn bind_ix(c: &Ctx, admin: &Pubkey) -> Instruction {
     }
 }
 
-fn flush_ix(c: &Ctx, admin: &Pubkey, amount: u64) -> Instruction {
-    let mut data = vec![3u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: c.stake_id,
-        accounts: vec![
-            AccountMeta::new(*admin, true),
-            AccountMeta::new(c.pool_pda, false),
-            AccountMeta::new(c.vault, false),
-            AccountMeta::new_readonly(c.vault_auth, false),
-            AccountMeta::new(c.market, false),
-            AccountMeta::new(c.wrapper_vault, false),
-            AccountMeta::new_readonly(c.wrapper_id, false),
-            AccountMeta::new_readonly(c.token_program, false),
-        ],
-        data,
-    }
-}
-
-fn recover_ix(c: &Ctx, caller: &Pubkey, amount: u64) -> Instruction {
-    let mut data = vec![23u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: c.stake_id,
-        accounts: vec![
-            AccountMeta::new_readonly(*caller, false), // permissionless: not a signer
-            AccountMeta::new(c.pool_pda, false),
-            AccountMeta::new(c.vault, false),
-            AccountMeta::new_readonly(c.vault_auth, false),
-            AccountMeta::new(c.market, false),
-            AccountMeta::new(c.wrapper_vault, false),
-            AccountMeta::new_readonly(c.wrapper_vault_auth, false),
-            AccountMeta::new_readonly(c.token_program, false),
-            AccountMeta::new_readonly(c.wrapper_id, false),
-        ],
-        data,
-    }
-}
-
-fn return_insurance_ix(c: &Ctx, admin: &Pubkey, admin_ata: Pubkey, amount: u64) -> Instruction {
-    let mut data = vec![10u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    Instruction {
-        program_id: c.stake_id,
-        accounts: vec![
-            AccountMeta::new(*admin, true),
-            AccountMeta::new(c.pool_pda, false),
-            AccountMeta::new(admin_ata, false),
-            AccountMeta::new(c.vault, false),
-            AccountMeta::new_readonly(c.token_program, false),
-        ],
-        data,
-    }
-}
-
 fn read_pool(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
     let data = svm.get_account(pool_pda).unwrap().data;
     *bytemuck::from_bytes::<StakePool>(&data[..STAKE_POOL_SIZE])
@@ -413,7 +350,6 @@ fn read_pool(svm: &LiteSVM, pool_pda: &Pubkey) -> StakePool {
 struct World {
     svm: LiteSVM,
     c: Ctx,
-    admin: Keypair,
     payer: Keypair,
 }
 
@@ -434,7 +370,7 @@ fn world(cooldown_slots: u64, deposit_cap: u64) -> World {
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
 
-    let (market, mint, wrapper_vault, wrapper_vault_auth) =
+    let (market, mint, _wrapper_vault, _wrapper_vault_auth) =
         build_live_market_v17(&mut svm, wrapper_id, token_program, &admin, &payer);
 
     let (pool_pda, _) = derive_pool_pda(&stake_id, &market);
@@ -454,8 +390,6 @@ fn world(cooldown_slots: u64, deposit_cap: u64) -> World {
         vault_auth,
         vault,
         lp_mint,
-        wrapper_vault,
-        wrapper_vault_auth,
     };
 
     send(
@@ -471,7 +405,6 @@ fn world(cooldown_slots: u64, deposit_cap: u64) -> World {
     World {
         svm,
         c,
-        admin,
         payer,
     }
 }
@@ -492,236 +425,7 @@ fn deposit(w: &mut World, u: &Keypair, ata: Pubkey, lp_ata: Pubkey, amount: u64)
     send(&mut w.svm, &w.payer.insecure_clone(), &[u], ix).expect("Deposit");
 }
 
-/// Genesis LP deposits, admin flushes `FLUSH` to wrapper insurance.
-/// Returns the genesis LP's keypair and LP ATA.
-fn genesis_and_flush(w: &mut World) -> (Keypair, Pubkey) {
-    let (lp, ata, lp_ata) = new_user(w, GENESIS);
-    deposit(w, &lp, ata, lp_ata, GENESIS);
-    w.svm.expire_blockhash();
-
-    let admin = w.admin.insecure_clone();
-    let payer = w.payer.insecure_clone();
-    send(
-        &mut w.svm,
-        &payer,
-        &[&admin],
-        flush_ix(&w.c, &admin.pubkey(), FLUSH),
-    )
-    .expect("FlushToInsurance");
-    w.svm.expire_blockhash();
-
-    let p = read_pool(&w.svm, &w.c.pool_pda);
-    assert_eq!(p.total_flushed, FLUSH);
-    assert_eq!(
-        p.total_pool_value().unwrap(),
-        GENESIS - FLUSH,
-        "pool value is marked down by the flush"
-    );
-    assert_eq!(
-        p.wrapper_recoverable(),
-        FLUSH,
-        "the whole flush is permissionlessly recoverable"
-    );
-    (lp, lp_ata)
-}
-
 // ── tests ────────────────────────────────────────────────────────────────────
-
-/// **The PoC.** Deposit + Recover in ONE transaction must be refused.
-///
-/// Pre-fix this transaction SUCCEEDS and the attacker walks away with ~5.5x.
-/// Post-fix the `Deposit` half is refused with `InsuranceLossOutstanding`, which
-/// reverts the whole transaction, so no LP is minted and no tokens move.
-#[test]
-#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
-fn ah2_poc_snipe_is_blocked() {
-    let mut w = world(1, 0);
-    let (_lp, _lp_ata) = genesis_and_flush(&mut w);
-
-    let before = read_pool(&w.svm, &w.c.pool_pda);
-    let (att, att_ata, att_lp_ata) = new_user(&mut w, ATTACK);
-
-    let payer = w.payer.insecure_clone();
-    let err = send_batch(
-        &mut w.svm,
-        &payer,
-        &[&att],
-        vec![
-            deposit_ix(&w.c, &att.pubkey(), att_ata, att_lp_ata, ATTACK),
-            recover_ix(&w.c, &att.pubkey(), FLUSH),
-        ],
-    )
-    .expect_err("A-H2: atomic Deposit+Recover must be refused");
-
-    assert_eq!(
-        custom_code(&err),
-        Some(ERR_INSURANCE_LOSS_OUTSTANDING),
-        "expected InsuranceLossOutstanding, got {:?}",
-        err.err
-    );
-
-    // Whole transaction reverted: no LP minted, no collateral moved, no accounting drift.
-    assert_eq!(token_amount(&w.svm, &att_lp_ata), 0, "no LP minted");
-    assert_eq!(
-        token_amount(&w.svm, &att_ata),
-        ATTACK,
-        "collateral untouched"
-    );
-    let after = read_pool(&w.svm, &w.c.pool_pda);
-    assert_eq!(after.total_lp_supply, before.total_lp_supply);
-    assert_eq!(after.total_deposited, before.total_deposited);
-    assert_eq!(after.total_returned, before.total_returned);
-}
-
-/// Non-atomic is equally refused — the attacker does not need to own the recover.
-/// This is why permissioning tag 23 would not have been a fix.
-#[test]
-#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
-fn ah2_snipe_is_blocked_without_atomicity() {
-    let mut w = world(1, 0);
-    genesis_and_flush(&mut w);
-
-    let (att, att_ata, att_lp_ata) = new_user(&mut w, ATTACK);
-    let payer = w.payer.insecure_clone();
-    let err = send(
-        &mut w.svm,
-        &payer,
-        &[&att],
-        deposit_ix(&w.c, &att.pubkey(), att_ata, att_lp_ata, ATTACK),
-    )
-    .expect_err("bare Deposit during the recoverable window must be refused");
-
-    assert_eq!(custom_code(&err), Some(ERR_INSURANCE_LOSS_OUTSTANDING));
-    assert_eq!(token_amount(&w.svm, &att_lp_ata), 0);
-}
-
-/// **Liveness.** The gate is not a freeze: the blocked party lifts it themselves.
-/// Recover-then-Deposit in the SAME transaction succeeds, and the deposit is then
-/// priced against the restored basis — so the depositor breaks even instead of
-/// capturing 5.5x, and the incumbent is made whole.
-#[test]
-#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
-fn ah2_recover_then_deposit_prices_fairly() {
-    let mut w = world(1, 0);
-    let (_lp, lp_ata) = genesis_and_flush(&mut w);
-    let lp_tokens_genesis = token_amount(&w.svm, &lp_ata);
-
-    let (dep, dep_ata, dep_lp_ata) = new_user(&mut w, ATTACK);
-    let payer = w.payer.insecure_clone();
-    send_batch(
-        &mut w.svm,
-        &payer,
-        &[&dep],
-        vec![
-            recover_ix(&w.c, &dep.pubkey(), FLUSH),
-            deposit_ix(&w.c, &dep.pubkey(), dep_ata, dep_lp_ata, ATTACK),
-        ],
-    )
-    .expect("Recover-then-Deposit must succeed — the gate self-lifts");
-
-    let p = read_pool(&w.svm, &w.c.pool_pda);
-    assert_eq!(p.wrapper_recoverable(), 0, "recovery completed");
-    assert_eq!(
-        p.total_pool_value().unwrap(),
-        GENESIS + ATTACK,
-        "pool value restored and credited with the new deposit"
-    );
-
-    // The depositor's claim must not exceed what they paid in: no snipe.
-    let dep_lp = token_amount(&w.svm, &dep_lp_ata);
-    let dep_claim = p.calc_collateral_for_withdraw(dep_lp).unwrap();
-    assert!(
-        dep_claim <= ATTACK,
-        "depositor must not profit: paid {ATTACK}, claim {dep_claim}"
-    );
-
-    // And the incumbent must be ~whole: the recovery accrued to them, not the newcomer.
-    let genesis_claim = p.calc_collateral_for_withdraw(lp_tokens_genesis).unwrap();
-    assert!(
-        genesis_claim >= GENESIS - 2_000,
-        "incumbent must retain their value: {genesis_claim} vs {GENESIS}"
-    );
-}
-
-/// **The quantity pin — highest-value regression test in this file.**
-///
-/// `ReturnInsurance` (tag 10) credits `total_returned` from the admin's OWN wallet
-/// without moving wrapper tokens. So `total_flushed - total_returned` reads 0 while
-/// `wrapper_recoverable()` is still the entire flush and a permissionless tag-23
-/// injection is still armed. A gate written against `flushed - returned` would open
-/// here and the snipe would be live again.
-#[test]
-#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
-fn ah2_gate_tracks_wrapper_recoverable_not_flushed_minus_returned() {
-    let mut w = world(1, 0);
-    genesis_and_flush(&mut w);
-
-    // Admin returns the full amount out of their own wallet.
-    let admin = w.admin.insecure_clone();
-    let payer = w.payer.insecure_clone();
-    let admin_ata = Pubkey::new_unique();
-    set_token_account(&mut w.svm, admin_ata, &w.c.mint, &admin.pubkey(), FLUSH);
-    send(
-        &mut w.svm,
-        &payer,
-        &[&admin],
-        return_insurance_ix(&w.c, &admin.pubkey(), admin_ata, FLUSH),
-    )
-    .expect("ReturnInsurance");
-    w.svm.expire_blockhash();
-
-    let p = read_pool(&w.svm, &w.c.pool_pda);
-    assert_eq!(
-        p.total_flushed.saturating_sub(p.total_returned),
-        0,
-        "the OLD quantity reads zero — a `flushed - returned` gate would open here"
-    );
-    assert_eq!(
-        p.wrapper_recoverable(),
-        FLUSH,
-        "but the whole flush is still permissionlessly injectable"
-    );
-
-    // The gate must still be shut.
-    let (att, att_ata, att_lp_ata) = new_user(&mut w, ATTACK);
-    let err = send(
-        &mut w.svm,
-        &payer,
-        &[&att],
-        deposit_ix(&w.c, &att.pubkey(), att_ata, att_lp_ata, ATTACK),
-    )
-    .expect_err("deposit must still be refused while wrapper_recoverable() > 0");
-    assert_eq!(custom_code(&err), Some(ERR_INSURANCE_LOSS_OUTSTANDING));
-}
-
-/// Not a permanent freeze: once the recovery is complete, deposits reopen.
-#[test]
-#[ignore = "v5: the v4 insurance mechanism this test builds on (FlushToInsurance / RecoverFlushedInsurance, DeprecatedV5 = 34 for every caller) is removed; the first-loss deployment, loss and withdrawal behaviour is covered by tests/v5_first_loss.rs and the wrapper p4_wave_d XP-1..3 cross-program tests"]
-fn ah2_deposits_reopen_after_full_recovery() {
-    let mut w = world(1, 0);
-    genesis_and_flush(&mut w);
-
-    let payer = w.payer.insecure_clone();
-    // Deliberately an account that signs NOTHING and has no role in the pool: the
-    // recover handler takes its caller slot as a non-signer, which is the
-    // permissionlessness this fix leaves intact.
-    let anyone = Pubkey::new_unique();
-    send(&mut w.svm, &payer, &[], recover_ix(&w.c, &anyone, FLUSH))
-        .expect("permissionless recover by an unrelated, non-signing party");
-    w.svm.expire_blockhash();
-
-    assert_eq!(read_pool(&w.svm, &w.c.pool_pda).wrapper_recoverable(), 0);
-
-    let (dep, dep_ata, dep_lp_ata) = new_user(&mut w, ATTACK);
-    send(
-        &mut w.svm,
-        &payer,
-        &[&dep],
-        deposit_ix(&w.c, &dep.pubkey(), dep_ata, dep_lp_ata, ATTACK),
-    )
-    .expect("deposits reopen once nothing is recoverable");
-    assert!(token_amount(&w.svm, &dep_lp_ata) > 0, "LP minted");
-}
 
 /// Inertness: a pool that has never flushed is completely unaffected by the gate.
 /// This is the state of every pool in normal operation before any flush.
