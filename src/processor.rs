@@ -1513,8 +1513,12 @@ fn process_withdraw(
         {
             return Err(StakeError::Unauthorized.into());
         }
+        // GH#268: the cooldown is EXCLUSIVE at its boundary. A withdrawal needs
+        // `clock.slot > last_deposit_slot + cooldown_slots` (the documented rule,
+        // tests/integration.rs::test_cooldown_boundary_is_exclusive); `<` let the exact
+        // boundary slot through, one slot early.
         if clock.slot
-            < deposit
+            <= deposit
                 .last_deposit_slot
                 .saturating_add(pool.cooldown_slots)
         {

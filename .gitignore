@@ -1,6 +1,7 @@
 /target/
 /kani-proofs/target/
-Cargo.lock
+# Cargo.lock is TRACKED (AUD-T2-2): it pins the dependency set that reproduces the
+# deployed bytes (v2.2 stake 7JrgAUHi = 5c6cc785 from 53f54803 with this lock).
 kani-proofs/Cargo.lock
 node_modules/
 dist/
