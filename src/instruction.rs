@@ -72,6 +72,14 @@ use solana_program::program_error::ProgramError;
 pub enum StakeInstruction {
     /// 0: Initialize a stake pool for a slab (market).
     ///
+    /// M-4 (AUD-S2-3): refused with `MultiAssetMarketNotSupported` (48) before anything is created
+    /// unless the market is single-asset (`max_market_slots == 1`) AND its
+    /// `permissionless_market_init_fee` is 0. InitPool hands `marketauth` to the pool PDA, and this
+    /// program proxies neither wrapper tag 59 (the fee) nor tag 40 (asset lifecycle), so both values
+    /// are then frozen for the pool's life and no third party can ever append an asset and block
+    /// the v5 bind (tag 19) with 48. `UnsupportedWrapperLayout` (32) if the slab is not on the
+    /// pinned layout.
+    ///
     /// Accounts:
     ///   0. `[signer, writable]` Admin (pays rent, becomes pool admin)
     ///   1. `[writable]` Slab account (the percolator market; written by the

@@ -157,6 +157,10 @@ pub enum StakeError {
     /// M-1b (security review 2026-10-14): a v5 pool may only bind a single-asset market
     /// (`max_market_slots == 1`): the pool takes custody of asset 0's insurance only, and other
     /// assets' insurance belongs to their own authorities.
+    /// M-4 (AUD-S2-3): InitPool also returns it, BEFORE the pool exists, when the market is already
+    /// multi-asset or its `permissionless_market_init_fee` is non-zero (anyone could then append an
+    /// asset and block the bind forever). Fix: the creator sets the fee to 0 (wrapper tag 59, still
+    /// its key before InitPool) and launches on a single-asset market.
     MultiAssetMarketNotSupported = 48,
 }
 
@@ -217,7 +221,7 @@ pub fn error_hint(code: u32) -> &'static str {
         44 => "Insurance readings diverged — the market's insurance has a backstop loan or reservation outstanding; deposits into deployed units and syncs wait until it is repaid. On BindInsuranceAuthority: asset 0 has unsettled positions (a stale funding cohort); crank to the current slot and refresh every open position in the same transaction as the bind, or bind before the market has positions",
         45 => "Insurance units mismatch — the wrapper did not mint or burn the expected stake units; the sync was reverted",
         47 => "Insurance custody not bound — the market's insurance authority and operator must both be the pool's vault authority before the asset admin can be burned; re-bind first",
-        48 => "Multi-asset market not supported — a v5 staking pool can only bind a single-asset market; this cannot be undone for this market (bind before any second asset can be added)",
+        48 => "Multi-asset market not supported — a v5 staking pool can only be created on (InitPool) and bind a single-asset market whose permissionless asset-init fee is 0; on InitPool set the fee to 0 (wrapper tag 59) first; on a bind this cannot be undone for this market",
         46 => "Creator account required — the terminal insurance surplus belongs to the pool creator (pool.admin); pass pool.admin's token account for the pool collateral (S1)",
         _ => "Unknown error — check the error code and pool state",
     }

@@ -145,6 +145,15 @@ pub const ASSET0_INSURANCE_OPERATOR_OFF: usize = ASSET0_WRAPPER_START + ASSET_IN
 /// Shortest market account that can hold the engine header (and so the `mode` byte).
 pub const MIN_MARKET_ACCOUNT_LEN: usize = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
 
+/// M-4 (AUD-S2-3): `WrapperConfigV16.permissionless_market_init_fee` (u128), config-relative:
+/// `marketauth`, `collateral_mint`, `secondary_collateral_mint` (3 x 32 B), then
+/// `maintenance_fee_per_slot` (u128), then this field. Non-zero = anyone may append an asset by
+/// paying it (wrapper tag 40); zero = only `marketauth`. Pinned on the real wrapper .so by
+/// `tests/v22live_s2_3_e2e.rs::m4_pin_permissionless_init_fee_offset_on_real_wrapper` (tag 59
+/// writes exactly these 16 bytes).
+pub const CONFIG_PERMISSIONLESS_INIT_FEE_OFF: usize = 3 * 32 + 16;
+pub const MARKET_PERMISSIONLESS_INIT_FEE_OFF: usize = HEADER_LEN + CONFIG_PERMISSIONLESS_INIT_FEE_OFF;
+
 // ── Value pins. Edit an input above without updating these and the build fails. ──
 const _: () = assert!(MARKET_GROUP_OFF == 592);
 const _: () = assert!(ASSET0_WRAPPER_START == 1398);
@@ -174,6 +183,8 @@ const _: () = assert!(ASSET0_INSURANCE_OPERATOR_OFF == 1454);
 const _: () = assert!(GROUP_INS_BUDGET_TOTAL_OFF + 16 <= MARKET_GROUP_LEN);
 const _: () = assert!(ASSET_INSURANCE_OPERATOR_OFF + 32 <= ASSET_INSURANCE_TOP_UP_OFF);
 const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1398);
+const _: () = assert!(MARKET_PERMISSIONLESS_INIT_FEE_OFF == 128);
+const _: () = assert!(CONFIG_PERMISSIONLESS_INIT_FEE_OFF + 16 <= WRAPPER_CONFIG_LEN);
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);
