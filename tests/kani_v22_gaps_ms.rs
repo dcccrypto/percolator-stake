@@ -178,6 +178,245 @@ fn ms_s4_units_exact_full_width() {
     }
 }
 
+// ---- r-variants (after MS-S1 NO-VERDICT, z3 900 s, 2026-10-20T06:26Z) -------------------------
+// Why the change: MS-S1 asked z3 to identify the harness's `d*(S+1)/(V+1)` with production's
+// `checked_mul(..)?.checked_div(..)?` (different Option/overflow lowering, so the words did not
+// hash-cons) and decide the 128-bit divider; the last property did not finish. The r-variants
+// remove ALL arithmetic from the solver: `u128::checked_mul` / `u128::checked_div` /
+// `u128::div_ceil` are RECORDING stubs returning ANY value (a superset of the real results, so
+// every assertion holds for the real primitives too) and logging operands and result. The
+// harness asserts the exact operands, the exact chaining (div numerator == mul result) and the
+// exact mapping from the primitive results to the returned value. With Rust semantics of the
+// primitives (`checked_mul` = Some(a*b) iff no overflow, `checked_div` = Some(floor(n/d)) iff
+// d != 0, `div_ceil` = ceil) and MS-S0 (the product never overflows at u64 operands) this IS
+// "mint = floor(d(S+1)/(V+1))" etc. at full width.
+
+static mut LOG: [(u8, u128, u128, Option<u128>); 4] = [(0, 0, 0, None); 4];
+static mut N: usize = 0;
+fn rec(kind: u8, a: u128, b: u128) -> Option<u128> {
+    let r: Option<u128> = kani::any();
+    unsafe {
+        let k = N;
+        assert!(k < 4, "at most 4 recorded u128 primitives");
+        LOG[k] = (kind, a, b, r);
+        N = k + 1;
+    }
+    r
+}
+fn mul_rec(a: u128, b: u128) -> Option<u128> {
+    rec(1, a, b)
+}
+fn div_rec(a: u128, b: u128) -> Option<u128> {
+    let r = rec(2, a, b);
+    if b == 0 {
+        kani::assume(r.is_none()); // checked_div by zero is None (real semantics; keeps the stub honest)
+    }
+    r
+}
+fn div_ceil_rec(a: u128, b: u128) -> u128 {
+    let r = rec(3, a, b);
+    kani::assume(r.is_some());
+    r.unwrap_or(0)
+}
+fn log() -> ([(u8, u128, u128, Option<u128>); 4], usize) {
+    unsafe { (LOG, N) }
+}
+
+/// MS-S0: the only multiplication on the mint / burn paths, `x * (y + 1)` with x, y u64, never
+/// overflows u128 (REAL `checked_mul`, full width). Used by MS-S1r / MS-S2r.
+#[kani::proof]
+fn ms_s0_u64_times_u64_plus_one_never_overflows() {
+    let x: u64 = kani::any();
+    let y: u64 = kani::any();
+    let p = (x as u128).checked_mul(y as u128 + 1);
+    assert!(p.is_some());
+    kani::cover!(x == u64::MAX && y == u64::MAX, "COVER: the extreme corner");
+}
+
+/// MS-S1r: mint wiring at full u64 width (global, junior, senior): exactly `checked_mul(d, S+1)`
+/// then `checked_div(that, V+1)`, result returned iff <= u64::MAX; genesis / orphan / empty arms
+/// exact and computed without any primitive call.
+#[kani::proof]
+#[kani::stub(u128::checked_mul, mul_rec)]
+#[kani::stub(u128::checked_div, div_rec)]
+fn ms_s1r_mint_wiring_full_width() {
+    let s: u64 = kani::any();
+    let v: u64 = kani::any();
+    let d: u64 = kani::any();
+    let which: u8 = kani::any();
+    kani::assume(which <= 2);
+    let r = match which {
+        0 => calc_lp_for_deposit(s, v, d),
+        1 => calc_senior_lp_for_deposit(s, v, d),
+        _ => calc_junior_lp_for_deposit(s, v, d),
+    };
+    let (lg, n) = log();
+    if s == 0 && v == 0 {
+        assert!(r == Some(d) && n == 0, "genesis 1:1, no arithmetic");
+        kani::cover!(d > 0, "COVER: genesis");
+        return;
+    }
+    if s == 0 || v == 0 {
+        assert!(r.is_none() && n == 0, "orphan / zero value refused before any arithmetic");
+        kani::cover!(s == 0, "COVER: orphan refused");
+        kani::cover!(v == 0, "COVER: zero value refused");
+        return;
+    }
+    assert!(n >= 1 && lg[0].0 == 1 && lg[0].1 == d as u128 && lg[0].2 == s as u128 + 1, "mul(d, S+1)");
+    match lg[0].3 {
+        None => assert!(r.is_none() && n == 1, "overflow refused (impossible for real: MS-S0)"),
+        Some(x) => {
+            assert!(n == 2 && lg[1].0 == 2 && lg[1].1 == x && lg[1].2 == v as u128 + 1, "div(product, V+1)");
+            match lg[1].3 {
+                None => assert!(r.is_none()),
+                Some(q) => {
+                    if q <= u64::MAX as u128 {
+                        assert!(r == Some(q as u64), "mint = the quotient");
+                        kani::cover!(which == 0 && q > 0, "COVER: global mint");
+                        kani::cover!(which == 1 && q > 0, "COVER: senior mint");
+                        kani::cover!(which == 2 && q > 0, "COVER: junior mint");
+                    } else {
+                        assert!(r.is_none(), "beyond u64 refused");
+                        kani::cover!(true, "COVER: beyond u64 refused");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// MS-S2r: burn wiring at full u64 width: junior over-burn / zero supply refused and junior full
+/// burn = junior balance, all WITHOUT arithmetic; otherwise exactly `checked_mul(lp, V+1)` then
+/// `checked_div(that, S+1)`, returned iff <= u64::MAX (global, senior, junior partial).
+#[kani::proof]
+#[kani::stub(u128::checked_mul, mul_rec)]
+#[kani::stub(u128::checked_div, div_rec)]
+fn ms_s2r_burn_wiring_full_width() {
+    let s: u64 = kani::any();
+    let v: u64 = kani::any();
+    let lp: u64 = kani::any();
+    let which: u8 = kani::any();
+    kani::assume(which <= 2);
+    let r = match which {
+        0 => calc_junior_collateral_for_withdraw(s, v, lp),
+        1 => calc_senior_collateral_for_withdraw(s, v, lp),
+        _ => calc_collateral_for_withdraw(s, v, lp),
+    };
+    let (lg, n) = log();
+    if s == 0 {
+        assert!(r.is_none() && n == 0, "zero supply refused");
+        kani::cover!(lp > 0, "COVER: zero supply");
+        return;
+    }
+    if which == 0 && lp > s {
+        assert!(r.is_none() && n == 0, "junior over-burn refused");
+        kani::cover!(true, "COVER: junior over-burn");
+        return;
+    }
+    if which == 0 && lp == s {
+        assert!(r == Some(v) && n == 0, "junior full burn pays exactly the junior balance");
+        kani::cover!(v > s, "COVER: junior full burn with earned fees");
+        return;
+    }
+    assert!(n >= 1 && lg[0].0 == 1 && lg[0].1 == lp as u128 && lg[0].2 == v as u128 + 1, "mul(lp, V+1)");
+    match lg[0].3 {
+        None => assert!(r.is_none() && n == 1),
+        Some(x) => {
+            assert!(n == 2 && lg[1].0 == 2 && lg[1].1 == x && lg[1].2 == s as u128 + 1, "div(product, S+1)");
+            match lg[1].3 {
+                None => assert!(r.is_none()),
+                Some(q) => {
+                    if q <= u64::MAX as u128 {
+                        assert!(r == Some(q as u64));
+                        kani::cover!(which == 0 && lp < s && q > 0, "COVER: junior partial burn");
+                        kani::cover!(which == 1 && lp == s, "COVER: senior full burn uses the formula");
+                        kani::cover!(which == 2 && q > 0, "COVER: global burn");
+                    } else {
+                        assert!(r.is_none());
+                        kani::cover!(true, "COVER: beyond u64 refused");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// MS-S4r: unit mirrors at full width (u64 / u128 operands). `checked_mul` and `div_ceil` are
+/// recording stubs; the `/` operator stays real (z3: the harness divides the SAME recorded word).
+#[kani::proof]
+#[kani::stub(u128::checked_mul, mul_rec)]
+#[kani::stub(u128::div_ceil, div_ceil_rec)]
+#[kani::solver(z3)]
+fn ms_s4r_units_wiring_full_width() {
+    let a: u64 = kani::any();
+    let u: u128 = kani::any();
+    let i: u128 = kani::any();
+    let part: u8 = kani::any();
+    kani::assume(part <= 2);
+    if part == 0 {
+        let m = expected_topup_units(a, u, i);
+        let (lg, n) = log();
+        if u == 0 || i == 0 {
+            assert!(m == Some(a as u128) && n == 0, "genesis / reset 1:1");
+            kani::cover!(u > 0 && i == 0, "COVER: reset arm");
+            return;
+        }
+        assert!(n == 1 && lg[0].0 == 1 && lg[0].1 == a as u128 && lg[0].2 == u, "mul(a, U)");
+        match lg[0].3 {
+            None => assert!(m.is_none(), "overflow refused"),
+            Some(p) => {
+                assert!(m == Some(p / i), "mint = floor(a*U/I)");
+                kani::cover!(p / i > 0, "COVER: mint");
+            }
+        }
+    } else if part == 1 {
+        let r: u64 = kani::any();
+        let b = expected_recover_burn(r, u, i);
+        let (lg, n) = log();
+        if u == 0 || i == 0 || r as u128 > i {
+            assert!(b.is_none() && n == 0, "nothing withdrawable / beyond free insurance refused");
+            kani::cover!(u > 0 && i > 0 && r as u128 > i, "COVER: beyond free insurance");
+            return;
+        }
+        assert!(n >= 1 && lg[0].0 == 1 && lg[0].1 == r as u128 && lg[0].2 == u, "mul(r, U)");
+        match lg[0].3 {
+            None => assert!(b.is_none() && n == 1, "overflow refused"),
+            Some(p) => {
+                assert!(n == 2 && lg[1].0 == 3 && lg[1].1 == p && lg[1].2 == i, "burn = div_CEIL(product, I)");
+                assert!(b == lg[1].3);
+                kani::cover!(b.is_some(), "COVER: burn");
+            }
+        }
+    } else {
+        let us: u128 = kani::any();
+        let dv = deployed_value(us, u, i);
+        let (lg, n) = log();
+        if u == 0 {
+            assert!(dv == Some(0) && n == 0);
+            return;
+        }
+        if us > u {
+            assert!(dv.is_none() && n == 0, "more units than exist refused");
+            kani::cover!(true, "COVER: more units than exist");
+            return;
+        }
+        assert!(n == 1 && lg[0].0 == 1 && lg[0].1 == us && lg[0].2 == i, "mul(Us, I)");
+        match lg[0].3 {
+            None => assert!(dv.is_none(), "overflow refused"),
+            Some(p) => {
+                let q = p / u;
+                if q <= u64::MAX as u128 {
+                    assert!(dv == Some(q as u64), "value = floor(Us*I/U)");
+                    kani::cover!(q > 0, "COVER: value");
+                } else {
+                    assert!(dv.is_none(), "beyond u64 refused");
+                    kani::cover!(true, "COVER: beyond u64");
+                }
+            }
+        }
+    }
+}
+
 // ---- S3 sync (I-S4) -------------------------------------------------------------------------
 
 static mut CALLS: [(u64, u16, u64, bool); 4] = [(0, 0, 0, false); 4];
