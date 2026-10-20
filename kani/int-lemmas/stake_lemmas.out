@@ -24,4 +24,26 @@ UNITS value premises: sat (expected sat) OK model=[Us = 12, val = 11, val2 = 10,
 UNITS value <= I: unsat (expected unsat) OK
 UNITS value: a loss never raises it: unsat (expected unsat) OK
 UNITS value control (Us = U+1, more units than exist, can exceed I): sat (expected sat) OK model=[val = 14, I = 13, U = 9, Us = 10]
+FIRST premises: sat (expected sat) OK model=[lp = 7, back = 7, d = 7]
+FIRST genesis round trip exact: unsat (expected unsat) OK
+TWO premises: sat (expected sat) OK model=[b_back = 1, a_lp = 3, b = 1, a = 3, a_back = 3, b_lp = 1]
+TWO a_back + b_back <= a + b: unsat (expected unsat) OK
+MONO_D premises: sat (expected sat) OK model=[d2 = 7, lp = 1, S = 11, d = 2, lp2 = 4, V = 16]
+MONO_D larger deposit -> >= lp: unsat (expected unsat) OK
+MONO_B premises: sat (expected sat) OK model=[lp2 = 5, V = 16, c2 = 10, c1 = 4, lp = 2, S = 7]
+MONO_B larger burn -> >= collateral: unsat (expected unsat) OK
+FULL premises: sat (expected sat) OK model=[S = 5, V = 0, full = 0]
+FULL full burn <= pool value: unsat (expected unsat) OK
+FULL mutant control (rounded UP can exceed): sat (expected sat) OK model=[S = 15, full = 9, V = 8]
+PARTIAL premises: sat (expected sat) OK model=[lp = 1, full = 12, S = 14, part = 0, V = 12]
+PARTIAL partial <= full: unsat (expected unsat) OK
+LPRD premises: sat (expected sat) OK model=[d = 14, lp = 14, S = 15, V = 14]
+LPRD lp(V+1) <= d(S+1): unsat (expected unsat) OK
+LPRD pre-N7 form lp*V <= d*S when V <= S: unsat (expected unsat) OK
+LPRD control: pre-N7 form fails when V > S: sat (expected sat) OK model=[d = 11, lp = 6, V = 6, S = 3]
+WRD premises: sat (expected sat) OK model=[c1 = 6, S = 7, V = 10, lp = 5]
+WRD c(S+1) <= lp(V+1): unsat (expected unsat) OK
+WRD pre-N7 form c*S <= lp*V when S <= V: unsat (expected unsat) OK
+WRD collateral <= pool value: unsat (expected unsat) OK
+WRD control: pre-N7 form fails when S > V: sat (expected sat) OK model=[V = 5, S = 13, c1 = 2, lp = 5]
 RESULT: ALL AS EXPECTED

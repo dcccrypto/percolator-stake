@@ -109,5 +109,42 @@ check("UNITS value: a loss never raises it", value, val2 <= val, unsat)
 check("UNITS value control (Us = U+1, more units than exist, can exceed I)",
       And(U >= 1, I >= 0, Us >= 0, Us <= U + 1, floor_div(val, Us * I, U)), val <= I, sat)
 
+# ---- tests/kani.rs carried rows (global calc_lp_for_deposit / calc_collateral_for_withdraw = the
+#      senior functions; their exact formulas are MS-S1 / MS-S2) ----
+c1, c2, d2, lp2, x1, x2, a_lp, b_lp, a_back, b_back, full, part = Ints("c1 c2 d2 lp2 x1 x2 a_lp b_lp a_back b_back full part")
+first = And(d >= 1, lp == d, floor_div(back, lp * (d + 1), lp + 1))
+check("FIRST premises", first, None, sat)
+check("FIRST genesis round trip exact", first, back == d, unsat)
+two = And(a >= 1, b >= 1, a_lp == a,
+          floor_div(b_lp, b * (a_lp + 1), a + 1), b_lp >= 1,
+          floor_div(a_back, a_lp * (a + b + 1), a_lp + b_lp + 1),
+          floor_div(b_back, b_lp * (a + b - a_back + 1), b_lp + 1))
+check("TWO premises", two, None, sat)
+check("TWO a_back + b_back <= a + b", two, a_back + b_back <= a + b, unsat)
+mono_d = And(S >= 1, V >= 1, d >= 1, d2 > d, floor_div(lp, d * (S + 1), V + 1), floor_div(lp2, d2 * (S + 1), V + 1))
+check("MONO_D premises", mono_d, None, sat)
+check("MONO_D larger deposit -> >= lp", mono_d, lp2 >= lp, unsat)
+mono_b = And(S >= 1, V >= 1, lp >= 1, lp2 > lp, lp2 <= S, floor_div(c1, lp * (V + 1), S + 1), floor_div(c2, lp2 * (V + 1), S + 1))
+check("MONO_B premises", mono_b, None, sat)
+check("MONO_B larger burn -> >= collateral", mono_b, c2 >= c1, unsat)
+fullb = And(S >= 1, V >= 0, floor_div(full, S * (V + 1), S + 1))
+check("FULL premises", fullb, None, sat)
+check("FULL full burn <= pool value", fullb, full <= V, unsat)
+check("FULL mutant control (rounded UP can exceed)", And(S >= 1, V >= 0, ceil_div(full, S * (V + 1), S + 1)), full <= V, sat)
+partb = And(S >= 1, V >= 1, lp >= 1, lp < S, floor_div(full, S * (V + 1), S + 1), floor_div(part, lp * (V + 1), S + 1))
+check("PARTIAL premises", partb, None, sat)
+check("PARTIAL partial <= full", partb, part <= full, unsat)
+lprd = And(S >= 1, V >= 1, d >= 1, floor_div(lp, d * (S + 1), V + 1))
+check("LPRD premises", lprd, None, sat)
+check("LPRD lp(V+1) <= d(S+1)", lprd, lp * (V + 1) <= d * (S + 1), unsat)
+check("LPRD pre-N7 form lp*V <= d*S when V <= S", And(lprd, V <= S), lp * V <= d * S, unsat)
+check("LPRD control: pre-N7 form fails when V > S", And(lprd, V > S), lp * V <= d * S, sat)
+wrd = And(S >= 1, V >= 1, lp >= 1, lp <= S, floor_div(c1, lp * (V + 1), S + 1))
+check("WRD premises", wrd, None, sat)
+check("WRD c(S+1) <= lp(V+1)", wrd, c1 * (S + 1) <= lp * (V + 1), unsat)
+check("WRD pre-N7 form c*S <= lp*V when S <= V", And(wrd, S <= V), c1 * S <= lp * V, unsat)
+check("WRD collateral <= pool value", wrd, c1 <= V, unsat)
+check("WRD control: pre-N7 form fails when S > V", And(wrd, S > V), c1 * S <= lp * V, sat)
+
 print("RESULT:", "ALL AS EXPECTED" if bad == 0 else f"{bad} UNEXPECTED")
 sys.exit(1 if bad else 0)

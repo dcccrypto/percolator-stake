@@ -13,12 +13,12 @@
 #![cfg(kani)]
 
 use percolator_stake::math::{
-    calc_junior_collateral_for_withdraw, calc_junior_lp_for_deposit, calc_senior_collateral_for_withdraw,
+    calc_collateral_for_withdraw, calc_junior_collateral_for_withdraw, calc_lp_for_deposit, calc_junior_lp_for_deposit, calc_senior_collateral_for_withdraw,
     calc_senior_lp_for_deposit, deployed_value, expected_recover_burn, expected_topup_units, sync_plan,
     SyncAction,
 };
 
-/// MS-S1: the mint is EXACTLY `floor(d*(S+1)/(V+1))` at full u64 width (junior and senior), with the
+/// MS-S1: the mint is EXACTLY `floor(d*(S+1)/(V+1))` at full u64 width (global, junior and senior), with the
 /// genesis / orphan / empty-value arms exact and the u128 product never overflowing.
 #[kani::proof]
 #[kani::solver(z3)]
@@ -27,7 +27,14 @@ fn ms_s1_mint_exact_floor_full_width() {
     let v: u64 = kani::any();
     let d: u64 = kani::any();
     let senior: bool = kani::any();
-    let r = if senior { calc_senior_lp_for_deposit(s, v, d) } else { calc_junior_lp_for_deposit(s, v, d) };
+    let global: bool = kani::any();
+    let r = if global {
+        calc_lp_for_deposit(s, v, d)
+    } else if senior {
+        calc_senior_lp_for_deposit(s, v, d)
+    } else {
+        calc_junior_lp_for_deposit(s, v, d)
+    };
     if s == 0 && v == 0 {
         assert!(r == Some(d), "genesis 1:1");
         kani::cover!(d > 0, "COVER: genesis");
@@ -46,7 +53,8 @@ fn ms_s1_mint_exact_floor_full_width() {
         assert!(r == Some(q as u64), "mint = floor(d*(S+1)/(V+1))");
         kani::cover!(q > 0 && q < d as u128, "COVER: share price > 1");
         kani::cover!(q == 0 && d > 0, "COVER: dust deposit mints 0");
-        kani::cover!(senior && q > d as u128, "COVER: senior, share price < 1");
+        kani::cover!(senior && !global && q > d as u128, "COVER: senior, share price < 1");
+        kani::cover!(global && q > 0, "COVER: global mint");
     } else {
         assert!(r.is_none(), "mint beyond u64 refused");
         kani::cover!(true, "COVER: mint beyond u64 refused");
@@ -61,8 +69,15 @@ fn ms_s2_burn_exact_floor_full_width() {
     let s: u64 = kani::any();
     let v: u64 = kani::any();
     let lp: u64 = kani::any();
-    let senior: bool = kani::any();
-    let r = if senior { calc_senior_collateral_for_withdraw(s, v, lp) } else { calc_junior_collateral_for_withdraw(s, v, lp) };
+    let senior_or_global: u8 = kani::any();
+    // 0 = junior, 1 = senior, 2 = global (calc_collateral_for_withdraw); senior and global share the formula
+    kani::assume(senior_or_global <= 2);
+    let senior = senior_or_global != 0;
+    let r = match senior_or_global {
+        0 => calc_junior_collateral_for_withdraw(s, v, lp),
+        1 => calc_senior_collateral_for_withdraw(s, v, lp),
+        _ => calc_collateral_for_withdraw(s, v, lp),
+    };
     if s == 0 {
         assert!(r.is_none(), "zero supply refused");
         kani::cover!(lp > 0, "COVER: zero supply");
@@ -84,7 +99,8 @@ fn ms_s2_burn_exact_floor_full_width() {
     if q <= u64::MAX as u128 {
         assert!(r == Some(q as u64), "burn = floor(lp*(V+1)/(S+1))");
         kani::cover!(!senior && q > 0 && lp < s, "COVER: junior partial burn pays");
-        kani::cover!(senior && q > 0 && lp < s, "COVER: senior partial burn pays");
+        kani::cover!(senior_or_global == 1 && q > 0 && lp < s, "COVER: senior partial burn pays");
+        kani::cover!(senior_or_global == 2 && q > 0 && lp < s, "COVER: global partial burn pays");
         kani::cover!(senior && lp == s && q < v as u128, "COVER: senior full burn keeps the N7 residual");
     } else {
         assert!(r.is_none(), "payout beyond u64 refused");
