@@ -1,0 +1,15 @@
+label\trc\twall_s\tverdict\tcovers\tfailed_checks\tsolver_args\tharness\tworkdir\tsha
+S1\t124\t7232\tNO-VERDICT\t\t\t--tests -Z stubbing\tms_s1_mint_exact_floor_full_width\t/Users/khubair/wt-v22kani-1020/ms/percolator-stake\tf69015c+dirty0
+S0	0	7073	SUCCESSFUL	1 of 1	0 of 8 failed	--tests -Z stubbing	ms_s0_u64_times_u64_plus_one_never_overflows	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+S1r	0	24	SUCCESSFUL	7 of 7	0 of 119 failed	--tests -Z stubbing	ms_s1r_mint_wiring_full_width	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+S2r	0	23	SUCCESSFUL	7 of 7	0 of 120 failed	--tests -Z stubbing	ms_s2r_burn_wiring_full_width	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+S6a	0	43	SUCCESSFUL	2 of 2	0 of 19429 failed (1762 unreachable)	--tests -Z stubbing	ms_s6a_tag3_flush_refused	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+S6b	0	35	SUCCESSFUL	2 of 2	0 of 19429 failed (1762 unreachable)	--tests -Z stubbing	ms_s6b_tag23_recover_refused	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+S5a	0	29	SUCCESSFUL	7 of 7	0 of 121 failed	--tests -Z stubbing	ms_s5a_sync_full_width_any_bps	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+S4r	124	900	NO-VERDICT			--tests -Z stubbing	ms_s4r_units_wiring_full_width	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+M1n	124	2400	NO-VERDICT			-Z stubbing	vamm::kani_v22_gaps_ms::ms_m1n_passive_exec_bounds_structural	/Users/khubair/wt-v22kani-1020/ms/percolator-match	50f146d+dirty0
+M2n	124	2400	NO-VERDICT			-Z stubbing	vamm::kani_v22_gaps_ms::ms_m2n_vamm_exec_bounds_structural	/Users/khubair/wt-v22kani-1020/ms/percolator-match	50f146d+dirty0
+PW	124	900	NO-VERDICT			-Z stubbing	vamm::kani_v22_gaps_ms::ms_pw_v2_price_with_total_bps_structural	/Users/khubair/wt-v22kani-1020/ms/percolator-match	50f146d+dirty0
+IMP	0	14	SUCCESSFUL	3 of 3	0 of 829 failed (20 unreachable)	-Z stubbing	vamm::kani_v22_gaps_ms::ms_imp_vamm_impact_never_overflows_in_documented_domain	/Users/khubair/wt-v22kani-1020/ms/percolator-match	50f146d+dirty0
+S5b	124	900	NO-VERDICT			--tests -Z stubbing	ms_s5b_sync_full_width_real_helpers	/Users/khubair/wt-v22kani-1020/ms/percolator-stake	77f5cce+dirty0
+QUEUE-DONE /Users/khubair/wt-v22kani-1020/ms/q2.tsv

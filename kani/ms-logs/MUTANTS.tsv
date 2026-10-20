@@ -1,0 +1,8 @@
+SMS1	ms_s1r_mint_wiring_full_width	rc=1	9119s	FAILED		 - Description: ""mul(d, S+1)"" 
+SMS2	ms_s1r_mint_wiring_full_width	rc=1	17s	FAILED		 - Description: ""div(product, V+1)"" 
+SMS3	ms_s2r_burn_wiring_full_width	rc=1	18s	FAILED		 - Description: ""div(product, S+1)"" 
+SMS4	ms_s2r_burn_wiring_full_width	rc=1	17s	FAILED		 - Description: ""junior full burn pays exactly the junior balance"" 
+SMY1	ms_s5a_sync_full_width_any_bps	rc=1	18s	FAILED		 - Description: ""buffer = CEIL of V and the buffer dial"" 
+SMF1	ms_s6a_tag3_flush_refused	rc=1	34s	FAILED		 - Description: "assertion failed: r == 
+MI1	vamm::kani_v22_gaps_ms::ms_imp_vamm_impact_never_overflows_in_documented_domain	rc=1	42s	FAILED		 - Description: "attempt to subtract with overflow" 	 - Description: "This is a placeholder message; Kani doesn't support message formatted at runtime" 
+MUT-QUEUE-DONE /Users/khubair/wt-v22kani-1020/ms/mq1.tsv
