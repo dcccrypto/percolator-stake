@@ -1,0 +1,27 @@
+RT premises: sat (expected sat) OK model=[d = 12, lp = 7, V = 12, back = 11, S = 7]
+RT  back <= d: unsat (expected unsat) OK
+RT  tight control (back == d reachable): sat (expected sat) OK model=[lp = 15, back = 15, V = 16, S = 16, d = 15]
+RT  mutant control (mint rounded UP): sat (expected sat) OK model=[d = 14, V = 15, S = 6, lp = 7, back = 15]
+LOSS premises: sat (expected sat) OK model=[lp = 12, delta = -2, V = 12, d = 16, back = 14, S = 9]
+LOSS back <= d: unsat (expected unsat) OK
+LOSS control (a GAIN delta > 0 can exceed d): sat (expected sat) OK model=[lp = 8, d = 6, delta = 12, V = 8, back = 10, S = 12]
+ND premises: sat (expected sat) OK model=[after = 9,
+ND  after >= before: unsat (expected unsat) OK
+ND  tight control (after == before reachable): sat (expected sat) OK model=[a = 1,
+ND  mutant control (late mint rounded UP dilutes): sat (expected sat) OK model=[blp = 4,
+ST5B premises: sat (expected sat) OK model=[pl = 2, v = 5, ps = 4, pb = 12]
+ST5B v <= pb: unsat (expected unsat) OK
+ST5B mutant control (partial burn rounded UP): sat (expected sat) OK model=[ps = 16, v = 5, pl = 15, pb = 4]
+UNITS mint premises: sat (expected sat) OK model=[I = 9, a = 12, U = 11, m = 14]
+UNITS mint: incumbents not diluted (I+a)U >= I(U+m): unsat (expected unsat) OK
+UNITS mint: new units worth <= paid m(I+a) <= a(U+m): unsat (expected unsat) OK
+UNITS mint mutant control (rounded UP dilutes): sat (expected sat) OK model=[m = 3, I = 6, U = 15, a = 1]
+UNITS burn premises: sat (expected sat) OK model=[U = 16, bb = 12, r = 9, I = 12]
+UNITS burn: burned units worth >= paid bb*I >= r*U: unsat (expected unsat) OK
+UNITS burn: stayers not diluted (I-r)U >= I(U-bb) when bb < U: unsat (expected unsat) OK
+UNITS burn mutant control (rounded DOWN dilutes stayers): sat (expected sat) OK model=[U = 10, bb = 9, I = 16, r = 15]
+UNITS value premises: sat (expected sat) OK model=[Us = 12, val = 11, val2 = 10, I2 = 14, I = 15, U = 16]
+UNITS value <= I: unsat (expected unsat) OK
+UNITS value: a loss never raises it: unsat (expected unsat) OK
+UNITS value control (Us = U+1, more units than exist, can exceed I): sat (expected sat) OK model=[val = 14, I = 13, U = 9, Us = 10]
+RESULT: ALL AS EXPECTED
