@@ -336,12 +336,6 @@ fn market_only() -> World {
 
 /// Real stake InitPool, FEE_ONLY (risk mode 2), cooldown 5.
 fn init_pool(w: &mut World) -> TxResult {
-    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    for (k, n) in [(w.lp_mint, 82usize), (w.vault, 165usize)] {
-        w.svm
-            .set_account(k, Account { lamports: 1_000_000_000, data: vec![0u8; n], owner: token_program, executable: false, rent_epoch: 0 })
-            .unwrap();
-    }
     let mut ipd = vec![0u8];
     ipd.extend_from_slice(&5u64.to_le_bytes());
     ipd.extend_from_slice(&0u64.to_le_bytes());
@@ -349,6 +343,17 @@ fn init_pool(w: &mut World) -> TxResult {
     ipd.extend_from_slice(&0u16.to_le_bytes());
     ipd.extend_from_slice(&3_000u16.to_le_bytes());
     ipd.extend_from_slice(&500u16.to_le_bytes());
+    init_pool_with(w, ipd)
+}
+
+/// Stake InitPool-family instruction with raw `data` (tag 0 or tag 13 InitTradingPool), same accounts.
+fn init_pool_with(w: &mut World, ipd: Vec<u8>) -> TxResult {
+    let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    for (k, n) in [(w.lp_mint, 82usize), (w.vault, 165usize)] {
+        w.svm
+            .set_account(k, Account { lamports: 1_000_000_000, data: vec![0u8; n], owner: token_program, executable: false, rent_epoch: 0 })
+            .unwrap();
+    }
     let ix = Instruction {
         program_id: w.stake_id,
         accounts: vec![
@@ -797,6 +802,53 @@ fn m4_third_party_append_then_bind_is_refused_forever_on_base() {
     // And the creator cannot reset the fee or retire the slot any more: marketauth is the pool PDA.
     let r = set_init_fee(&mut w, &admin, 0);
     assert!(r.is_err(), "creator is no longer marketauth");
+}
+
+/// Review L1: InitTradingPool (tag 13) shares `process_init_pool`, so it hits the same guard.
+#[test]
+fn m4_init_trading_pool_also_refuses_nonzero_permissionless_init_fee() {
+    let mut w = market_only();
+    let admin = w.admin.insecure_clone();
+    assert!(set_init_fee(&mut w, &admin, 1_000_000).is_ok());
+    let mut d = vec![13u8];
+    d.extend_from_slice(&5u64.to_le_bytes());
+    d.extend_from_slice(&0u64.to_le_bytes());
+    let r = init_pool_with(&mut w, d.clone());
+    assert_eq!(custom(&r), Some(E_MULTI_ASSET_NOT_SUPPORTED), "{}", logs(&r));
+    assert!(set_init_fee(&mut w, &admin, 0).is_ok());
+    let r = init_pool_with(&mut w, d);
+    assert!(r.is_ok(), "fee 0: {}", logs(&r));
+}
+
+/// Review L1: an unpinned wrapper header (FORGED version byte on the real market) fails closed
+/// with UnsupportedWrapperLayout (32) before anything is created.
+#[test]
+fn m4_init_pool_refuses_unpinned_wrapper_layout() {
+    let mut w = market_only();
+    let mut m = w.svm.get_account(&w.market).unwrap();
+    let v = u16::from_le_bytes(m.data[8..10].try_into().unwrap());
+    m.data[8..10].copy_from_slice(&(v + 1).to_le_bytes());
+    w.svm.set_account(w.market, m).unwrap();
+    let r = init_pool(&mut w);
+    assert_eq!(custom(&r), Some(32), "{}", logs(&r));
+    assert!(w.svm.get_account(&w.pool).map(|a| a.data.is_empty()).unwrap_or(true));
+}
+
+/// Review L2: the M-4 invariant needs stake to never CPI wrapper tag 59 (fee setter) or tag 40
+/// (asset lifecycle). Every wrapper tag stake sends is a `const TAG_*: u8 = N;` in src/cpi.rs.
+#[test]
+fn m4_stake_cpi_never_targets_wrapper_tag_59_or_40() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cpi.rs")).unwrap();
+    let mut tags = vec![];
+    for line in src.lines() {
+        let l = line.trim();
+        if l.starts_with("const TAG_") || l.starts_with("pub const TAG_") {
+            let n: u8 = l.rsplit('=').next().unwrap().trim().trim_end_matches(';').trim().parse().unwrap();
+            tags.push(n);
+        }
+    }
+    assert!(tags.len() >= 10, "found the TAG table: {tags:?}");
+    assert!(!tags.contains(&59) && !tags.contains(&40), "M-4 invariant broken: {tags:?}");
 }
 
 /// The invariant the fix relies on (both builds): once InitPool lands with fee 0, nobody can append
