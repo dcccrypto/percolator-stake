@@ -1666,6 +1666,31 @@ pub fn read_wrapper_bind_insurance(data: &[u8]) -> Option<WrapperBindInsurance> 
     })
 }
 
+/// M-4 (AUD-S2-3): the two wrapper fields that decide whether anyone other than `marketauth` can
+/// ever make the market multi-asset: engine `config.max_market_slots` (626) and the wrapper's
+/// `permissionless_market_init_fee` (128). `None` for anything but a pinned-layout wrapper MARKET
+/// account long enough to hold the engine header; the caller refuses.
+pub fn read_wrapper_asset_append_guard(data: &[u8]) -> Option<(u32, u128)> {
+    use crate::wrapper_layout as wl;
+    if !wl::header_is_pinned(data)
+        || data.get(WRAPPER_OFF_KIND) != Some(&WRAPPER_KIND_MARKET)
+        || data.len() < wl::MIN_MARKET_ACCOUNT_LEN
+    {
+        return None;
+    }
+    let slots = u32::from_le_bytes(
+        data.get(wl::MARKET_MAX_MARKET_SLOTS_OFF..wl::MARKET_MAX_MARKET_SLOTS_OFF + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let fee = u128::from_le_bytes(
+        data.get(wl::MARKET_PERMISSIONLESS_INIT_FEE_OFF..wl::MARKET_PERMISSIONLESS_INIT_FEE_OFF + 16)?
+            .try_into()
+            .ok()?,
+    );
+    Some((slots, fee))
+}
+
 /// M-2: asset 0's `(insurance_authority, insurance_operator)` of a pinned-layout wrapper MARKET
 /// account (profile at the start of asset slot 0). `None` for anything else; the caller refuses.
 pub fn read_wrapper_asset0_insurance_keys(data: &[u8]) -> Option<([u8; 32], [u8; 32])> {

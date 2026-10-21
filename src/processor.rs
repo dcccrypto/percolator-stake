@@ -668,6 +668,30 @@ fn process_init_pool(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
+    // M-4 (AUD-S2-3, security review 2026-10-14): every pool this program creates is v5
+    // (`V5Init::validate` admits FIRST_LOSS and FEE_ONLY only), and a v5 bind (tag 19) refuses a
+    // multi-asset market with 48 forever. A third party can append an asset (wrapper tag 40)
+    // only while `permissionless_market_init_fee != 0`; with fee 0 only `marketauth` can. The CPI
+    // below hands `marketauth` to the pool PDA, and this program proxies neither wrapper tag 59
+    // (the fee setter) nor tag 40, so after it both readings are frozen for the pool's life.
+    // Refusing here, before the pool exists, therefore makes the griefable state unreachable,
+    // and the creator (still `marketauth`) can repair the market (fee 0) and retry. Fail closed
+    // on an unpinned layout. INVARIANT for future changes: adding a tag-59 or tag-40 proxy
+    // re-opens M-4.
+    {
+        let (max_market_slots, permissionless_init_fee) =
+            state::read_wrapper_asset_append_guard(&slab.try_borrow_data()?)
+                .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        if max_market_slots != 1 || permissionless_init_fee != 0 {
+            msg!(
+                "InitPool: v5 pools need a single-asset market with permissionless init fee 0 (slots {}, fee {})",
+                max_market_slots,
+                permissionless_init_fee
+            );
+            return Err(StakeError::MultiAssetMarketNotSupported.into());
+        }
+    }
+
     // InitPool now performs a wrapper UpdateAuthority (tag 32) CPI that rotates
     // marketauth to this pool PDA (see `cpi::cpi_update_authority` below), and that
     // CPI marks the slab/market writable. Require the outer InitPool account
@@ -2305,8 +2329,9 @@ fn process_bind_insurance_authority(
     // `expect_live_authority`) or withdraw. Read from the pinned layout only (fail closed),
     // BEFORE the CPIs (they do not move insurance). Other parties' claims (fee legs, rent,
     // reserved credit) are SUBTRACTED, not refused on: the creator cannot clear them. The bind
-    // DOES refuse two states: a multi-asset market (48; never recoverable for that market, so the
-    // launch flow must bind before anyone can append an asset, M-4) and a stale K/F cohort on
+    // DOES refuse two states: a multi-asset market (48; never recoverable for that market. M-4:
+    // unreachable for pools created by this build, since InitPool refuses unless the market is
+    // single-asset with permissionless init fee 0, which then can never change) and a stale K/F cohort on
     // asset 0 (44; retry in one transaction: crank to the current slot, refresh every positioned
     // asset-0 account, then bind; or bind before the market has any position, L-4).
     // `net_deployed` (staker principal flushed and not yet recovered) is subtracted defensively:
