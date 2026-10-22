@@ -1270,17 +1270,42 @@ fn gh311_fo_direct_tag41_fund_equal_seed_books_nothing_for_stakers() {
     assert_eq!(token_amount(&w.svm, &w.creator_ata), SEED);
 }
 
-/// FEE_ONLY Withdraw WITHOUT the optional slab cannot see that the market is terminal, so it
-/// books nothing (#290: it can only under-pay, never over-pay). Pinned so a client knows to pass
-/// the slab.
+/// GH#315 (PR #316): a FEE_ONLY mode-0 Withdraw WITHOUT the optional slab cannot see that the
+/// market is terminal, so it cannot book the #313 terminal surplus before pricing. It used to
+/// proceed and book nothing ("can only under-pay, never over-pay"); under-paying the withdrawer
+/// IS the #311 harm (the shortfall accrues to the stakers who stay), so it now fails closed with
+/// `NotEnoughAccountKeys` and moves nothing. This test previously pinned the OLD behaviour
+/// (`gh311_fo_withdraw_without_slab_books_nothing`: paid <= BOB with no booking); that pin is
+/// intentionally inverted because the behaviour it pinned is the defect #316 removes. The retry
+/// WITH the slab still succeeds and pays the slab-supplied control.
 #[test]
-fn gh311_fo_withdraw_without_slab_books_nothing() {
+fn gh311_fo_withdraw_without_slab_is_refused() {
+    let c = fo_control(true);
     let (mut w, _alice, bob) = fo_scene(true);
     assert!(direct_tag41(&mut w, SEED).is_ok());
     let tpv_before = w.tpv();
-    let paid = exit_all(&mut w, &bob, Tail::None);
-    assert!(paid <= BOB, "no booking without the slab (paid {paid})");
-    assert_eq!(w.tpv(), tpv_before - paid);
+    let vault_before = w.vault_balance();
+    let lp = token_amount(&w.svm, &bob.lp_ata);
+    let bob_before = token_amount(&w.svm, &bob.ata);
+    assert!(lp > 0, "the measured withdraw must be a real, non-zero redemption");
+    let r = withdraw(&mut w, &bob, lp, Tail::None);
+    assert!(
+        matches!(
+            r.as_ref().map_err(|e| e.err.clone()),
+            Err(TransactionError::InstructionError(
+                _,
+                InstructionError::NotEnoughAccountKeys
+            ))
+        ),
+        "withdraw without the slab must be refused: {}",
+        logs(&r)
+    );
+    assert_eq!(w.tpv(), tpv_before, "refused: nothing booked or paid");
+    assert_eq!(w.vault_balance(), vault_before, "refused: vault untouched");
+    assert_eq!(token_amount(&w.svm, &bob.ata), bob_before, "refused: bob paid nothing");
+    // The same withdrawal with the slab succeeds.
+    let paid = exit_all(&mut w, &bob, Tail::Slab);
+    assert_eq!(paid, c.bob_paid, "with the slab bob is paid the tag-29-first control");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

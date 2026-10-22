@@ -2990,8 +2990,11 @@ fn pre_accrue_fee_modes(
 ///   FIRST_LOSS market; with the units figure this books that excess to the stakers before the
 ///   withdrawer is priced, exactly as a tag 29 (amount 0) on the tombstone would.
 /// * Live / Recovery: nothing is booked (#290: a Live-mode donation is not recovery).
-/// * No slab passed (optional on FEE_ONLY / legacy Withdraw): nothing is booked; redeeming at
-///   the unbooked price can only under-pay the withdrawer, never over-pay.
+/// * No slab passed on a mode-0 Withdraw: REFUSED (GH#315). This previously booked nothing,
+///   reasoning that the unbooked price "can only under-pay the withdrawer" -- but that is the
+///   #311 harm itself, and the shortfall accrues to the stakers who stay. FIRST_LOSS never
+///   reached it because its Withdraw already requires the slab; FEE_ONLY and legacy mode-0
+///   pools did, so the #313 booking did not apply to them.
 /// * Unpinned layout: nothing is booked (never worse than before).
 ///
 /// `creator_class_released`: FIRST_LOSS = the wrapper's `creator_paid_to_stake` from the ledger
@@ -3010,8 +3013,22 @@ fn book_terminal_surplus_before_pricing(
     if pool.pool_mode != 0 {
         return Ok(());
     }
+    // GH#315: a mode-0 Withdraw may not opt out of correct pricing by passing fewer
+    // accounts. This used to `return Ok(())`, on the stated grounds that redeeming at
+    // the unbooked price "can only under-pay the withdrawer, never over-pay" -- but
+    // under-paying the withdrawer IS the #311 harm, and the shortfall accrues to the
+    // stakers who stay. FIRST_LOSS never reached it (its Withdraw already requires the
+    // slab on the way to `v5_read_units`), so the #313 booking silently did not apply
+    // to FEE_ONLY or legacy mode-0 pools, which `BindInsuranceAuthority` permits as a
+    // market's insurance authority and which can therefore receive a direct tag-41
+    // terminal payout.
+    //
+    // Fails closed rather than skipping. Safe for every live caller: SDK 8.0.0's
+    // `withdrawAccounts` appends the slab when supplied, and the app supplies it
+    // (`useStakeWithdrawByPool.ts`, `slab: poolSlab`); FIRST_LOSS already errors
+    // without it.
     let Some(slab) = slab else {
-        return Ok(());
+        return Err(ProgramError::NotEnoughAccountKeys);
     };
     if slab.key.to_bytes() != pool.slab || slab.owner.to_bytes() != pool.percolator_program {
         return Err(StakeError::InvalidAccount.into());
@@ -6531,5 +6548,32 @@ mod tests {
         assert_eq!(&bytes[464..472], &u64::MAX.to_le_bytes());
         assert_eq!(&bytes[472..480], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(bytes[456], 1);
+    }
+
+    // GH#315 / PR #316: red on b50fe43 (Ok(()) instead of the refusal), green with the fix.
+    fn gh315_call(
+        mode: u8,
+        f: impl FnOnce(&mut StakePool, &AccountInfo) -> ProgramResult,
+    ) -> ProgramResult {
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; 165];
+        let vault = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+        let mut pool = StakePool::zeroed();
+        pool.pool_mode = mode;
+        f(&mut pool, &vault)
+    }
+
+    #[test]
+    fn gh315_mode0_withdraw_without_slab_is_refused() {
+        let r = gh315_call(0, |p, v| book_terminal_surplus_before_pricing(p, v, None, None));
+        assert_eq!(r, Err(ProgramError::NotEnoughAccountKeys));
+    }
+
+    #[test]
+    fn gh315_mode1_withdraw_without_slab_unaffected() {
+        let r = gh315_call(1, |p, v| book_terminal_surplus_before_pricing(p, v, None, None));
+        assert_eq!(r, Ok(()));
     }
 }
