@@ -5498,7 +5498,6 @@ mod tests {
     use super::*;
     use bytemuck::Zeroable;
 
-
     // ── N7 (CONSOLIDATED-PLAN §2.2): apply_minimum_liquidity_lock ───────────
 
     #[test]
@@ -6549,5 +6548,32 @@ mod tests {
         assert_eq!(&bytes[464..472], &u64::MAX.to_le_bytes());
         assert_eq!(&bytes[472..480], &0x0102_0304_0506_0708u64.to_le_bytes());
         assert_eq!(bytes[456], 1);
+    }
+
+    // GH#315 / PR #316: red on b50fe43 (Ok(()) instead of the refusal), green with the fix.
+    fn gh315_call(
+        mode: u8,
+        f: impl FnOnce(&mut StakePool, &AccountInfo) -> ProgramResult,
+    ) -> ProgramResult {
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut lamports = 0u64;
+        let mut data = vec![0u8; 165];
+        let vault = AccountInfo::new(&key, false, true, &mut lamports, &mut data, &owner, false, 0);
+        let mut pool = StakePool::zeroed();
+        pool.pool_mode = mode;
+        f(&mut pool, &vault)
+    }
+
+    #[test]
+    fn gh315_mode0_withdraw_without_slab_is_refused() {
+        let r = gh315_call(0, |p, v| book_terminal_surplus_before_pricing(p, v, None, None));
+        assert_eq!(r, Err(ProgramError::NotEnoughAccountKeys));
+    }
+
+    #[test]
+    fn gh315_mode1_withdraw_without_slab_unaffected() {
+        let r = gh315_call(1, |p, v| book_terminal_surplus_before_pricing(p, v, None, None));
+        assert_eq!(r, Ok(()));
     }
 }
