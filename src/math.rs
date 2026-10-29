@@ -669,6 +669,85 @@ pub fn closeout_split(
     }
 }
 
+/// D8 / stake #318 (M-3), MARK-TO-CLOSE: the close-out growth that is pending for the stakers
+/// but not yet in `total_pool_value()`: exactly the `stakers` part of [`closeout_split`] over the
+/// surplus the close-out WILL see.
+///
+/// * `unbooked`: vault balance above the booked pool value (tag 29 would split it too).
+/// * `creator_class_pending`: the creator-class fund the wrapper has yet to pay into the vault
+///   at terminal (FEE_ONLY: the insurance authority's withdrawable capacity; unitised
+///   FIRST_LOSS: the value of the creator-class units). The stake class is NOT included: it is
+///   already in the FIRST_LOSS pool value as deployed units.
+/// * `seed`, `forwarded`, `creator_class_released`: as [`closeout_creator_share`]; for a
+///   unitised FIRST_LOSS pool `creator_class_released` must already include
+///   `creator_class_pending` (what the wrapper will have released by then).
+///
+/// A deposit priced at `total_pool_value() + pending_closeout_growth(..)` buys exactly the LP
+/// its collateral is worth once the close-out books the growth, so a deposit placed just before
+/// a predictable resolve cannot capture the growth of the incumbents. Always `<= unbooked +
+/// creator_class_pending` and `0` when the creator's entitlement absorbs everything.
+/// Kani (verified, 31 checks, 2 covers): `kani_d8_pending_growth_equals_closeout_stakers_part`.
+pub fn pending_closeout_growth(
+    unbooked: u64,
+    creator_class_pending: u64,
+    seed: u64,
+    forwarded: u64,
+    creator_class_released: Option<u64>,
+) -> u64 {
+    let total = unbooked.saturating_add(creator_class_pending);
+    let (_creator, stakers, _unclaimed) =
+        closeout_split(total, seed, forwarded, creator_class_released, true);
+    stakers
+}
+
+/// D8 / stake #318 (M-3), MATURITY GATE (`state::MATURITY_GATE_SLOTS`): the haircut a withdrawal
+/// takes on the part of its burn that is YOUNG LP, i.e. minted within the gate of the market's
+/// terminal. Young LP does not share in the close-out surplus: it is paid at most what it cost.
+///
+/// * `young` = `(young_lp, young_cost, young_slot)`: the deposit record's young tranche;
+/// * `lp_amount`: the record's total LP; `lp_burn`: this withdrawal; `payout`: the pro-rata
+///   collateral the pool would pay for `lp_burn`;
+/// * `terminal_slot`: the market's `resolved_slot` (`None` = not terminal / unknown: no haircut).
+///
+/// The record's mature LP is burned first (the user's choice is never worse for it). Returns
+/// `(haircut, young_burned, cost_burned)`: the caller pays `payout - haircut`, leaves the haircut
+/// in the pool (its price rises for everyone who stays: the surplus the young LP may not take),
+/// and removes `young_burned` / `cost_burned` from the record's young tranche.
+/// Properties (exhaustive small-grid test `d8_maturity_haircut_bounds_exhaustive_grid`; a Kani
+/// harness over the u128 multiply/divide did not terminate): `haircut <= payout`; `0` unless young LP is
+/// burned inside the gate; `payout - haircut >= min(payout, cost share)` of the young part, so
+/// only the surplus above cost is withheld and a loss is still borne in full.
+pub fn maturity_haircut(
+    young: (u64, u64, u64),
+    lp_amount: u64,
+    lp_burn: u64,
+    payout: u64,
+    terminal_slot: Option<u64>,
+    gate_slots: u64,
+) -> (u64, u64, u64) {
+    let (young_lp, young_cost, young_slot) = young;
+    let young = young_lp.min(lp_amount);
+    if young == 0 || lp_burn == 0 {
+        return (0, 0, 0);
+    }
+    let mature = lp_amount - young;
+    let young_burned = lp_burn.saturating_sub(mature).min(young);
+    if young_burned == 0 {
+        return (0, 0, 0);
+    }
+    let cost_burned = (young_cost as u128 * young_burned as u128 / young_lp as u128) as u64;
+    let is_young = match terminal_slot {
+        Some(t) => young_slot.saturating_add(gate_slots) > t,
+        None => false,
+    };
+    if !is_young {
+        return (0, young_burned, cost_burned);
+    }
+    // payout attributable to the young part of the burn (floor), capped at its cost.
+    let value_part = (payout as u128 * young_burned as u128 / lp_burn as u128) as u64;
+    (value_part.saturating_sub(cost_burned), young_burned, cost_burned)
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // v5 (Phase 4 item 6): first-loss deployment into the wrapper's insurance.
 // ════════════════════════════════════════════════════════════════════════════
@@ -1607,6 +1686,129 @@ mod tests {
             current, pre_n7,
             "supply==value must cancel the offset exactly"
         );
+    }
+
+    // ── D8 / #318: mark-to-close pricing and the maturity gate ─────────────────────────────
+
+    #[test]
+    fn d8_pending_growth_is_the_stakers_part_of_the_closeout_split() {
+        // FEE_ONLY: 5M fund, seed 3M, nothing forwarded: 2M growth.
+        assert_eq!(pending_closeout_growth(0, 5_000_000, 3_000_000, 0, None), 2_000_000);
+        // an unbooked donation is split the same way as the payout
+        assert_eq!(pending_closeout_growth(1_000, 5_000_000, 3_000_000, 0, None), 2_001_000);
+        // fund == seed: the whole fund is the creator's
+        assert_eq!(pending_closeout_growth(0, 5_000_000, 5_000_000, 0, None), 0);
+        // part of the seed already forwarded: the rest of the fund is growth
+        assert_eq!(pending_closeout_growth(0, 5_000_000, 5_000_000, 3_000_000, None), 3_000_000);
+        // FIRST_LOSS: creator class worth 5M, seed 3M, released-so-far 0 + 5M
+        assert_eq!(pending_closeout_growth(0, 5_000_000, 3_000_000, 0, Some(5_000_000)), 2_000_000);
+        // creator class lost value: the seed return is capped by it, no growth
+        assert_eq!(pending_closeout_growth(0, 2_000_000, 3_000_000, 0, Some(2_000_000)), 0);
+        // nothing pending
+        assert_eq!(pending_closeout_growth(0, 0, 3_000_000, 0, None), 0);
+    }
+
+    /// Exhaustive small grid of the no-dilution inequality (a Kani harness over the u128 division
+    /// did not terminate at u8 width): a deposit priced at
+    /// `P = pv + G`, followed by the close-out booking `G`, leaves the incumbent LP worth at least
+    /// `P - D / (S + lp)`, and marking never mints more LP than the unmarked price.
+    #[test]
+    fn d8_marked_deposit_does_not_dilute_incumbents_exhaustive_grid() {
+        for s in 1u64..48 {
+            for pv in 1u64..48 {
+                for g in 0u64..48 {
+                    for d in 0u64..64 {
+                        let p = pv + g;
+                        let lp = calc_lp_for_deposit(s, p, d).unwrap();
+                        let lp0 = calc_lp_for_deposit(s, pv, d).unwrap();
+                        assert!(lp <= lp0);
+                        let lhs = s as u128 * (p as u128 + d as u128) + d as u128;
+                        let rhs = p as u128 * (s as u128 + lp as u128);
+                        assert!(lhs >= rhs, "s={s} pv={pv} g={g} d={d} lp={lp}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The JIT numbers of the memo: 100M against a 10M incumbent and 2M of growth: unmarked the
+    /// late deposit takes D/(D+S) of it; marked it takes (to rounding) nothing.
+    #[test]
+    fn d8_jit_capture_before_and_after_marking() {
+        let (s, pv, g, d) = (10_000_000u64, 10_000_000u64, 2_000_000u64, 100_000_000u64);
+        let value_after_close = |priced_at: u64| -> u64 {
+            let lp = calc_lp_for_deposit(s, priced_at, d).unwrap();
+            (lp as u128 * (pv + g + d) as u128 / (s + lp) as u128) as u64
+        };
+        let unmarked = value_after_close(pv);
+        let marked = value_after_close(pv + g);
+        assert!(unmarked > d + 1_800_000, "unmarked JIT capture {}", unmarked - d);
+        assert!(marked <= d + 1, "marked JIT capture {}", marked.saturating_sub(d));
+    }
+
+    #[test]
+    fn d8_maturity_haircut_examples() {
+        let gate = 150;
+        // record: 1000 LP, 300 young (cost 300), young at slot 1000; terminal at 1100 (young).
+        // burn 1000 (all): value 1500 -> young part value 450, cost 300 -> haircut 150.
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 1000, 1500, Some(1100), gate), (150, 300, 300));
+        // terminal at 1150: exactly `gate` later = mature, no haircut (bookkeeping still moves).
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 1000, 1500, Some(1150), gate), (0, 300, 300));
+        // terminal at 1149: young.
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 1000, 1500, Some(1149), gate).0, 150);
+        // no terminal (Live): never a haircut.
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 1000, 1500, None, gate).0, 0);
+        // burn only the mature 700: young untouched.
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 700, 1000, Some(1100), gate), (0, 0, 0));
+        // burn 800: 100 young burned (mature first), cost 100, value 1000*100/800 = 125 -> 25.
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 800, 1000, Some(1100), gate), (25, 100, 100));
+        // a loss: the young part is worth less than its cost: paid in full.
+        assert_eq!(maturity_haircut((300, 300, 1000), 1000, 1000, 500, Some(1100), gate).0, 0);
+        // no young record.
+        assert_eq!(maturity_haircut((0, 0, 0), 1000, 1000, 1500, Some(1100), gate), (0, 0, 0));
+        // record young_lp larger than lp_amount is clamped.
+        let (h, yb, _) = maturity_haircut((5000, 5000, 1000), 100, 100, 150, Some(1100), gate);
+        assert!(h <= 150 && yb <= 100);
+    }
+
+    /// Exhaustive small grid of the `maturity_haircut` bounds.
+    #[test]
+    fn d8_maturity_haircut_bounds_exhaustive_grid() {
+        let gate = 3u64;
+        for young_lp in 0u64..7 {
+            for young_cost in [0u64, 1, 5, 9] {
+                for young_slot in 0u64..4 {
+                    for lp_amount in 0u64..8 {
+                        for lp_burn in 0..=lp_amount {
+                            for payout in [0u64, 1, 4, 11, 40] {
+                                for terminal in [None, Some(0u64), Some(2), Some(3), Some(5), Some(9)] {
+                                    let (h, yb, cb) = maturity_haircut(
+                                        (young_lp, young_cost, young_slot), lp_amount, lp_burn,
+                                        payout, terminal, gate,
+                                    );
+                                    assert!(h <= payout);
+                                    assert!(yb <= young_lp.min(lp_burn) && yb <= lp_amount);
+                                    assert!(cb <= young_cost);
+                                    let young = young_lp.min(lp_amount);
+                                    let mature = lp_amount - young;
+                                    if lp_burn <= mature || young == 0 {
+                                        assert_eq!((h, yb, cb), (0, 0, 0));
+                                    }
+                                    let in_gate = matches!(terminal, Some(t) if young_slot + gate > t);
+                                    if !in_gate {
+                                        assert_eq!(h, 0);
+                                    }
+                                    if yb > 0 && lp_burn > 0 && in_gate {
+                                        let vp = payout * yb / lp_burn;
+                                        assert_eq!(payout - h, (payout - vp) + vp.min(cb));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

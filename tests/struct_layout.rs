@@ -247,3 +247,41 @@ fn test_stake_pool_field_offsets() {
         384
     );
 }
+
+/// D8: the terminal-slot record lives in the former `_padding` (bytes 4..8) and the young
+/// tranche in `StakeDeposit._reserved[16..40]`; neither moves any field nor changes a size, and
+/// neither aliases an existing use (the pool's bytes 0..4 and 8.., the deposit's discriminator
+/// [0..8] and junior flag [8]).
+#[test]
+fn d8_padding_and_young_record_alias_nothing() {
+    use percolator_stake::state::{StakeDeposit, STAKE_DEPOSIT_SIZE, STAKE_POOL_SIZE};
+    assert_eq!(STAKE_POOL_SIZE, 480, "StakePool size unchanged (wrapper pins the layout)");
+    let mut pool: StakePool = bytemuck::Zeroable::zeroed();
+    pool.is_initialized = 1;
+    pool.bump = 7;
+    pool.vault_authority_bump = 8;
+    pool.admin_transferred = 1;
+    assert_eq!(pool.terminal_slot_record(), None);
+    pool.record_terminal_slot(123_456);
+    assert_eq!(pool.terminal_slot_record(), Some(123_456));
+    pool.record_terminal_slot(999); // recorded once, never overwritten
+    assert_eq!(pool.terminal_slot_record(), Some(123_456));
+    assert_eq!((pool.is_initialized, pool.bump, pool.vault_authority_bump, pool.admin_transferred), (1, 7, 8, 1));
+    assert_eq!(pool.slab, [0u8; 32], "the byte after the record is untouched");
+    let mut big: StakePool = bytemuck::Zeroable::zeroed();
+    big.record_terminal_slot(u64::from(u32::MAX) + 1);
+    assert_eq!(big.terminal_slot_record(), None, "a slot beyond u32 is not recorded");
+
+    assert_eq!(STAKE_DEPOSIT_SIZE, core::mem::size_of::<StakeDeposit>());
+    let mut d: StakeDeposit = bytemuck::Zeroable::zeroed();
+    d.set_discriminator();
+    d.set_junior_deposit(true);
+    assert!(d.record_young_mint(1_000, 10, 20).is_some());
+    assert_eq!((d.young_lp(), d.young_cost(), d.young_slot()), (10, 20, 1_000));
+    assert!(d.validate_discriminator() && d.is_junior_deposit());
+    // within the gate: joins; outside: replaces.
+    assert!(d.record_young_mint(1_100, 5, 6).is_some());
+    assert_eq!((d.young_lp(), d.young_cost(), d.young_slot()), (15, 26, 1_100));
+    assert!(d.record_young_mint(1_100 + 150, 7, 8).is_some());
+    assert_eq!((d.young_lp(), d.young_cost(), d.young_slot()), (7, 8, 1_250));
+}

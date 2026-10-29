@@ -760,6 +760,10 @@ fn fl_scene(kind: Kind) -> (World, Staker, Staker) {
         Kind::Growth => forge_seed(&mut w, SEED_LOW),
         Kind::Loss => forge_creator_class_loss(&mut w),
     }
+    // D8 (#318): the stakers are MATURE at the terminal (the maturity gate would otherwise treat
+    // a deposit a few slots before the resolve as JIT and cap it at cost); this suite is about
+    // the booking ORDER, not about JIT.
+    w.warp(1_000);
     admin_resolve(&mut w);
     assert_eq!(w.terminal(), WrapperTerminal::Resolved);
     assert_eq!(token_amount(&w.svm, &w.wrapper_vault), FUND);
@@ -786,6 +790,7 @@ fn fo_scene(growth: bool) -> (World, Staker, Staker) {
     if growth {
         forge_seed(&mut w, SEED_LOW);
     }
+    w.warp(1_000); // D8: mature stakers, see `fl_scene`
     admin_resolve(&mut w);
     assert_eq!(w.terminal(), WrapperTerminal::Resolved);
     w.warp(100);
