@@ -1163,6 +1163,10 @@ fn process_deposit(
     // the whole orphaned balance. So senior_total_lp == 0 is NOT bootstrapped 1:1
     // unconditionally; it defers to the same guard the global path uses.
     let lp_to_mint = if pool.tranche_enabled() {
+        // D8: a tranche pool cannot apportion pending close-out growth between its sub-pools.
+        if pending_closeout_growth_for_deposit(pool, vault, fee_slab, None)? != 0 {
+            return Err(StakeError::PendingCloseoutGrowth.into());
+        }
         let senior_lp = pool.senior_total_lp();
         let senior_bal = pool.senior_balance().ok_or(StakeError::Overflow)?;
         crate::math::calc_senior_lp_for_deposit(senior_lp, senior_bal, amount)
@@ -1197,10 +1201,20 @@ fn process_deposit(
             deployed,
         )
         .ok_or(StakeError::Overflow)?;
+        // D8 (mark-to-close): price in the creator-class growth the close-out will book.
+        let growth = pending_closeout_growth_for_deposit(pool, vault, fee_slab, Some(&units))?;
+        let pv = pv.checked_add(growth).ok_or(StakeError::Overflow)?;
         crate::math::calc_lp_for_deposit(pool.total_lp_supply, pv, amount)
             .ok_or(StakeError::Overflow)?
     } else {
-        pool.calc_lp_for_deposit(amount)
+        // D8 (mark-to-close): price in the close-out growth (FEE_ONLY: read from the market).
+        let growth = pending_closeout_growth_for_deposit(pool, vault, fee_slab, None)?;
+        let pv = pool
+            .total_pool_value()
+            .ok_or(StakeError::Overflow)?
+            .checked_add(growth)
+            .ok_or(StakeError::Overflow)?;
+        crate::math::calc_lp_for_deposit(pool.total_lp_supply, pv, amount)
             .ok_or(StakeError::Overflow)?
     };
     // S-4: reject a zero-share mint EXPLICITLY (dedicated variant, not the generic
@@ -1361,6 +1375,10 @@ fn process_deposit(
     deposit.lp_amount = deposit
         .lp_amount
         .checked_add(lp_to_mint)
+        .ok_or(StakeError::Overflow)?;
+    // D8 / #318 maturity gate: remember the young (recent) part of this record.
+    deposit
+        .record_young_mint(clock.slot, lp_to_mint, amount)
         .ok_or(StakeError::Overflow)?;
 
     msg!(
@@ -1664,6 +1682,33 @@ fn process_withdraw(
         pool.calc_collateral_for_withdraw(lp_amount)
             .ok_or(StakeError::Overflow)?
     };
+    // D8 / #318 MATURITY GATE: LP minted within `MATURITY_GATE_SLOTS` of the market's terminal
+    // does not share in the close-out surplus: the young part of this burn is paid at most what
+    // it cost; the rest stays in the pool for the LP that stays. Tranche pools are not gated
+    // (they refuse deposits while growth is pending, `PendingCloseoutGrowth`).
+    let (withdrawal_amount, young_burned, cost_burned) = if pool.tranche_enabled() {
+        (withdrawal_amount, 0u64, 0u64)
+    } else {
+        let terminal_slot = terminal_slot_for_gate(pool, fee_slab)?;
+        let dep_ref = deposit_pda.try_borrow_data()?;
+        let dep = deposit_from_data(&dep_ref[..])?;
+        let (haircut, yb, cb) = crate::math::maturity_haircut(
+            (dep.young_lp(), dep.young_cost(), dep.young_slot()),
+            dep.lp_amount,
+            lp_amount,
+            withdrawal_amount,
+            terminal_slot,
+            state::MATURITY_GATE_SLOTS,
+        );
+        if haircut > 0 {
+            msg!(
+                "Withdraw: maturity gate: {} of the payout is close-out surplus on LP minted within {} slots of the terminal; it stays in the pool",
+                haircut,
+                state::MATURITY_GATE_SLOTS
+            );
+        }
+        (withdrawal_amount - haircut, yb, cb)
+    };
     let fully_wiped_junior_exit = pool.tranche_enabled()
         && is_junior
         && pool.effective_junior_balance() == 0
@@ -1857,9 +1902,23 @@ fn process_withdraw(
     // mixing requires a RESIDUAL liened position; with lp_amount == 0 there is nothing to mix.
     // Metadata-only — touches no token/LP/accounting field. The deposit re-init path
     // (process_deposit / process_deposit_junior) correctly re-initializes a zeroed record.
+    if young_burned > 0 {
+        let (yl, yc, ys) = (
+            deposit_mut.young_lp(),
+            deposit_mut.young_cost(),
+            deposit_mut.young_slot(),
+        );
+        deposit_mut.set_young(
+            yl.saturating_sub(young_burned),
+            yc.saturating_sub(cost_burned),
+            ys,
+        );
+    }
+
     if deposit_mut.lp_amount == 0 {
         deposit_mut.is_initialized = 0;
         deposit_mut._reserved[8] = 0;
+        deposit_mut.set_young(0, 0, 0);
     }
 
     if pool.tranche_enabled() && is_junior {
@@ -2969,6 +3028,80 @@ fn pre_accrue_fee_modes(
     Ok(())
 }
 
+/// D8 / stake #318 (M-3), MARK-TO-CLOSE: the close-out growth pending for the LP holders that
+/// `total_pool_value()` does not yet contain, so a deposit can be priced at `pool value + growth`.
+///
+/// Closes the JIT capture: tag 29 books the growth pro rata to whoever holds LP when the market
+/// closes, so a deposit priced at booked value one slot before a predictable resolve took
+/// `D / (D + LP)` of it. Priced with the growth, the same deposit buys exactly the LP its
+/// collateral is worth after the booking. Withdraw stays at booked value (the asymmetry is
+/// fail-safe: a depositor priced with growth that never arrives only loses).
+///
+/// It is the `stakers` part of the SAME split tag 29 makes (`math::pending_closeout_growth` over
+/// `math::closeout_split`), over what the close-out will see:
+/// * `unbooked`: pool vault balance above booked value;
+/// * FEE_ONLY (and a FIRST_LOSS market whose unit ledger is still empty): the insurance
+///   authority's withdrawable capacity read from the wrapper market, the same lower bound the
+///   bind measured the seed with (`math::creator_seed_at_bind`);
+/// * unitised FIRST_LOSS: the value of the creator-class units at the free (exit) reading; the
+///   stake class is already in the pool value as deployed units.
+///
+/// `0` (the legacy price) when no growth is priceable: mode-1 pools, legacy risk mode, a pool
+/// whose custody bind recorded no seed (it does not hold the market's insurance), or a pool with
+/// no LP yet (the genesis deposit has nobody to dilute and mints 1:1).
+/// `slab` must already be verified as `pool.slab` by `pre_accrue_fee_modes`.
+fn pending_closeout_growth_for_deposit(
+    pool: &state::StakePool,
+    vault: &AccountInfo,
+    slab: Option<&AccountInfo>,
+    units: Option<&state::WrapperInsUnits>,
+) -> Result<u64, ProgramError> {
+    if pool.pool_mode != 0
+        || !pool.is_v5_risk_mode()
+        || !pool.creator_seed_recorded()
+        || pool.total_lp_supply == 0
+    {
+        return Ok(0);
+    }
+    let slab = slab.ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if slab.key.to_bytes() != pool.slab || slab.owner.to_bytes() != pool.percolator_program {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    let capacity = || -> Result<u64, ProgramError> {
+        let b = state::read_wrapper_bind_insurance(&slab.try_borrow_data()?)
+            .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        Ok(crate::math::creator_seed_at_bind(
+            b.insurance,
+            b.vault,
+            b.credit_reserved,
+            b.asset0_budget_remaining,
+            0,
+        ))
+    };
+    let (creator_class_pending, released) = match units {
+        Some(u) if u.units_total != 0 => {
+            let creator_val =
+                crate::math::deployed_value(u.units_creator, u.units_total, u.snap_free)
+                    .ok_or(StakeError::Overflow)?;
+            let paid = u64::try_from(u.creator_paid_to_stake).map_err(|_| StakeError::Overflow)?;
+            (
+                creator_val,
+                Some(paid.checked_add(creator_val).ok_or(StakeError::Overflow)?),
+            )
+        }
+        _ => (capacity()?, None),
+    };
+    let unbooked =
+        token_balance(vault)?.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
+    Ok(crate::math::pending_closeout_growth(
+        unbooked,
+        creator_class_pending,
+        pool.creator_seed_atoms(),
+        pool.creator_total_forwarded_atoms(),
+        released,
+    ))
+}
+
 /// GH#311 (close-out line): before a Withdraw prices, book a TERMINAL vault surplus exactly as
 /// RecoverTerminalInsurance (tag 29) would, keeping the creator's close-out share unbooked.
 ///
@@ -3201,6 +3334,39 @@ fn wrapper_fee_payouts(
 /// CloseSlab tombstone. `state::read_wrapper_terminal` fails closed, so anything that is
 /// not the exact pinned tombstone (wrong magic / VERSION / kind / length) returns `false`
 /// and takes the unchanged live-market path.
+/// D8 maturity gate: the wrapper market's terminal slot, or `None` (gate off) when the pool has
+/// no market concept (mode 1), the market is not terminal, or the slot cannot be read.
+/// A Resolved market is read live (and recorded once in the pool, `record_terminal_slot`); a
+/// CloseSlab tombstone has lost it, so the recorded copy is used (AdminCloseSlab and the tag-29 /
+/// Withdraw reads of the Resolved market record it before the tombstone exists).
+/// The slab, when passed, is verified as `pool.slab` owned by `pool.percolator_program`.
+fn terminal_slot_for_gate(
+    pool: &mut state::StakePool,
+    slab: Option<&AccountInfo>,
+) -> Result<Option<u64>, ProgramError> {
+    if pool.pool_mode != 0 {
+        return Ok(None);
+    }
+    let Some(slab) = slab else {
+        return Ok(pool.terminal_slot_record());
+    };
+    if slab.key.to_bytes() != pool.slab || slab.owner.to_bytes() != pool.percolator_program {
+        return Ok(pool.terminal_slot_record());
+    }
+    let data = slab.try_borrow_data()?;
+    match state::read_wrapper_terminal(&data) {
+        state::WrapperTerminal::Resolved => {
+            if let Some(t) = state::read_wrapper_resolved_slot(&data) {
+                pool.record_terminal_slot(t);
+                return Ok(Some(t));
+            }
+            Ok(pool.terminal_slot_record())
+        }
+        state::WrapperTerminal::Closed => Ok(pool.terminal_slot_record()),
+        _ => Ok(None),
+    }
+}
+
 fn slab_is_closed_tombstone(
     pool: &state::StakePool,
     slab: Option<&AccountInfo>,
@@ -3667,6 +3833,11 @@ fn process_deposit_junior(
     // PR #148 — KEEP it. The InsuranceLossOutstanding gate below is added AFTER it, not in
     // place of it, so #148's JIT fee-snipe guard stays intact.)
     pre_accrue_fee_modes(pool, vault, fee_slab, true)?;
+
+    // D8: a tranche pool cannot apportion pending close-out growth between its sub-pools.
+    if pending_closeout_growth_for_deposit(pool, vault, fee_slab, None)? != 0 {
+        return Err(StakeError::PendingCloseoutGrowth.into());
+    }
 
     // Pause junior deposits while an insurance loss is OUTSTANDING (flushed but not
     // yet returned). effective_junior_balance() applies the pool's CURRENT net_loss
@@ -4318,6 +4489,9 @@ fn process_recover_terminal_insurance(
         return Err(StakeError::MarketNotTerminal.into());
     }
 
+    // D8: record the terminal slot for the maturity gate while the market is still readable.
+    terminal_slot_for_gate(pool, Some(market))?;
+
     let read_vault_balance = |ai: &AccountInfo| -> Result<u64, ProgramError> {
         let data = ai.try_borrow_data()?;
         let acct = crate::spl_token::state::Account::unpack(&data)?;
@@ -4600,6 +4774,9 @@ fn process_admin_close_slab(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pr
             let paid = wrapper_fee_payouts(pool, market)?;
             accrue_fees_inner(pool, balance, Some(paid))?;
         }
+        // D8: the CloseSlab tombstone erases the market's resolved_slot; keep the copy the
+        // maturity gate needs (the market is Resolved and readable right here).
+        terminal_slot_for_gate(pool, Some(market))?;
     }
 
     // CPI. No borrow of the pool account is held: the pool PDA is a CPI account

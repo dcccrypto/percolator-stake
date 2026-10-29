@@ -918,16 +918,18 @@ fn l4_stale_cohort_after_a_real_price_move_blocks_bind_until_every_position_is_t
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════
-// M-3 (characterisation; no code change on this branch)
+// M-3 / D8 (#318): mark-to-close pricing + maturity gate (was a characterisation of the flaw)
 // ═════════════════════════════════════════════════════════════════════════════════════════
 
 /// Alice stakes for the life of the market. Bob deposits the same amount one slot before the
 /// (predictable) admin resolve, and leaves right after the close-out. Growth above the seed
-/// (`BUDGET - SEED`) is booked pro rata at the close-out, so Bob takes about half of it for a
-/// position held only a few slots. Pins the CURRENT behaviour; if M-3 is fixed (any option), the
-/// `bob_profit` assert flips and this test must be updated with the decision.
+/// (`BUDGET - SEED`) is booked at the close-out. BEFORE D8 Bob took about half of it for a
+/// position held only a few slots (this test pinned that flaw); NOW the deposit is priced with
+/// the pending growth (mark-to-close) and, as a backstop, LP minted within `MATURITY_GATE_SLOTS`
+/// of the terminal does not share in the surplus: Bob earns (to rounding) nothing and Alice
+/// keeps the growth. The full red/green matrix is `tests/d8_jit_closeout_e2e.rs`.
 #[test]
-fn m3_jit_deposit_before_resolve_shares_closeout_growth_pro_rata() {
+fn m3_jit_deposit_before_resolve_no_longer_shares_closeout_growth() {
     const SEED: u64 = 3_000_000;
     let mut w = market_only();
     assert!(init_pool(&mut w).is_ok());
@@ -947,10 +949,14 @@ fn m3_jit_deposit_before_resolve_shares_closeout_growth_pro_rata() {
     let growth = BUDGET - SEED;
     let bob_profit = bob_out.saturating_sub(STAKE);
     let alice_profit = alice_out.saturating_sub(STAKE);
-    eprintln!("M-3: growth {growth}, alice +{alice_profit} (100k+ slots), bob +{bob_profit} (~2 slots)");
+    eprintln!("M-3/D8: growth {growth}, alice +{alice_profit} (100k+ slots), bob +{bob_profit} (~2 slots)");
     assert!(
-        bob_profit * 100 >= growth * 49,
-        "JIT staker takes ~half the growth: bob +{bob_profit} of {growth}"
+        bob_profit * 1_000 <= growth,
+        "JIT staker must not take the growth: bob +{bob_profit} of {growth}"
+    );
+    assert!(
+        alice_profit * 100 >= growth * 99,
+        "the long-term staker keeps the growth: alice +{alice_profit} of {growth}"
     );
     assert!(alice_profit + bob_profit <= growth);
 }

@@ -343,6 +343,21 @@ pub const HYSTERESIS_DEFAULT_BPS: u16 = 500;
 pub const HYSTERESIS_MAX_BPS: u16 = 2_000;
 /// One sync per 150 slots (~1 minute) by default.
 pub const SYNC_COOLDOWN_DEFAULT_SLOTS: u64 = 150;
+/// D8 / stake #318 (M-3), MATURITY GATE: LP minted fewer than this many slots before the wrapper
+/// market's terminal (`resolved_slot`) does not share in the close-out surplus: at withdrawal it
+/// is paid at most the collateral it cost (`math::maturity_haircut`).
+///
+/// 150 slots (~1 minute) on purpose. It equals the protocol's standard stake cooldown (D7 / D22
+/// enforce >= 150 at the vault-LP bind; clients already use 150) and `SYNC_COOLDOWN_DEFAULT_SLOTS`,
+/// so a staker who has been in the pool for one cooldown is mature and an honest staker is never
+/// touched: the gate only bites a deposit placed inside the last cooldown before a resolve, which
+/// is exactly the JIT window (the stake cooldown of 5 slots some devnet pools use "enables JIT
+/// staking", D7). It is deliberately SHORT (the memo's word): mark-to-close pricing already makes
+/// the deposit fair, so the gate is only the backstop for a growth that the pre-terminal reading
+/// under-estimated; a long gate would only lock out honest late stakers from the close-out they
+/// legitimately funded. A pool-config value would let the creator (who is the admin and times
+/// the resolve) shorten it, so it is a program constant.
+pub const MATURITY_GATE_SLOTS: u64 = 150;
 /// S-6 (security review 2026-10-05): a deploy-target change commits no earlier than this many
 /// slots (~1 day) after its proposal, whatever the creator-chosen pool cooldown (min 1 slot):
 /// the stakers' exit window is a protocol constant.
@@ -529,6 +544,39 @@ impl StakeDeposit {
     // instead of silently corrupting tranche isolation.
 
     /// Whether this deposit belongs to the junior tranche.
+    /// D8 maturity gate: the YOUNG tranche of this deposit record, `_reserved[16..40]`
+    /// (`young_lp`, `young_cost`, `young_slot`, LE u64 each; the record size is unchanged):
+    /// LP minted by the most recent deposits (all within `MATURITY_GATE_SLOTS` of each other) and
+    /// the collateral they cost. Everything else in `lp_amount` is mature.
+    pub fn young_lp(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[16..24].try_into().unwrap())
+    }
+    pub fn young_cost(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[24..32].try_into().unwrap())
+    }
+    pub fn young_slot(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[32..40].try_into().unwrap())
+    }
+    pub fn set_young(&mut self, lp: u64, cost: u64, slot: u64) {
+        self._reserved[16..24].copy_from_slice(&lp.to_le_bytes());
+        self._reserved[24..32].copy_from_slice(&cost.to_le_bytes());
+        self._reserved[32..40].copy_from_slice(&slot.to_le_bytes());
+    }
+    /// A deposit at `slot` minted `lp` for `cost`: it joins the young tranche if that tranche is
+    /// itself still young at `slot`, else it replaces it (the older tranche has matured).
+    /// `None` on overflow (fail closed).
+    pub fn record_young_mint(&mut self, slot: u64, lp: u64, cost: u64) -> Option<()> {
+        let (new_lp, new_cost) = if self.young_lp() != 0
+            && slot.saturating_sub(self.young_slot()) < MATURITY_GATE_SLOTS
+        {
+            (self.young_lp().checked_add(lp)?, self.young_cost().checked_add(cost)?)
+        } else {
+            (lp, cost)
+        };
+        self.set_young(new_lp, new_cost, slot);
+        Some(())
+    }
+
     pub fn is_junior_deposit(&self) -> bool {
         self._reserved[8] == 1
     }
@@ -1255,6 +1303,26 @@ impl StakePool {
         )
     }
 
+    /// D8: the wrapper market's `resolved_slot` as first observed by this program (bytes 4..8 of
+    /// the pool, the former `_padding`; LE u32; 0 = not observed). The wrapper's CloseSlab
+    /// tombstone erases the market's `resolved_slot`, so the maturity gate (`MATURITY_GATE_SLOTS`)
+    /// needs this copy. The wrapper reads none of bytes 4..8 (it reads offset 0 and 8+), the pool
+    /// size is unchanged. A slot above `u32::MAX` (decades away) is not recorded: the gate is off
+    /// rather than wrong.
+    pub fn terminal_slot_record(&self) -> Option<u64> {
+        let v = u32::from_le_bytes(self._padding);
+        (v != 0).then_some(v as u64)
+    }
+
+    /// D8: record the terminal slot once (never overwritten: a market resolves once).
+    pub fn record_terminal_slot(&mut self, slot: u64) {
+        if self.terminal_slot_record().is_none() {
+            if let Ok(v) = u32::try_from(slot) {
+                self._padding = v.to_le_bytes();
+            }
+        }
+    }
+
     /// Recorded unclaimed terminal surplus (bytes 281..288 + 334). See
     /// [`MODE_PADDING_TERMINAL_UNCLAIMED`].
     pub fn terminal_unclaimed_atoms(&self) -> u64 {
@@ -1595,6 +1663,19 @@ pub fn read_wrapper_terminal(data: &[u8]) -> WrapperTerminal {
         }
         _ => WrapperTerminal::UnknownLayout,
     }
+}
+
+/// D8: the `resolved_slot` of a pinned-layout wrapper MARKET account whose engine mode is
+/// Resolved. `None` for anything else (live, tombstone, unpinned layout) or a zero slot; the
+/// caller then has no terminal slot and the maturity gate is off. The caller must already have
+/// checked the account's key (== `pool.slab`) and owner (== `pool.percolator_program`).
+pub fn read_wrapper_resolved_slot(data: &[u8]) -> Option<u64> {
+    if read_wrapper_terminal(data) != WrapperTerminal::Resolved {
+        return None;
+    }
+    let off = crate::wrapper_layout::MARKET_RESOLVED_SLOT_OFF;
+    let v = u64::from_le_bytes(data.get(off..off + 8)?.try_into().ok()?);
+    (v != 0).then_some(v)
 }
 
 /// FEE_ONLY growth-plan reading: the engine `insurance` balance of a pinned-layout wrapper

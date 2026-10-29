@@ -126,6 +126,12 @@ pub const ASSET0_AUTHORITY_EPOCH_OFF: usize =
 pub const MARKET_ASSET_GENERATION_FRONTIER_OFF: usize = MARKET_GROUP_OFF + GROUP_NEXT_MARKET_ID_OFF;
 /// Engine `mode` byte.
 pub const MARKET_MODE_OFF: usize = MARKET_GROUP_OFF + GROUP_MODE_OFF;
+/// D8: engine `resolved_slot` (u64 LE), the slot at which the market was resolved: the byte
+/// right after `mode` in the same header. Measured against the deployed v2.2 wrapper
+/// (6kpg2wi7, VERSION 19): a resolve at slot S leaves 0 -> S here (and nowhere else but the
+/// `current_slot` field, which moves on every crank). Pinned by
+/// `tests/d8_jit_closeout_e2e.rs::d8_resolved_slot_offset_is_pinned`. Zero while not resolved.
+pub const MARKET_RESOLVED_SLOT_OFF: usize = MARKET_GROUP_OFF + GROUP_MODE_OFF + 1;
 /// Engine `insurance` balance (u128 LE).
 pub const MARKET_INSURANCE_OFF: usize = MARKET_GROUP_OFF + GROUP_INSURANCE_OFF;
 pub const MARKET_INS_CREDIT_RESERVED_OFF: usize = MARKET_GROUP_OFF + GROUP_INS_CREDIT_RESERVED_OFF;
@@ -188,6 +194,7 @@ const _: () = assert!(CONFIG_PERMISSIONLESS_INIT_FEE_OFF + 16 <= WRAPPER_CONFIG_
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);
+const _: () = assert!(GROUP_MODE_OFF + 1 + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_INSURANCE_OFF + 16 <= MARKET_GROUP_LEN);
 
 /// True iff `data` carries the wrapper magic and EXACTLY the pinned header VERSION. Every raw

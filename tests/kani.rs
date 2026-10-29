@@ -1408,6 +1408,39 @@ mod kani_proofs {
         kani::cover!(fwd > 0 && reserved > 0, "COVER: after an earlier forward");
     }
 
+    /// PROOF D8 / #318 (`kani_d8_pending_growth_equals_closeout_stakers_part`) on the REAL
+    /// `math::pending_closeout_growth`: the mark-to-close growth is exactly what the close-out
+    /// (`closeout_split`, real stakers present) books to the stakers out of the surplus it will
+    /// see: `growth + creator share == unbooked + pending creator class` to the atom, never above
+    /// it, and `0` while the creator's remaining entitlement absorbs the whole surplus. Bounded u32.
+    /// MUTANTS: (M1) the creator share not deducted (growth = the whole surplus); (M2) forwarded
+    /// ignored; (M3) the creator-class cap ignored.
+    #[kani::proof]
+    fn kani_d8_pending_growth_equals_closeout_stakers_part() {
+        let unbooked = kani::any::<u32>() as u64;
+        let pending = kani::any::<u32>() as u64;
+        let seed = kani::any::<u32>() as u64;
+        let forwarded = kani::any::<u32>() as u64;
+        let unitised: bool = kani::any();
+        let cc = kani::any::<u32>() as u64;
+        let released = if unitised { Some(cc) } else { None };
+        let g = percolator_stake::math::pending_closeout_growth(
+            unbooked, pending, seed, forwarded, released,
+        );
+        let total = unbooked + pending;
+        let creator = percolator_stake::math::closeout_creator_share(total, seed, forwarded, released);
+        assert_eq!(g + creator, total, "growth + creator share == the surplus the close-out sees");
+        let (c2, stakers, unclaimed) =
+            percolator_stake::math::closeout_split(total, seed, forwarded, released, true);
+        assert_eq!((c2, stakers, unclaimed), (creator, g, 0), "== tag 29's stakers part");
+        let cap = if unitised { seed.min(cc) } else { seed };
+        if cap.saturating_sub(forwarded) >= total {
+            assert_eq!(g, 0, "the creator's entitlement absorbs everything");
+        }
+        kani::cover!(g > 0 && creator > 0, "COVER: growth above a partly paid seed");
+        kani::cover!(g == 0 && total > 0, "COVER: all of it is the creator's");
+    }
+
     /// PROOF I-S1 (`kani_s3_admin_cannot_flush`), dispatch level on the REAL
     /// `processor::process`: tag 3 (FlushToInsurance) and tag 23 (RecoverFlushedInsurance) are
     /// `Err(DeprecatedV5)` for ANY amount and ANY caller, before a single account is read (the
