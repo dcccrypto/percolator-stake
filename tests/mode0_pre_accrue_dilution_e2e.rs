@@ -233,12 +233,8 @@ fn encode_init_pool(cooldown_slots: u64, deposit_cap: u64) -> Vec<u8> {
     out.push(0u8); // tag InitPool
     out.extend_from_slice(&cooldown_slots.to_le_bytes());
     out.extend_from_slice(&deposit_cap.to_le_bytes());
-    // v5: the 16-byte InitPool now creates a FIRST_LOSS pool (consent-gated deposits). These suites test
-    // the pre-v5 fee-only (mode 0) behaviour, which is v5 risk mode FEE_ONLY: no insurance deployment.
-    out.push(2u8); // risk_mode FEE_ONLY
-    out.extend_from_slice(&0u16.to_le_bytes()); // deploy_target_bps
-    out.extend_from_slice(&3_000u16.to_le_bytes()); // liquid_buffer_bps
-    out.extend_from_slice(&500u16.to_le_bytes()); // hysteresis_bps
+    // GH#322: the 16-byte InitPool = a FIRST_LOSS pool, the only kind wrapper tag 87 pays (a FEE_ONLY
+    // pool is refused with StakePoolModeMismatch), so the only kind #290 attribution applies to.
     out
 }
 
@@ -355,8 +351,17 @@ fn deposit_ix(
     slab: Pubkey,
 ) -> Instruction {
     let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+    let wrapper_id = Pubkey::from_str(WRAPPER_MAINNET).unwrap();
     let mut data = vec![1u8]; // tag = Deposit
     data.extend_from_slice(&amount.to_le_bytes());
+    // GH#322: FIRST_LOSS pool -> signed consent bytes + the wrapper's InsuranceUnitsV20 (refreshed by
+    // CPI) + the wrapper program (as f3_dead_share_accrue_guard_e2e.rs).
+    data.extend_from_slice(&percolator_stake::state::deposit_consent_bytes(
+        percolator_stake::state::DEPLOY_TARGET_DEFAULT_BPS,
+        percolator_stake::state::LIQUID_BUFFER_DEFAULT_BPS,
+        percolator_stake::state::HYSTERESIS_DEFAULT_BPS,
+    ));
+    let units = percolator_stake::state::derive_wrapper_ins_units(&wrapper_id, &slab).0;
     Instruction {
         program_id: stake_id,
         accounts: vec![
@@ -371,7 +376,9 @@ fn deposit_ix(
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
             AccountMeta::new_readonly(system_program::id(), false),
-            AccountMeta::new_readonly(slab, false), // 11. wrapper market (#290)
+            AccountMeta::new(slab, false), // 11. wrapper market (#290; v5: writable)
+            AccountMeta::new(units, false), // 12. v5 InsuranceUnitsV20
+            AccountMeta::new_readonly(wrapper_id, false), // 13. v5 wrapper program
         ],
         data,
     }
