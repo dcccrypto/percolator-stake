@@ -160,6 +160,15 @@ pub const MIN_MARKET_ACCOUNT_LEN: usize = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
 pub const CONFIG_PERMISSIONLESS_INIT_FEE_OFF: usize = 3 * 32 + 16;
 pub const MARKET_PERMISSIONLESS_INIT_FEE_OFF: usize = HEADER_LEN + CONFIG_PERMISSIONLESS_INIT_FEE_OFF;
 
+/// #318 item 2: `WrapperConfigV16.permissionless_resolve_stale_slots` (u64), config-relative: after
+/// `permissionless_market_init_fee` (u128 at 112) comes `trade_fee_base_bps` (u64 at 128), then this
+/// field at 136. `offset_of!` against wrapper rc23 `dump_layout`; real-bytes pin
+/// `tests/v22live_s2_3_e2e.rs::gh318_pin_resolve_stale_offset_on_real_wrapper` (wrapper tag 38
+/// writes exactly these 8 bytes). 0 = permissionless resolve disabled (the InitMarket default).
+pub const CONFIG_PERMISSIONLESS_RESOLVE_STALE_OFF: usize = 3 * 32 + 16 + 16 + 8;
+pub const MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF: usize =
+    HEADER_LEN + CONFIG_PERMISSIONLESS_RESOLVE_STALE_OFF;
+
 // ── Value pins. Edit an input above without updating these and the build fails. ──
 const _: () = assert!(MARKET_GROUP_OFF == 592);
 const _: () = assert!(ASSET0_WRAPPER_START == 1398);
@@ -191,6 +200,8 @@ const _: () = assert!(ASSET_INSURANCE_OPERATOR_OFF + 32 <= ASSET_INSURANCE_TOP_U
 const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1398);
 const _: () = assert!(MARKET_PERMISSIONLESS_INIT_FEE_OFF == 128);
 const _: () = assert!(CONFIG_PERMISSIONLESS_INIT_FEE_OFF + 16 <= WRAPPER_CONFIG_LEN);
+const _: () = assert!(MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF == 152);
+const _: () = assert!(CONFIG_PERMISSIONLESS_RESOLVE_STALE_OFF + 8 <= WRAPPER_CONFIG_LEN);
 // Both header-field reads must lie INSIDE the header they are relative to.
 const _: () = assert!(GROUP_NEXT_MARKET_ID_OFF + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);

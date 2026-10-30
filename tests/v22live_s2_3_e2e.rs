@@ -871,6 +871,140 @@ fn m4_fee_zero_market_cannot_be_appended_or_refeed_after_init_pool() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════
+// #318 item 2: InitPool refuses a market with a permissionless stale resolve configured
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+const E_PERMISSIONLESS_RESOLVE_ENABLED: u32 = 50;
+/// `permissionless_resolve` is control-sequence lane 8 (after market_init_fee = lane 7).
+const ASSET0_PERMISSIONLESS_RESOLVE_SEQ_OFF: usize = ASSET0_ORACLE_OBS_SEQ_OFF + 8 * 8;
+
+/// Wrapper tag 38 ConfigurePermissionlessResolve, signed by marketauth (the creator before InitPool).
+fn set_resolve_stale(w: &mut World, stale_slots: u64) -> TxResult {
+    let frontier = rd_u64(&w.svm, &w.market, wl::MARKET_ASSET_GENERATION_FRONTIER_OFF);
+    let seq = rd_u64(&w.svm, &w.market, ASSET0_PERMISSIONLESS_RESOLVE_SEQ_OFF) + 1;
+    let mut d = vec![38u8];
+    d.extend_from_slice(&frontier.to_le_bytes());
+    d.extend_from_slice(&stale_slots.to_le_bytes());
+    d.extend_from_slice(&1_000u64.to_le_bytes()); // force_close_delay_slots
+    d.extend_from_slice(&seq.to_le_bytes());
+    let ix = Instruction {
+        program_id: w.wrapper_id,
+        accounts: vec![AccountMeta::new(w.admin.pubkey(), true), AccountMeta::new(w.market, false)],
+        data: d,
+    };
+    let (admin, payer) = (w.admin.insecure_clone(), w.payer.insecure_clone());
+    send_ixs(&mut w.svm, &payer, &[&admin], vec![ix])
+}
+
+/// Overwrite the raw field (for values the wrapper's own setter would refuse).
+fn forge_resolve_stale(w: &mut World, v: u64) {
+    let mut m = w.svm.get_account(&w.market).unwrap();
+    let o = wl::MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF;
+    m.data[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    w.svm.set_account(w.market, m).unwrap();
+}
+
+fn assert_init_pool_refused_for_resolve_stale(w: &mut World, v: u64) {
+    let r = init_pool(w);
+    assert_eq!(custom(&r), Some(E_PERMISSIONLESS_RESOLVE_ENABLED), "stale_slots {v}: {}", logs(&r));
+    assert!(w.svm.get_account(&w.pool).map(|a| a.data.is_empty()).unwrap_or(true), "no pool created ({v})");
+    let d = w.svm.get_account(&w.market).unwrap().data;
+    assert_eq!(&d[16..48], w.admin.pubkey().as_ref(), "marketauth NOT handed to the pool PDA ({v})");
+}
+
+/// Pins the raw offset on the REAL wrapper: tag 38 writes exactly the u64 at 152..160 (0 from
+/// InitMarket), and the program's own reader sees it.
+#[test]
+fn gh318_pin_resolve_stale_offset_on_real_wrapper() {
+    let mut w = market_only();
+    let o = wl::MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF;
+    assert_eq!(o, 152);
+    assert_eq!(rd_u64(&w.svm, &w.market, o), 0, "InitMarket writes 0 (disabled)");
+    let before = w.svm.get_account(&w.market).unwrap().data;
+    let r = set_resolve_stale(&mut w, 123_456);
+    assert!(r.is_ok(), "{}", logs(&r));
+    assert_eq!(rd_u64(&w.svm, &w.market, o), 123_456);
+    assert_eq!(
+        percolator_stake::state::read_wrapper_permissionless_resolve_stale_slots(
+            &w.svm.get_account(&w.market).unwrap().data
+        ),
+        Some(123_456)
+    );
+    // The neighbouring config fields did not move (the write is the 8 bytes at `o`).
+    let after = w.svm.get_account(&w.market).unwrap().data;
+    for i in 16..16 + 296 {
+        if !(o..o + 16).contains(&i) {
+            // force_close_delay_slots (o+8..o+16) is also written by tag 38; everything else is untouched.
+            assert_eq!(before[i], after[i], "config byte {i} changed outside the stale/force-close fields");
+        }
+    }
+}
+
+/// FIXED BEHAVIOUR: a market with a configured permissionless stale resolve (through the wrapper's
+/// own setter: the minimum, a middling value and the maximum) is refused by InitPool with 50,
+/// before the pool exists and without moving marketauth. On the base build InitPool succeeds.
+#[test]
+fn gh318_init_pool_refuses_configured_permissionless_resolve() {
+    for v in [9_000u64, 100_000, 6_480_000] {
+        let mut w = market_only();
+        let r = set_resolve_stale(&mut w, v);
+        assert!(r.is_ok(), "wrapper setter {v}: {}", logs(&r));
+        assert_init_pool_refused_for_resolve_stale(&mut w, v);
+    }
+}
+
+/// Out-of-range / garbage raw values the wrapper's setter would never write are refused too: the
+/// guard is `!= 0`, not a range check, so it cannot be skirted by a value near either bound.
+#[test]
+fn gh318_init_pool_refuses_any_nonzero_raw_value() {
+    for v in [1u64, 8_999, 6_480_001, u64::MAX] {
+        let mut w = market_only();
+        forge_resolve_stale(&mut w, v);
+        assert_init_pool_refused_for_resolve_stale(&mut w, v);
+    }
+}
+
+/// A market left at the InitMarket default (0 = permissionless resolve disabled) launches normally:
+/// InitPool then bind succeed, and the value stays 0 and unchangeable (marketauth is the pool PDA).
+#[test]
+fn gh318_init_pool_accepts_zero_and_the_value_stays_frozen() {
+    let mut w = market_only();
+    assert_eq!(rd_u64(&w.svm, &w.market, wl::MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF), 0);
+    let r = init_pool(&mut w);
+    assert!(r.is_ok(), "InitPool: {}", logs(&r));
+    let r = bind(&mut w);
+    assert!(r.is_ok(), "bind: {}", logs(&r));
+    let r = set_resolve_stale(&mut w, 9_000);
+    assert_eq!(custom(&r), Some(W_UNAUTHORIZED), "creator can no longer enable it: {}", logs(&r));
+    assert_eq!(rd_u64(&w.svm, &w.market, wl::MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF), 0);
+}
+
+/// The creator who configured it, then sees the refusal, cannot repair the market (the wrapper
+/// refuses a value below its minimum), so the market is unusable for a v5 pool by design.
+#[test]
+fn gh318_creator_cannot_zero_it_back_so_that_market_is_not_poolable() {
+    let mut w = market_only();
+    assert!(set_resolve_stale(&mut w, 9_000).is_ok());
+    assert_init_pool_refused_for_resolve_stale(&mut w, 9_000);
+    let r = set_resolve_stale(&mut w, 0);
+    assert!(r.is_err(), "wrapper must refuse stale_slots = 0: {}", logs(&r));
+    assert_init_pool_refused_for_resolve_stale(&mut w, 9_000);
+}
+
+/// The reader fails closed (None) on a short / unpinned buffer, so InitPool cannot read garbage as 0.
+#[test]
+fn gh318_reader_fails_closed_on_short_or_unpinned_data() {
+    let w = market_only();
+    let good = w.svm.get_account(&w.market).unwrap().data;
+    assert_eq!(percolator_stake::state::read_wrapper_permissionless_resolve_stale_slots(&good), Some(0));
+    assert_eq!(percolator_stake::state::read_wrapper_permissionless_resolve_stale_slots(&good[..wl::MIN_MARKET_ACCOUNT_LEN - 1]), None);
+    assert_eq!(percolator_stake::state::read_wrapper_permissionless_resolve_stale_slots(&good[..100]), None);
+    let mut bad = good.clone();
+    bad[8] ^= 0xff;
+    assert_eq!(percolator_stake::state::read_wrapper_permissionless_resolve_stale_slots(&bad), None);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
 // L-4 (characterisation; no code change on this branch)
 // ═════════════════════════════════════════════════════════════════════════════════════════
 

@@ -168,6 +168,13 @@ pub enum StakeError {
     /// waits until the market is closed out, or the pool has no pending growth. Pools without
     /// tranches (every v5 pool the wizard creates) are priced with the growth and never see this.
     PendingCloseoutGrowth = 49,
+    /// #318 item 2 (M-3): InitPool refuses a market whose wrapper `permissionless_resolve_stale_slots`
+    /// is non-zero. A permissionless stale resolve (wrapper tag 39) needs no signer, so it bypasses
+    /// the freeze-then-announce policy (`deposit_cap = 1`, then AdminResolveMarket) that protects
+    /// stakers from a JIT deposit before a predictable resolve. InitPool hands `marketauth` to the
+    /// pool PDA, which proxies no wrapper tag 38, so the value can never be changed afterwards:
+    /// the creator (still `marketauth`) must leave it 0 before InitPool.
+    PermissionlessResolveEnabled = 50,
 }
 
 impl From<StakeError> for ProgramError {
@@ -230,6 +237,7 @@ pub fn error_hint(code: u32) -> &'static str {
         48 => "Multi-asset market not supported — a v5 staking pool can only be created on (InitPool) and bind a single-asset market whose permissionless asset-init fee is 0; on InitPool set the fee to 0 (wrapper tag 59) first; on a bind this cannot be undone for this market",
         46 => "Creator account required — the terminal insurance surplus belongs to the pool creator (pool.admin); pass pool.admin's token account for the pool collateral (S1)",
         49 => "Pending close-out growth — this tranche pool's market holds insurance growth that will be booked to the LP holders at the close, and a tranche deposit cannot be priced with it; deposit after the close-out (D8 / #318)",
+        50 => "Permissionless resolve enabled — the market's permissionless_resolve_stale_slots is non-zero, so anyone could resolve it without notice once its oracle goes stale and a staker could not be protected by freezing deposits first; a v5 pool can only be created on a market where it is 0 (the InitMarket default), and it cannot be changed after InitPool (#318)",
         _ => "Unknown error — check the error code and pool state",
     }
 }

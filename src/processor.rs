@@ -692,6 +692,30 @@ fn process_init_pool(
         }
     }
 
+    // #318 item 2 (M-3 follow-up): refuse a market with a permissionless stale resolve configured.
+    // Wrapper tag 39 resolves a stale market with NO signer, so it bypasses the owner policy
+    // "freeze deposits (deposit_cap = 1), announce, then AdminResolveMarket" and leaves a JIT
+    // deposit window the D8 pricing/maturity gate only partly closes. It is 0 (disabled) from
+    // InitMarket and only `marketauth` can set it (wrapper tag 38); the CPI below hands
+    // `marketauth` to the pool PDA and this program proxies no tag 38, so after InitPool the value
+    // is frozen for the pool's life. Checking it here, before the pool exists, makes the
+    // exposed state unreachable. A creator who configured it before InitPool cannot undo that
+    // (wrapper tag 38 rejects a value below its minimum, so it cannot be set back to 0): that
+    // market cannot host a v5 pool, and the creator launches a fresh market instead.
+    // Fail closed on an unpinned layout. INVARIANT: adding a tag-38 proxy re-opens this.
+    {
+        let stale_slots =
+            state::read_wrapper_permissionless_resolve_stale_slots(&slab.try_borrow_data()?)
+                .ok_or(StakeError::UnsupportedWrapperLayout)?;
+        if stale_slots != 0 {
+            msg!(
+                "InitPool: market has permissionless_resolve_stale_slots = {}; v5 pools need 0",
+                stale_slots
+            );
+            return Err(StakeError::PermissionlessResolveEnabled.into());
+        }
+    }
+
     // InitPool now performs a wrapper UpdateAuthority (tag 32) CPI that rotates
     // marketauth to this pool PDA (see `cpi::cpi_update_authority` below), and that
     // CPI marks the slab/market writable. Require the outer InitPool account

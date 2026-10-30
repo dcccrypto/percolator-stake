@@ -1772,6 +1772,20 @@ pub fn read_wrapper_asset_append_guard(data: &[u8]) -> Option<(u32, u128)> {
     Some((slots, fee))
 }
 
+/// #318 item 2: the wrapper's `permissionless_resolve_stale_slots` of a pinned-layout wrapper MARKET
+/// account (0 = permissionless resolve disabled). `None` for anything else; the caller refuses.
+pub fn read_wrapper_permissionless_resolve_stale_slots(data: &[u8]) -> Option<u64> {
+    use crate::wrapper_layout as wl;
+    if !wl::header_is_pinned(data)
+        || data.get(WRAPPER_OFF_KIND) != Some(&WRAPPER_KIND_MARKET)
+        || data.len() < wl::MIN_MARKET_ACCOUNT_LEN
+    {
+        return None;
+    }
+    let off = wl::MARKET_PERMISSIONLESS_RESOLVE_STALE_OFF;
+    Some(u64::from_le_bytes(data.get(off..off + 8)?.try_into().ok()?))
+}
+
 /// M-2: asset 0's `(insurance_authority, insurance_operator)` of a pinned-layout wrapper MARKET
 /// account (profile at the start of asset slot 0). `None` for anything else; the caller refuses.
 pub fn read_wrapper_asset0_insurance_keys(data: &[u8]) -> Option<([u8; 32], [u8; 32])> {
