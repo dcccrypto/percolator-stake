@@ -445,6 +445,9 @@ pub enum StakeInstruction {
     /// P1 wrapper note: CloseSlab may re-book orphaned fee legs, or advance its
     /// windowed terminal scan, and return Ok WITHOUT closing. Call this again
     /// (after claiming any re-booked protocol leg) until the market is a tombstone.
+    /// On a FEE_ONLY pool that re-book advances the wrapper's tag-87 payout counter with no
+    /// transfer; stake never books that counter for FEE_ONLY (GH#322), so the creator's seed is
+    /// safe whether `RecoverTerminalInsurance` runs before or after this call.
     ///
     /// AUTHORITY: `pool.admin` (irreversible action; mirrors `AdminResolveMarket`).
     /// Requires the wrapper market to be Resolved (`MarketNotTerminal`, 30). A market
@@ -551,7 +554,8 @@ pub enum StakeInstruction {
     ///   4. `[]` Wrapper market (`pool.slab`). #290: REQUIRED for mode 0, ignored
     ///      for mode 1. A mode-0 pool books vault surplus only up to the wrapper's
     ///      not-yet-booked `insurance_reserve_withdrawn_atoms` (tag-87 payouts). Any
-    ///      other surplus (a raw donation) stays unpriced in the vault.
+    ///      other surplus (a raw donation) stays unpriced in the vault. GH#322: only a
+    ///      FIRST_LOSS pool is paid by tag 87; any other mode-0 pool books nothing here.
     ///
     /// F3: refused with `NoRealLpHolders` (29) when `total_lp_supply <=
     /// MINIMUM_LIQUIDITY` (only the N7 dead shares exist). Nothing is written; the

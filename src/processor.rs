@@ -3220,6 +3220,10 @@ fn book_terminal_surplus_before_pricing(
 /// this change, `wrapper_paid` is 0 until the first real tag-87 payout (tag 87 needs a
 /// bound, initialized pool), so arming it credits nothing.
 ///
+/// GH#322: only a FIRST_LOSS pool attributes `wrapper_paid` (tag 87 pays no other pool). A
+/// FEE_ONLY mode-0 pool attributes 0, because the wrapper's CloseSlab re-book can advance the
+/// counter for it without a transfer.
+///
 /// Mode-1 (trading) pools are not paid by tag 87. Their accrual is unchanged: any
 /// surplus is booked, as accepted in #274.
 fn accrue_fees_inner(
@@ -3234,6 +3238,10 @@ fn accrue_fees_inner(
 
     let fee_delta = if pool.pool_mode == 0 {
         let paid = wrapper_paid.ok_or(StakeError::InvalidAccount)?;
+        // GH#322: tag 87 pays mode-0 FIRST_LOSS pools only (the wrapper's `owed_staker_leg`). For
+        // any other pool the counter moves only through CloseSlab's orphaned-leg re-book
+        // (W-S1), which advances it with NO transfer, so none of it is this pool's money.
+        let paid = if pool.is_first_loss() { paid } else { 0 };
         let (cursor, attributable) = crate::math::mode0_attributable_fees(
             surplus,
             paid,
@@ -6621,6 +6629,37 @@ mod tests {
         q.set_fee_attribution_armed(true);
         accrue_fees_inner(&mut q, 500, Some(500)).unwrap();
         assert_eq!(q.s2_backlog_owed_atoms(), 0);
+    }
+
+    /// GH#322: the wrapper counter is a payout ledger for FIRST_LOSS pools only. A FEE_ONLY mode-0
+    /// pool with real stakers books nothing from a counter jump (the CloseSlab re-book moves it
+    /// with no transfer), armed or not; FIRST_LOSS keeps #290 attribution; the slab stays required.
+    /// NEGATIVE CONTROL: on 3a7c4dd9 the FEE_ONLY pool books min(surplus, jump) = 500.
+    #[test]
+    fn fee_only_pool_never_attributes_wrapper_counter() {
+        for (mode, want) in [
+            (state::RISK_MODE_FIRST_LOSS, 500),
+            (state::RISK_MODE_FEE_ONLY, 0),
+        ] {
+            for armed in [false, true] {
+                let mut p = v5_pool(mode);
+                p.total_deposited = state::MINIMUM_LIQUIDITY + 1_000;
+                p.total_lp_supply = state::MINIMUM_LIQUIDITY + 1_000; // real stakers
+                p.set_fee_attribution_armed(armed);
+                let pv = p.total_pool_value().unwrap();
+                accrue_fees_inner(&mut p, pv + 700, Some(500)).unwrap();
+                assert_eq!(p.total_fees_earned, want, "risk mode {mode}, armed {armed}");
+                assert_eq!(
+                    p.mode0_fees_attributed, want,
+                    "risk mode {mode}, armed {armed}"
+                );
+                assert_eq!(
+                    accrue_fees_inner(&mut p, pv, None),
+                    Err(StakeError::InvalidAccount.into()),
+                    "risk mode {mode}: the slab stays required"
+                );
+            }
+        }
     }
 
     /// CLOSE-OUT RULE (2026-10-14, every v5 mode): the seed record (457..464, u56 + flag byte 333
