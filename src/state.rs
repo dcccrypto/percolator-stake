@@ -1544,6 +1544,12 @@ impl StakePool {
 // legal destination is this pool's vault (`load_bound_stake_pool`). Reading it
 // lets `AccrueFees` book wrapper-paid fees and nothing else.
 //
+// GH#322 EXCEPTION: the wrapper's CloseSlab re-book (W-S1, `rebook_orphaned_fee_legs_view`)
+// sets the counter to `accrued` WITHOUT a transfer when the market's pool is owed nothing
+// (not mode-0 FIRST_LOSS) or is not bound at all, moving the leg to the protocol. The
+// counter is therefore a payout ledger ONLY for a bound FIRST_LOSS pool, and
+// `accrue_fees_inner` reads it only for FIRST_LOSS pools.
+//
 // Offsets (identical in the deployed wrapper a9318945 (v18), the v18.1
 // candidate 3262608b, and the CI-pinned v17 wrapper 15eb8b0c):
 //   [0..8)   MAGIC            = 0x5045_5243_5631_3600 ("PERCV16\0")
