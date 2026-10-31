@@ -591,7 +591,13 @@ pub enum StakeInstruction {
     /// admin can no longer call the wrapper's ResolveMarket directly once InitPool
     /// has rotated marketauth to the pool PDA.
     ///
-    /// H-1 GATE (security review, RE-REVIEW FIX): rejects with
+    /// The order is not enforced: this instruction does not read the wrapper market. On a
+    /// FIRST_LOSS pool whose market is still Live the flag only closes the pool to new money
+    /// (deposits and `SyncInsuranceDeployment` top-ups); `SyncInsuranceDeployment` still recovers
+    /// the deployed share over successive syncs, as on an unflagged pool. On a mode-0 pool `RecoverTerminalInsurance` (tag 29) sets this flag
+    /// itself, so for FIRST_LOSS the runbook is tag 24 then tag 29.
+    ///
+    /// H-1 GATE (non-FIRST_LOSS pools; security review, RE-REVIEW FIX): rejects with
     /// `StakeError::InsuranceLossOutstanding` unless `pool.total_flushed <=
     /// pool.total_recovered_from_wrapper` — defense-in-depth mirroring the same
     /// gate on `AdminResolveMarket`. `AdminResolveMarket` is the instruction that
@@ -785,6 +791,9 @@ pub enum StakeInstruction {
     /// creator-admin `FlushToInsurance`. Keeps `deployed ~= pool_value * deploy_target_bps`:
     /// tops up (PDA-signed wrapper tag 9) while keeping `liquid_buffer_bps` liquid, or
     /// recovers the excess (PDA-signed wrapper tag 57; the wrapper's live health gate applies).
+    /// With the pool's `market_resolved` flag set, it never tops up, and it is refused once the
+    /// market is terminal (or its layout is not the pinned one); a recovery on a Live market
+    /// still runs.
     ///
     /// Accounts:
     ///   0. `[signer, writable]` Caller (pays the units-ledger creation on first use)

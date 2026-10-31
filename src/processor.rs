@@ -4939,8 +4939,8 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
         return Err(StakeError::MarketResolved.into());
     }
 
-    // H-1 (security review, RE-REVIEW FIX): reject unless every flushed token has
-    // actually been recovered FROM THE WRAPPER (total_flushed <= total_recovered_
+    // H-1 (non-FIRST_LOSS pools; security review, RE-REVIEW FIX): reject unless every flushed
+    // token has actually been recovered FROM THE WRAPPER (total_flushed <= total_recovered_
     // from_wrapper). `AdminResolveMarket` (tag 24) is the instruction that actually
     // flips the wrapper to a non-Live mode and carries the PRIMARY enforcement of
     // this invariant (see its doc comment for the full rationale: post-resolution,
@@ -4962,8 +4962,12 @@ fn process_set_market_resolved(program_id: &Pubkey, accounts: &[AccountInfo]) ->
     // Threshold is net of `realized_junior_loss`: that capital was forfeited by the
     // exiting junior and is deliberately left in the wrapper, so requiring it back
     // would make this gate unsatisfiable. See `StakePool::wrapper_recoverable`.
-    // v5: a FIRST_LOSS pool's deployed units stay withdrawable after resolution (wrapper
-    // tag 41 pays the stake class through RecoverTerminalInsurance): nothing is stranded.
+    // v5: a FIRST_LOSS pool skips this gate: its deployed units come back through
+    // SyncInsuranceDeployment (Live) or RecoverTerminalInsurance (tag 29), not through
+    // RecoverFlushedInsurance. This handler does not read the wrapper, so the flag can be set
+    // while the market is still Live; Sync then still recovers the deployed units (with the
+    // flag set it refuses only top-ups there), and tag 29 pays them out once the wrapper's
+    // terminal gates allow it.
     if !pool.is_first_loss() && !pool.wrapper_fully_recovered() {
         msg!(
             "SetMarketResolved: {} tokens flushed-but-not-recovered-from-wrapper — call RecoverFlushedInsurance first",
@@ -5403,14 +5407,24 @@ fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInf
     if !pool.is_first_loss() || pool.pool_mode != 0 {
         return Err(StakeError::InvalidPoolMode.into());
     }
-    if pool.market_resolved() {
-        return Err(StakeError::MarketResolved.into());
-    }
     if pool.slab != market.key.to_bytes() || pool.vault != vault.key.to_bytes() {
         return Err(StakeError::InvalidPda.into());
     }
     if pool.percolator_program != percolator_program.key.to_bytes() {
         return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+    // GH#327: SetMarketResolved (tag 18) does not read the wrapper, so the local flag can be
+    // set while the bound market is still Live. It then means "closed to new deposits and new
+    // deployment", not "terminal": a recovery still runs, so the deployed part keeps returning
+    // over successive syncs as the first-loss consent text promises. This gate refuses only
+    // when the market is terminal or not the pinned layout (fail closed, as before); a top-up
+    // is refused below.
+    let flagged = pool.market_resolved();
+    if flagged
+        && state::read_wrapper_terminal(&market.try_borrow_data()?)
+            != state::WrapperTerminal::NotTerminal
+    {
+        return Err(StakeError::MarketResolved.into());
     }
     let (expected_vault_auth, vault_auth_bump) =
         state::derive_vault_authority(program_id, pool_pda.key);
@@ -5469,6 +5483,10 @@ fn process_sync_insurance_deployment(program_id: &Pubkey, accounts: &[AccountInf
             return Err(StakeError::NothingToSync.into());
         }
         crate::math::SyncAction::TopUp(a) => {
+            // A flagged pool never deploys more (see the flag check above).
+            if flagged {
+                return Err(StakeError::MarketResolved.into());
+            }
             if !pool.asset_admin_burned() {
                 return Err(StakeError::AssetAdminNotBurned.into());
             }
