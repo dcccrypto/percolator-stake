@@ -3047,8 +3047,13 @@ fn pre_accrue_fee_modes(
 ///   stake class is already in the pool value as deployed units.
 ///
 /// `0` (the legacy price) when no growth is priceable: mode-1 pools, legacy risk mode, a pool
-/// whose custody bind recorded no seed (it does not hold the market's insurance), or a pool with
-/// no LP yet (the genesis deposit has nobody to dilute and mints 1:1).
+/// whose custody bind recorded no seed (it does not hold the market's insurance), a pool with
+/// no LP yet (the genesis deposit has nobody to dilute and mints 1:1), or a pool without tranches
+/// whose only LP is the dead-share floor (GH#333): nobody to dilute either, and priced in, the
+/// growth would be booked to the dead shares at the close. That deposit is priced without the
+/// growth and, like a genesis deposit, takes it when it is booked if it still holds its LP then,
+/// subject to the maturity gate. Tranche pools still see the growth and refuse the deposit while
+/// it is pending.
 /// `slab` must already be verified as `pool.slab` by `pre_accrue_fee_modes`.
 fn pending_closeout_growth_for_deposit(
     pool: &state::StakePool,
@@ -3060,6 +3065,7 @@ fn pending_closeout_growth_for_deposit(
         || !pool.is_v5_risk_mode()
         || !pool.creator_seed_recorded()
         || pool.total_lp_supply == 0
+        || (!pool.tranche_enabled() && !pool.has_real_lp_holders())
     {
         return Ok(0);
     }

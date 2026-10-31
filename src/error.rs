@@ -166,7 +166,8 @@ pub enum StakeError {
     /// close-out growth is pending: the growth would have to be apportioned between the senior
     /// and junior sub-pools, which the close-out booking does not do per tranche. The deposit
     /// waits until the market is closed out, or the pool has no pending growth. Pools without
-    /// tranches (every v5 pool the wizard creates) are priced with the growth and never see this.
+    /// tranches (every v5 pool the wizard creates) are priced with the growth (without it while
+    /// the dead shares are their only LP, GH#333) and never see this.
     PendingCloseoutGrowth = 49,
 }
 
