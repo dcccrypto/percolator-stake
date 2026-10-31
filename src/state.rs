@@ -399,11 +399,15 @@ pub const RESERVED_IDX_UNCLAIMED_HI: usize = 14;
 /// decreases.
 pub const V5_RESERVED_CREATOR_SURPLUS_FORWARDED: core::ops::Range<usize> = 8..16;
 /// S2 (2026-10-14): `_v5_reserved[16..24]` (bytes 472..480, LE u64) = wrapper fee payouts a
-/// FIRST_LOSS pool received while it had no real staker (consumed unbooked by `AccrueFees`, so a
-/// later depositor is not priced with them). INFORMATIONAL since the close-out rule: the atoms
-/// stay unbooked in the vault until the close, where they are part of the surplus that goes to
-/// the stakers (or is recorded unclaimed) and are NEVER paid to the creator beyond the seed.
-/// Raised by the S2 branch of the fee accrual; no longer lowered.
+/// FIRST_LOSS pool received while it had no real staker (consumed unbooked by `AccrueFees`, so
+/// they are never booked to the next staker as a windfall). The atoms stay unbooked in the
+/// vault until the close, where they are part of the surplus that goes to the stakers (or is
+/// recorded unclaimed) and are NEVER paid to the creator beyond the seed. LOAD-BEARING since D8:
+/// capped at the raw vault surplus, it is exactly the unbooked surplus that deposit pricing
+/// (`pending_closeout_growth_for_deposit`) feeds into the close-out split, so it must equal the
+/// backlog atoms still in the vault while deposits are open.
+/// Raised by the S2 branch of the fee accrual; no longer lowered (only terminal paths book it,
+/// and deposits are refused there).
 pub const V5_RESERVED_S2_BACKLOG_OWED: core::ops::Range<usize> = 16..24;
 
 // ════════════════════════════════════════════════════════════════════════════

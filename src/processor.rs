@@ -1220,8 +1220,9 @@ fn process_deposit(
     // S-4: reject a zero-share mint EXPLICITLY (dedicated variant, not the generic
     // ZeroAmount). A nonzero deposit that rounds to 0 LP at the current share price
     // must never transfer collateral in while minting nothing. Share price derives
-    // from tracked counters (total_pool_value), never the raw vault balance, so a
-    // direct token donation cannot inflate it — see math::calc_lp_for_deposit.
+    // from tracked counters (total_pool_value), never raw vault surplus beyond the S2
+    // backlog, so a direct token donation cannot inflate it — see
+    // pending_closeout_growth_for_deposit.
     if lp_to_mint == 0 {
         return Err(StakeError::ZeroSharesMinted.into());
     }
@@ -3039,7 +3040,14 @@ fn pre_accrue_fee_modes(
 ///
 /// It is the `stakers` part of the SAME split tag 29 makes (`math::pending_closeout_growth` over
 /// `math::closeout_split`), over what the close-out will see:
-/// * `unbooked`: pool vault balance above booked value;
+/// * `unbooked`: the S2 pre-stake fee backlog (`s2_backlog_owed_atoms`), capped at the pool vault
+///   balance above booked value. That backlog is the only legitimate unbooked surplus while
+///   deposits are open: the pre-accrue has just booked, or (with no real staker) recorded as S2
+///   backlog, every attributable tag-87 payout, and terminal inflows (tag 41 / tag 29) arrive
+///   only once deposits are refused. Any other surplus is a raw transfer, and #290 says a
+///   donation never moves a mode-0 price before the close-out, so it is not priced here.
+///   Tag 29 still books it to the LP holders at the close, like any surplus, so a deposit
+///   made after the donation (and outside the maturity gate) shares in it;
 /// * FEE_ONLY (and a FIRST_LOSS market whose unit ledger is still empty): the insurance
 ///   authority's withdrawable capacity read from the wrapper market, the same lower bound the
 ///   bind measured the seed with (`math::creator_seed_at_bind`);
@@ -3091,8 +3099,11 @@ fn pending_closeout_growth_for_deposit(
         }
         _ => (capacity()?, None),
     };
-    let unbooked =
-        token_balance(vault)?.saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?);
+    // While deposits are open the S2 backlog is the only legitimate unbooked inflow; a raw
+    // transfer above it must not move the deposit price (#298, GH#324).
+    let unbooked = token_balance(vault)?
+        .saturating_sub(pool.total_pool_value().ok_or(StakeError::Overflow)?)
+        .min(pool.s2_backlog_owed_atoms());
     Ok(crate::math::pending_closeout_growth(
         unbooked,
         creator_class_pending,
@@ -3209,8 +3220,9 @@ fn book_terminal_surplus_before_pricing(
 /// `(MINIMUM_LIQUIDITY + 1) x price`, independent of pool size: a deposit DoS
 /// (`ZeroSharesMinted`), rounding-dust capture, and a corrupted fee ledger on the
 /// insurance backstop. A donation advances no wrapper counter, so it is now
-/// never booked: it stays in the vault as unpriced surplus. Only the donor loses it,
-/// and it cannot move the share price.
+/// never booked here; it is booked at the close-out (tag 29, tag 30, or the terminal Withdraw
+/// pre-book) and until then stays in the vault as unpriced surplus. Only the donor loses it,
+/// and it cannot move the share price before the close-out.
 ///
 /// Migration: pools created before #290 carry a stale vault snapshot in the cursor
 /// bytes and an unset `fee_attribution_armed` flag. The first attributed accrual arms
@@ -3269,8 +3281,9 @@ fn accrue_fees_inner(
     // AccrueFees instruction refuses explicitly (NoRealLpHolders) before reaching here.
     // S2 (F5, v5 FIRST_LOSS pools): fees the wrapper paid while the pool had no real staker
     // belong to nobody who staked for them. Consume them from the attribution cursor instead of
-    // leaving them for the FIRST staker to book (a later depositor is not priced with them).
-    // They stay as unbooked vault surplus and the counter at 472 records them (informational).
+    // leaving them for the FIRST staker to book (they are never booked to the next staker as a
+    // windfall). They stay as unbooked vault surplus and the counter at 472 records them;
+    // deposit pricing reads that counter as the only unbooked surplus it prices.
     // CLOSE-OUT RULE: they are NOT paid to the creator; at the close they are part of the
     // surplus booked to the stakers then holding LP (or recorded unclaimed with none).
     if fee_delta > 0 && pool.pool_mode == 0 && pool.is_first_loss() && !pool.has_real_lp_holders() {
