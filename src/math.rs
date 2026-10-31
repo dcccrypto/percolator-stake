@@ -562,7 +562,7 @@ pub fn terminal_cpi_delta_ok(before: u64, after: u64, requested: u64) -> bool {
     after.checked_sub(before) == Some(requested)
 }
 
-/// CLOSE-OUT RULE (Khubair 2026-10-14 12:55, confirmed 13:36 and 19:35; every v5 pool mode).
+/// CLOSE-OUT RULE (Khubair 2026-10-14 12:55, confirmed 13:36 and 19:35; every v5 risk mode).
 ///
 /// At a market's close the creator gets back the insurance seed recorded at bind if it is
 /// intact, else what is left of it, and never more; everything else goes to the stakers.
