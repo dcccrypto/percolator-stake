@@ -9,8 +9,9 @@
 //! (mark-to-close) and adds a maturity gate (LP minted within `MATURITY_GATE_SLOTS` of the
 //! terminal does not share in the surplus; see `processor::young_lp_payout_cap`).
 //!
-//! Forged state, and only this: token balances used as funding, and the close-out seed record
-//! (to model growth above the seed, as the gh311 `*_forged_seed` tests do).
+//! Forged state, and only this: token balances used as funding, the close-out seed record
+//! (to model growth above the seed, as the gh311 `*_forged_seed` tests do), and in one FIRST_LOSS
+//! test a tag-87 payout (`push_fees`: the pool vault balance and the wrapper's payout counter).
 
 #![allow(clippy::result_large_err, clippy::too_many_arguments, dead_code)]
 
@@ -1141,4 +1142,316 @@ fn d8_pricing_alone_closes_the_jit_when_the_gate_does_not_apply() {
     assert!(deposit(&mut w, &jit, JIT).is_ok());
     let (jp, ap) = resolve_and_exit_after(&mut w, &alice, &jit, SEED, N);
     assert_jit_captures_nothing(jp, ap, ALICE);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GH#333: a pool whose only LP is the MINIMUM_LIQUIDITY dead shares
+// ─────────────────────────────────────────────────────────────────────────────
+
+const E_PENDING_CLOSEOUT_GROWTH: u32 = 49;
+
+/// A REAL SPL transfer of `amount` into the pool vault by a third party (only the funding
+/// balance is set directly). Mode 0 never books it before the close, and the close-out books it
+/// to the LP then holding.
+fn transfer_to_vault(w: &mut World, amount: u64) {
+    let donor = Keypair::new();
+    w.svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let src = Pubkey::new_unique();
+    let mint = w.mint;
+    set_token_account(&mut w.svm, src, &mint, &donor.pubkey(), amount);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: token_program(),
+        accounts: vec![
+            AccountMeta::new(src, false),
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new_readonly(donor.pubkey(), true),
+        ],
+        data,
+    };
+    let payer = w.payer.insecure_clone();
+    let r = send(&mut w.svm, &payer, &[&donor], ix);
+    assert!(r.is_ok(), "SPL transfer: {}", logs(&r));
+}
+
+/// FORGED, like `f3_dead_share_accrue_guard_e2e.rs::push_fees`: the wrapper's tag-87 push lands
+/// `amount` atoms in the pool vault AND advances its `insurance_reserve_withdrawn_atoms` counter
+/// (a real tag 87 needs a fee-paying trade history).
+fn push_fees(w: &mut World, amount: u64) {
+    let (vault, mint, auth) = (w.vault, w.mint, w.vault_auth);
+    let bal = w.vault_balance();
+    set_token_account(&mut w.svm, vault, &mint, &auth, bal + amount);
+    let mut acct = w.svm.get_account(&w.market).unwrap();
+    let off = percolator_stake::state::WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN;
+    let cur = u128::from_le_bytes(acct.data[off..off + 16].try_into().unwrap());
+    acct.data[off..off + 16].copy_from_slice(&(cur + amount as u128).to_le_bytes());
+    let market = w.market;
+    w.svm.set_account(market, acct).unwrap();
+}
+
+/// Every real staker has left: only the 1,000 dead shares remain.
+fn assert_dead_shares_only(w: &World) {
+    let p = w.pool();
+    assert_eq!(
+        p.total_lp_supply,
+        percolator_stake::state::MINIMUM_LIQUIDITY
+    );
+    assert!(!p.has_real_lp_holders());
+}
+
+/// FEE_ONLY: alice stakes, `DON` of close-out growth becomes pending while she is staked, and
+/// alice leaves while Live. The dead shares are the pool's only LP. `transfer`: the growth is a
+/// REAL SPL transfer into the vault (nothing forged but funding). Otherwise the seed record is
+/// FORGED `DON` below the fund (insurance growth above the seed, as in `fo_live`), a growth
+/// source the deposit prices even where it does not price a raw transfer.
+fn fo_dead_only(transfer: bool) -> World {
+    let mut w = world(RISK_FEE_ONLY);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    bind_like(&mut w, 19); // seed == fund
+    w.warp(1_000);
+    if transfer {
+        transfer_to_vault(&mut w, DON);
+    } else {
+        forge_seed(&mut w, SEED - DON);
+    }
+    w.warp(300);
+    exit_all(&mut w, &alice, Tail::Slab);
+    assert_dead_shares_only(&w);
+    w
+}
+
+/// Upper bound (plus 2 atoms of rounding) on the dead shares' cut of `growth` once a deposit of `d`
+/// minted at their price.
+fn dead_crumb(growth: u64, d: u64) -> u64 {
+    growth * percolator_stake::state::MINIMUM_LIQUIDITY / d + 2
+}
+
+/// Bob deposits into the dead-share-only pool, holds past the maturity gate and exits after the
+/// close-out; returns (bob's payout, what the dead shares gained).
+fn hold_to_close(w: &mut World, d: u64, tail: Tail) -> (u64, u64) {
+    let dead = w.tpv();
+    let bob = new_staker(w, d);
+    let r = deposit(w, &bob, d);
+    assert!(r.is_ok(), "bob deposit: {}", logs(&r));
+    w.warp(1_000);
+    admin_resolve(w);
+    w.warp(300);
+    let r = recover_terminal(w, SEED);
+    assert!(r.is_ok(), "tag 29: {}", logs(&r));
+    let paid = exit_all(w, &bob, tail);
+    (paid, w.tpv() - dead)
+}
+
+/// FEE_ONLY: the first depositor into a dead-share-only pool is priced like a genesis deposit
+/// (no LP to dilute) and holds the pool's LP at the close, so the close-out books the pending
+/// growth to it. Priced with the growth, it bought 1,000 LP for 2M and the close booked the 2M
+/// to the dead shares, unredeemable.
+#[test]
+fn d8_dead_shares_only_pool_depositor_holding_to_the_close_gets_the_pending_growth() {
+    for transfer in [true, false] {
+        let mut w = fo_dead_only(transfer);
+        let (paid, crumb) = hold_to_close(&mut w, BOB, Tail::Slab);
+        assert!(
+            crumb <= dead_crumb(DON, BOB),
+            "transfer {transfer}: dead shares took {crumb} of the {DON} growth (bob paid {paid})"
+        );
+        assert_eq!(paid + crumb, BOB + DON, "transfer {transfer}: conservation");
+        assert_eq!(
+            w.pool().terminal_unclaimed_atoms(),
+            0,
+            "transfer {transfer}"
+        );
+    }
+}
+
+/// FIRST_LOSS: the same for the S2 pre-stake backlog, a tag-87 push (FORGED, see `push_fees`)
+/// paid while only the dead shares hold LP.
+#[test]
+fn d8_first_loss_dead_shares_only_pool_depositor_holding_to_the_close_gets_the_backlog() {
+    let mut w = world(RISK_FIRST_LOSS);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    w.warp(300);
+    exit_all(&mut w, &alice, Tail::V5);
+    assert_dead_shares_only(&w);
+    push_fees(&mut w, DON);
+    let (paid, crumb) = hold_to_close(&mut w, BOB, Tail::V5);
+    assert!(
+        crumb <= dead_crumb(DON, BOB),
+        "the dead shares took {crumb} of the {DON} backlog (bob paid {paid})"
+    );
+    assert_eq!(paid + crumb, BOB + DON, "conservation");
+}
+
+/// A round trip through a dead-share-only pool on a Live market returns the deposit to the atom.
+/// Priced with the growth (withdraw is at booked value), it returned about
+/// D x (pv + D) / (pv + G + D), less the rounding of its LP to whole units: 1,000,000 of a
+/// 2,000,000 deposit, the rest left to the dead shares.
+#[test]
+fn d8_dead_shares_only_pool_live_round_trip_returns_the_deposit() {
+    for transfer in [true, false] {
+        let mut w = fo_dead_only(transfer);
+        let dead = w.tpv();
+        let bob = new_staker(&mut w, BOB);
+        assert!(deposit(&mut w, &bob, BOB).is_ok(), "transfer {transfer}");
+        w.warp(300);
+        let paid = exit_all(&mut w, &bob, Tail::Slab);
+        assert_eq!(paid, BOB, "transfer {transfer}: live round trip");
+        assert_eq!(
+            w.tpv(),
+            dead,
+            "transfer {transfer}: nothing left to the dead shares"
+        );
+    }
+}
+
+/// A deposit into a dead-share-only pool one slot before the terminal (inside
+/// `MATURITY_GATE_SLOTS`) captures nothing: the maturity gate pays its young LP at most its cost,
+/// and the growth stays in the pool, booked to the dead shares (as before GH#333).
+#[test]
+fn d8_dead_shares_only_pool_deposit_inside_the_maturity_window_captures_nothing() {
+    for transfer in [true, false] {
+        let mut w = fo_dead_only(transfer);
+        let dead = w.tpv();
+        let bob = new_staker(&mut w, BOB);
+        assert!(deposit(&mut w, &bob, BOB).is_ok(), "transfer {transfer}");
+        w.warp(1);
+        admin_resolve(&mut w);
+        w.warp(300);
+        assert!(
+            recover_terminal(&mut w, SEED).is_ok(),
+            "transfer {transfer}"
+        );
+        let paid = exit_all(&mut w, &bob, Tail::Slab);
+        assert!(
+            paid <= BOB,
+            "transfer {transfer}: young LP captured {} of the growth",
+            paid - BOB
+        );
+        assert!(
+            paid + BOB / 1_000 >= BOB,
+            "transfer {transfer}: young LP lost more than dust: {paid}"
+        );
+        assert!(
+            w.tpv() >= dead + DON,
+            "transfer {transfer}: the growth stays in the pool"
+        );
+    }
+}
+
+/// A tranche pool refuses both deposit paths while growth is pending, with or without a real
+/// LP, and takes both once nothing is pending (unchanged by GH#333).
+#[test]
+fn d8_tranche_pool_refusals_with_and_without_real_lp() {
+    for (grow, leave) in [(true, true), (true, false), (false, true)] {
+        let mut w = world(RISK_FEE_ONLY);
+        let alice = new_staker(&mut w, ALICE);
+        assert!(deposit(&mut w, &alice, ALICE).is_ok());
+        bind_like(&mut w, 19);
+        let admin = w.admin.insecure_clone();
+        let mut data = vec![15u8];
+        data.extend_from_slice(&20_000u16.to_le_bytes());
+        let accounts = vec![
+            AccountMeta::new(w.admin.pubkey(), true),
+            AccountMeta::new(w.pool, false),
+        ];
+        assert!(
+            w.send_stake(&[&admin], accounts, data).is_ok(),
+            "tranche config"
+        );
+        if grow {
+            forge_seed(&mut w, SEED_LOW);
+        }
+        w.warp(300);
+        if leave {
+            exit_all(&mut w, &alice, Tail::Slab);
+            assert_dead_shares_only(&w);
+        }
+        let want = if grow {
+            Some(E_PENDING_CLOSEOUT_GROWTH)
+        } else {
+            None
+        };
+        for tag in [16u8, 1u8] {
+            let s = new_staker(&mut w, BOB);
+            let (dpda, _) = derive_deposit_pda(&w.stake_id, &w.pool, &s.kp.pubkey());
+            let mut data = vec![tag];
+            data.extend_from_slice(&BOB.to_le_bytes());
+            let accounts = vec![
+                AccountMeta::new(s.kp.pubkey(), true),
+                AccountMeta::new(w.pool, false),
+                AccountMeta::new(s.ata, false),
+                AccountMeta::new(w.vault, false),
+                AccountMeta::new(w.lp_mint, false),
+                AccountMeta::new(s.lp_ata, false),
+                AccountMeta::new_readonly(w.vault_auth, false),
+                AccountMeta::new(dpda, false),
+                AccountMeta::new_readonly(token_program(), false),
+                AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+                AccountMeta::new_readonly(w.market, false),
+            ];
+            let kp = s.kp.insecure_clone();
+            let r = w.send_stake(&[&kp], accounts, data);
+            assert_eq!(
+                custom(&r),
+                want,
+                "grow {grow} leave {leave} tag {tag}: {}",
+                logs(&r)
+            );
+            assert_eq!(
+                r.is_ok(),
+                want.is_none(),
+                "grow {grow} leave {leave} tag {tag}"
+            );
+        }
+    }
+}
+
+/// The genesis deposit (no LP at all) is never priced with growth: it mints 1:1 less the dead
+/// shares, even with growth pending (FIRST_LOSS binds before the first deposit).
+#[test]
+fn d8_genesis_deposit_ignores_pending_growth() {
+    let mut w = world(RISK_FIRST_LOSS);
+    forge_seed(&mut w, SEED_LOW);
+    assert_eq!(w.pool().total_lp_supply, 0);
+    let alice = new_staker(&mut w, ALICE);
+    let r = deposit(&mut w, &alice, ALICE);
+    assert!(r.is_ok(), "{}", logs(&r));
+    assert_eq!(
+        token_amount(&w.svm, &alice.lp_ata),
+        ALICE - percolator_stake::state::MINIMUM_LIQUIDITY
+    );
+    // Control: growth IS pending, so a deposit with a real LP is priced with it.
+    let p = w.pool();
+    let bob = new_staker(&mut w, BOB);
+    assert!(deposit(&mut w, &bob, BOB).is_ok());
+    let unpriced = percolator_stake::math::calc_lp_for_deposit(
+        p.total_lp_supply,
+        p.total_pool_value().unwrap(),
+        BOB,
+    )
+    .unwrap();
+    assert!(
+        token_amount(&w.svm, &bob.lp_ata) < unpriced,
+        "control: no growth was pending"
+    );
+}
+
+/// With a real incumbent the deposit is priced at booked value + growth, to the atom.
+#[test]
+fn d8_deposit_with_a_real_incumbent_is_priced_with_the_growth() {
+    let (mut w, _alice) = fo_live();
+    let p = w.pool();
+    let bob = new_staker(&mut w, BOB);
+    assert!(deposit(&mut w, &bob, BOB).is_ok());
+    let want = percolator_stake::math::calc_lp_for_deposit(
+        p.total_lp_supply,
+        p.total_pool_value().unwrap() + GROWTH,
+        BOB,
+    )
+    .unwrap();
+    assert_eq!(token_amount(&w.svm, &bob.lp_ata), want);
 }
