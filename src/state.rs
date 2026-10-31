@@ -1564,6 +1564,8 @@ pub const WRAPPER_MAGIC: u64 = 0x5045_5243_5631_3600;
 pub const WRAPPER_KIND_MARKET: u8 = 1;
 pub const WRAPPER_OFF_KIND: usize = 10;
 pub const WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN: usize = 16 + 544;
+/// `insurance_reserve_accrued_atoms`, the u128 directly before the withdrawn counter.
+pub const WRAPPER_OFF_INSURANCE_RESERVE_ACCRUED: usize = 16 + 528;
 
 /// Read `insurance_reserve_withdrawn_atoms` from a wrapper market account's raw
 /// bytes. Returns `None` if the account is too short, is not initialized with the
@@ -1745,6 +1747,44 @@ pub fn read_wrapper_bind_insurance(data: &[u8]) -> Option<WrapperBindInsurance> 
         asset0_stale_long: r64(wl::ASSET0_STALE_COUNT_LONG_OFF)?,
         asset0_stale_short: r64(wl::ASSET0_STALE_COUNT_SHORT_OFF)?,
     })
+}
+
+/// GH#331: the staker fee leg a wrapper tag 87 (`WithdrawInsuranceReserveToStake`) would pay into
+/// the pool vault right now. The claim `insurance_reserve_accrued - insurance_reserve_withdrawn`
+/// is clamped exactly as tag 87 clamps it:
+///
+/// ```text
+/// min(claim, insurance - credit_reserved - budget_total - rent_unrouted, vault)   (saturating)
+/// ```
+///
+/// `Some(0)` where tag 87 pays nothing: the market is not Live, asset 0's insurance authority is not
+/// `vault_auth` (the pool is not bound), or the market is not single-asset (the rent term reads
+/// asset 0 only; v5 pools are single-asset). `None` for anything but a pinned-layout wrapper
+/// MARKET account, or a corrupt `withdrawn > accrued`; the caller refuses. Tag 87's temporary
+/// refusals (a lagged band mark, a matured Live market) are not modelled: they delay the payout,
+/// they do not reduce it (a resolved market is paid once terminal-empty).
+pub fn read_wrapper_staker_fee_leg(data: &[u8], vault_auth: &[u8; 32]) -> Option<u128> {
+    use crate::wrapper_layout as wl;
+    let b = read_wrapper_bind_insurance(data)?;
+    if data.get(WRAPPER_OFF_MODE) != Some(&0)
+        || b.max_market_slots != 1
+        || read_wrapper_asset0_insurance_keys(data)?.0 != *vault_auth
+    {
+        return Some(0);
+    }
+    let r128 = |off: usize| -> Option<u128> {
+        Some(u128::from_le_bytes(
+            data.get(off..off + 16)?.try_into().ok()?,
+        ))
+    };
+    let claim = r128(WRAPPER_OFF_INSURANCE_RESERVE_ACCRUED)?
+        .checked_sub(r128(WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN)?)?;
+    let available = b
+        .insurance
+        .saturating_sub(b.credit_reserved)
+        .saturating_sub(r128(wl::MARKET_INS_BUDGET_TOTAL_OFF)?)
+        .saturating_sub(r128(wl::ASSET0_RENT_UNROUTED_OFF)?);
+    Some(claim.min(available).min(b.vault))
 }
 
 /// M-4 (AUD-S2-3): the two wrapper fields that decide whether anyone other than `marketauth` can
@@ -2216,6 +2256,59 @@ mod tests {
         let mut d = wrapper_market_bytes(1);
         d[WRAPPER_OFF_KIND] = 2;
         assert_eq!(read_wrapper_insurance_reserve_withdrawn(&d), None);
+    }
+
+    /// The staker fee leg reader reproduces tag 87's clamp, and reads 0 wherever tag 87 pays nothing.
+    #[test]
+    fn staker_fee_leg_is_the_tag87_payout() {
+        use crate::wrapper_layout as wl;
+        let va = [7u8; 32];
+        let put = |d: &mut Vec<u8>, off: usize, v: u128| {
+            d[off..off + 16].copy_from_slice(&v.to_le_bytes())
+        };
+        let mut d = wrapper_market_with_mode(0);
+        d[wl::MARKET_MAX_MARKET_SLOTS_OFF..wl::MARKET_MAX_MARKET_SLOTS_OFF + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        d[wl::ASSET0_INSURANCE_AUTHORITY_OFF..wl::ASSET0_INSURANCE_AUTHORITY_OFF + 32]
+            .copy_from_slice(&va);
+        put(&mut d, WRAPPER_OFF_INSURANCE_RESERVE_ACCRUED, 1_000);
+        put(&mut d, WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN, 400); // claim 600
+        put(&mut d, wl::MARKET_INSURANCE_OFF, 10_000);
+        put(&mut d, wl::MARKET_INS_CREDIT_RESERVED_OFF, 100);
+        put(&mut d, wl::MARKET_INS_BUDGET_TOTAL_OFF, 9_000);
+        put(&mut d, wl::ASSET0_RENT_UNROUTED_OFF, 400); // engine surplus 500
+        put(&mut d, wl::MARKET_VAULT_OFF, 1_000_000);
+        assert_eq!(
+            read_wrapper_staker_fee_leg(&d, &va),
+            Some(500),
+            "engine surplus binds"
+        );
+        put(&mut d, wl::ASSET0_RENT_UNROUTED_OFF, 0);
+        assert_eq!(
+            read_wrapper_staker_fee_leg(&d, &va),
+            Some(600),
+            "claim binds"
+        );
+        put(&mut d, wl::MARKET_VAULT_OFF, 550);
+        assert_eq!(
+            read_wrapper_staker_fee_leg(&d, &va),
+            Some(550),
+            "engine vault binds"
+        );
+        // Tag 87 pays nothing: not Live, not bound to this pool, multi-asset.
+        d[WRAPPER_OFF_MODE] = 2;
+        assert_eq!(read_wrapper_staker_fee_leg(&d, &va), Some(0));
+        d[WRAPPER_OFF_MODE] = 0;
+        assert_eq!(read_wrapper_staker_fee_leg(&d, &[8u8; 32]), Some(0));
+        d[wl::MARKET_MAX_MARKET_SLOTS_OFF] = 2;
+        assert_eq!(read_wrapper_staker_fee_leg(&d, &va), Some(0));
+        d[wl::MARKET_MAX_MARKET_SLOTS_OFF] = 1;
+        // Corrupt counters and an unpinned header fail closed.
+        put(&mut d, WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN, 1_001);
+        assert_eq!(read_wrapper_staker_fee_leg(&d, &va), None);
+        put(&mut d, WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN, 400);
+        d[8] ^= 1;
+        assert_eq!(read_wrapper_staker_fee_leg(&d, &va), None);
     }
 
     #[test]

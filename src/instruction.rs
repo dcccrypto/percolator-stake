@@ -142,7 +142,9 @@ pub enum StakeInstruction {
     /// `DepositWithConsent`). A FIRST_LOSS pool REQUIRES the 15-byte form with the version ==
     /// `pool.consent_version` AND the deployment parameters the staker accepts equal to the
     /// pool's (S-5: `target_bps` == the larger of the committed and a pending target), else
-    /// `ConsentRequired`. The deployed units are priced at the wrapper's ENTRY (mint) reading.
+    /// `ConsentRequired`. The deployed units are priced at the wrapper's ENTRY (mint) reading,
+    /// and the staker fee leg the wrapper has accrued but not yet paid (tag 87) is priced in at
+    /// what tag 87's own clamp would pay now (GH#331).
     Deposit { amount: u64 },
 
     /// 1 (v5, 15-byte data): `Deposit` carrying the staker's signed first-loss consent, bound

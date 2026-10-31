@@ -1203,7 +1203,26 @@ fn process_deposit(
         .ok_or(StakeError::Overflow)?;
         // D8 (mark-to-close): price in the creator-class growth the close-out will book.
         let growth = pending_closeout_growth_for_deposit(pool, vault, fee_slab, Some(&units))?;
-        let pv = pv.checked_add(growth).ok_or(StakeError::Overflow)?;
+        // GH#331: price in the staker fee leg the wrapper has accrued for this pool but the
+        // permissionless tag 87 has not paid yet. Once paid it is booked pro rata to whoever holds
+        // LP, so a deposit just before the crank took `D / (D + V)` of it. Priced at what tag 87's
+        // own clamp would pay now; 0 with no real staker (the dead shares would take it). Withdraw
+        // stays at booked value: an exiting staker can crank tag 87 first.
+        let fee_leg = if pool.has_real_lp_holders() {
+            let slab = fee_slab.ok_or(ProgramError::NotEnoughAccountKeys)?;
+            let leg = state::read_wrapper_staker_fee_leg(
+                &slab.try_borrow_data()?,
+                &vault_auth.key.to_bytes(),
+            )
+            .ok_or(StakeError::UnsupportedWrapperLayout)?;
+            u64::try_from(leg).map_err(|_| StakeError::Overflow)?
+        } else {
+            0
+        };
+        let pv = pv
+            .checked_add(growth)
+            .and_then(|v| v.checked_add(fee_leg))
+            .ok_or(StakeError::Overflow)?;
         crate::math::calc_lp_for_deposit(pool.total_lp_supply, pv, amount)
             .ok_or(StakeError::Overflow)?
     } else {
@@ -2988,6 +3007,9 @@ fn token_balance(ai: &AccountInfo) -> Result<u64, ProgramError> {
 /// JIT capture, so those paths refuse to run without it. Withdraw passes false and
 /// skips the accrual when the slab is absent. Redeeming at the not-yet-accrued price
 /// can only under-pay the withdrawer, never over-pay them, so it is not an attack.
+///
+/// This books only what tag 87 has already PAID. The part of the leg the wrapper has accrued
+/// but not yet paid is priced separately by the FIRST_LOSS Deposit (GH#331).
 fn pre_accrue_fee_modes(
     pool: &mut state::StakePool,
     vault: &AccountInfo,

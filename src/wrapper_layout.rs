@@ -88,6 +88,10 @@ pub const SLOT_INS_BUDGET_LONG_OFF: usize = 627;
 pub const SLOT_INS_BUDGET_SHORT_OFF: usize = 643;
 pub const SLOT_INS_SPENT_LONG_OFF: usize = 659;
 pub const SLOT_INS_SPENT_SHORT_OFF: usize = 675;
+/// `AssetStateV16Account.rent_unrouted_atoms` (u128 LE), the unrouted holding-fee rent every
+/// insurance surplus withdrawal excludes. Last field of the asset state, so it ends where the
+/// slot's insurance budget begins. Engine 3ce4cbd1.
+pub const SLOT_RENT_UNROUTED_OFF: usize = SLOT_INS_BUDGET_LONG_OFF - 16;
 
 /// Fixed wrapper-owned region at the start of every asset slot (`Market.wrapper`).
 pub const ASSET_ORACLE_WRAPPER_LEN: usize = 1024;
@@ -146,6 +150,7 @@ pub const ASSET0_INS_BUDGET_LONG_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_
 pub const ASSET0_INS_BUDGET_SHORT_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_BUDGET_SHORT_OFF;
 pub const ASSET0_INS_SPENT_LONG_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_SPENT_LONG_OFF;
 pub const ASSET0_INS_SPENT_SHORT_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_INS_SPENT_SHORT_OFF;
+pub const ASSET0_RENT_UNROUTED_OFF: usize = ASSET0_ENGINE_SLOT_OFF + SLOT_RENT_UNROUTED_OFF;
 pub const ASSET0_INSURANCE_AUTHORITY_OFF: usize = ASSET0_WRAPPER_START + ASSET_INSURANCE_AUTHORITY_OFF;
 pub const ASSET0_INSURANCE_OPERATOR_OFF: usize = ASSET0_WRAPPER_START + ASSET_INSURANCE_OPERATOR_OFF;
 /// Shortest market account that can hold the engine header (and so the `mode` byte).
@@ -183,6 +188,7 @@ const _: () = assert!(ASSET0_INS_BUDGET_LONG_OFF == 3049);
 const _: () = assert!(ASSET0_INS_BUDGET_SHORT_OFF == 3065);
 const _: () = assert!(ASSET0_INS_SPENT_LONG_OFF == 3081);
 const _: () = assert!(ASSET0_INS_SPENT_SHORT_OFF == 3097);
+const _: () = assert!(ASSET0_RENT_UNROUTED_OFF == 3033);
 const _: () = assert!(GROUP_MAX_MARKET_SLOTS_OFF + 4 <= MARKET_GROUP_LEN);
 const _: () = assert!(ASSET0_INSURANCE_AUTHORITY_OFF == 1422);
 const _: () = assert!(ASSET0_INSURANCE_OPERATOR_OFF == 1454);
