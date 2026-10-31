@@ -26,7 +26,7 @@
 /// #290 UPDATE: for mode-0 pools the donation half of this vector is now closed at
 /// the source. `AccrueFees` and the pre-accrue guard book surplus only up to the
 /// wrapper's not-yet-booked tag-87 payouts (`processor.rs::accrue_fees_inner`), so
-/// a raw donation no longer moves a mode-0 share price at all. The offset and the
+/// a raw donation no longer moves a mode-0 share price before the close-out. The offset and the
 /// MINIMUM_LIQUIDITY lock remain the defense for mode-1 pools, and remain
 /// defense-in-depth for mode 0.
 /// Kept at the minimal canonical value of 1 (not scaled to token decimals):
@@ -673,7 +673,9 @@ pub fn closeout_split(
 /// but not yet in `total_pool_value()`: exactly the `stakers` part of [`closeout_split`] over the
 /// surplus the close-out WILL see.
 ///
-/// * `unbooked`: vault balance above the booked pool value (tag 29 would split it too).
+/// * `unbooked`: the legitimate unbooked vault surplus tag 29 will split too. The deposit caller
+///   passes the S2 backlog capped at the vault surplus, never a raw donation (#290; see
+///   `processor::pending_closeout_growth_for_deposit`).
 /// * `creator_class_pending`: the creator-class fund the wrapper has yet to pay into the vault
 ///   at terminal (FEE_ONLY: the insurance authority's withdrawable capacity; unitised
 ///   FIRST_LOSS: the value of the creator-class units). The stake class is NOT included: it is
