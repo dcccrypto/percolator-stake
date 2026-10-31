@@ -2359,6 +2359,13 @@ fn process_bind_insurance_authority(
         if pool.admin != admin.key.to_bytes() {
             return Err(StakeError::Unauthorized.into());
         }
+        // GH#329: insurance LP pools only. RecoverTerminalInsurance and the terminal deposit gate
+        // and booking are mode-0 only, so a trading LP pool (mode 1) would record a creator seed
+        // it can never return and book the recovered insurance as fees.
+        if pool.pool_mode != 0 {
+            msg!("BindInsuranceAuthority: not valid for trading LP pools (mode 1)");
+            return Err(StakeError::InvalidPoolMode.into());
+        }
         (
             pool.slab,
             pool.percolator_program,
@@ -2377,7 +2384,7 @@ fn process_bind_insurance_authority(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
-    // CLOSE-OUT RULE (2026-10-14, every v5 mode): record the creator's insurance seed = the
+    // CLOSE-OUT RULE (2026-10-14, every v5 risk mode): record the creator's insurance seed = the
     // creator's OWN money in the fund at the moment the pool takes custody of it (M-1 / M-1b,
     // security reviews 2026-10-14): ASSET 0's budgeted insurance (what its authority/operator
     // could withdraw) net of reserved credit, capped by insurance and the vault
@@ -3335,7 +3342,8 @@ fn wrapper_fee_payouts(
 /// not the exact pinned tombstone (wrong magic / VERSION / kind / length) returns `false`
 /// and takes the unchanged live-market path.
 /// D8 maturity gate: the wrapper market's terminal slot, or `None` (gate off) when the pool has
-/// no market concept (mode 1), the market is not terminal, or the slot cannot be read.
+/// no insurance custody (mode 1: tag 19 refuses it), the market is not terminal, or the slot
+/// cannot be read.
 /// A Resolved market is read live (and recorded once in the pool, `record_terminal_slot`); a
 /// CloseSlab tombstone has lost it, so the recorded copy is used (AdminCloseSlab and the tag-29 /
 /// Withdraw reads of the Resolved market record it before the tombstone exists).
@@ -4297,7 +4305,7 @@ fn forward_to_creator<'a>(
     Ok(amount)
 }
 
-/// CLOSE-OUT RULE terminal settlement (2026-10-14, every v5 mode): forward the creator's seed
+/// CLOSE-OUT RULE terminal settlement (2026-10-14, every v5 risk mode): forward the creator's seed
 /// return (`StakePool::closeout_creator_share`: at most the seed recorded at bind, less what was
 /// already forwarded, and for a unitised FIRST_LOSS market at most the creator-class value the
 /// wrapper has released) out of the vault surplus to the creator, and advance the forwarded
@@ -4392,7 +4400,8 @@ fn process_recover_terminal_insurance(
         }
     }
 
-    // Insurance LP pools only, like tags 3 / 10 / 23.
+    // Insurance LP pools only. Bind (tag 19) refuses mode 1, so a trading pool cannot take custody
+    // of the market's insurance or record a creator seed.
     if pool.pool_mode != 0 {
         msg!("RecoverTerminalInsurance: not valid for trading LP pools (mode 1)");
         return Err(StakeError::InvalidPoolMode.into());
@@ -4634,7 +4643,7 @@ fn process_recover_terminal_insurance(
         .checked_sub(fees_before)
         .ok_or(StakeError::Overflow)?;
 
-    // CLOSE-OUT RULE (2026-10-14, every v5 mode): the creator gets back the seed recorded at
+    // CLOSE-OUT RULE (2026-10-14, every v5 risk mode): the creator gets back the seed recorded at
     // bind if intact, else what is left of it, never more:
     // `min(surplus, min(seed, creator class released) - forwarded)`. Everything else is booked
     // to the stakers (pro rata by LP share); with no real staker it stays unbooked in the vault,

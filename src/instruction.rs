@@ -223,7 +223,10 @@ pub enum StakeInstruction {
     /// since been resolved (e.g. via `AdminResolveMarket`, tag 24) a repeat or
     /// late call fails with EngineLockActive instead, not Unauthorized.
     ///
-    /// CLOSE-OUT RULE (2026-10-14, every v5 pool: FIRST_LOSS and FEE_ONLY): the bind also
+    /// Insurance LP pools only: a trading pool (`pool_mode` 1, tag 13) is refused with
+    /// `InvalidPoolMode` (17) before any CPI, since tag 29 cannot settle its custody.
+    ///
+    /// CLOSE-OUT RULE (2026-10-14, every v5 mode-0 pool: FIRST_LOSS and FEE_ONLY): the bind also
     /// records the creator's insurance seed = the creator's own money in the fund now
     /// (`math::creator_seed_at_bind`: ASSET 0's remaining budget minus reserved credit, capped by
     /// insurance minus reserved credit and by the engine vault; pool bytes 457..464 + flag byte
@@ -377,7 +380,7 @@ pub enum StakeInstruction {
     ///    owned by `vault_auth`, other than `pool.vault`) into `pool.vault`.
     ///    Wrapper tag 41 is itself permissionless, and anyone can point it at such
     ///    an account, so this is the undo for a griefed payout.
-    /// 4. Settle the vault surplus (CLOSE-OUT RULE, 2026-10-14, every v5 mode). (a) Book the
+    /// 4. Settle the vault surplus (CLOSE-OUT RULE, 2026-10-14, every v5 risk mode). (a) Book the
     ///    wrapper-attributable tag-87 fees (the normal `AccrueFees` path, Resolved only).
     ///    (b) Forward the creator's seed return to the creator:
     ///    `min(surplus, min(seed, creator class released) - forwarded)`
@@ -559,6 +562,8 @@ pub enum StakeInstruction {
     AccrueFees,
 
     /// 13: Initialize pool in trading LP mode (pool_mode = 1).
+    /// A trading pool cannot take custody of the market's insurance: BindInsuranceAuthority (19) and
+    /// RecoverTerminalInsurance (29) refuse it with `InvalidPoolMode` (17).
     ///
     /// Accounts: same as InitPool
     InitTradingPool {

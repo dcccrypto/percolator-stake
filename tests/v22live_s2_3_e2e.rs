@@ -960,3 +960,117 @@ fn m3_jit_deposit_before_resolve_no_longer_shares_closeout_growth() {
     );
     assert!(alice_profit + bob_profit <= growth);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+// GH#329: a trading LP pool (InitTradingPool, tag 13, mode 1) as the insurance authority
+// ═════════════════════════════════════════════════════════════════════════════════════════
+
+const E_INVALID_POOL_MODE: u32 = 17;
+
+/// Real stake InitTradingPool (tag 13): cooldown 5, no deposit cap.
+fn init_trading_pool(w: &mut World) -> TxResult {
+    let mut d = vec![13u8];
+    d.extend_from_slice(&5u64.to_le_bytes());
+    d.extend_from_slice(&0u64.to_le_bytes());
+    init_pool_with(w, d)
+}
+
+/// Wrapper tag 41 WithdrawInsurance, unsigned (permissionless once the market is Resolved and
+/// empty): pays `authority`'s terminal insurance budget into `dest`, a token account it owns.
+fn withdraw_insurance(w: &mut World, authority: Pubkey, dest: Pubkey, amount: u64) -> TxResult {
+    let mut d = vec![41u8];
+    d.extend_from_slice(&(amount as u128).to_le_bytes());
+    let ix = Instruction {
+        program_id: w.wrapper_id,
+        accounts: vec![
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new(w.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(w.wrapper_vault, false),
+            AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+            AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+        ],
+        data: d,
+    };
+    let payer = w.payer.insecure_clone();
+    send_ixs(&mut w.svm, &payer, &[], vec![ix])
+}
+
+/// The bind refuses a trading LP pool (17) before any CPI: custody stays with the creator and no
+/// seed is recorded, so after the resolve the creator withdraws its own insurance with tag 41 and
+/// nothing is payable to the pool. On the base build the bind succeeds and this test fails at the
+/// bind assert.
+#[test]
+fn trading_pool_bind_is_refused_and_custody_stays_with_the_creator() {
+    let mut w = market_only();
+    assert!(init_trading_pool(&mut w).is_ok());
+    assert_eq!(read_pool(&w.svm, &w.pool).pool_mode, 1);
+    let alice = deposit(&mut w, STAKE);
+    let me = w.admin.pubkey().to_bytes();
+    let r = bind(&mut w);
+    assert_eq!(custom(&r), Some(E_INVALID_POOL_MODE), "{}", logs(&r));
+    let invoke = format!("Program {} invoke", w.wrapper_id);
+    assert!(
+        !logs(&r).contains(&invoke),
+        "refused before any wrapper CPI: {}",
+        logs(&r)
+    );
+    assert_eq!(custody(&w), (me, me), "custody never moves");
+    assert!(
+        !read_pool(&w.svm, &w.pool).creator_seed_recorded(),
+        "no seed recorded"
+    );
+    w.svm.warp_to_slot(now(&w) + 1_000);
+    admin_resolve(&mut w);
+    let (vault_auth, vault, admin, creator_ata) =
+        (w.vault_auth, w.vault, w.admin.pubkey(), w.creator_ata);
+    let r = withdraw_insurance(&mut w, vault_auth, vault, 1);
+    assert_eq!(
+        custom(&r),
+        Some(21),
+        "nothing is payable to the pool: {}",
+        logs(&r)
+    );
+    let r = withdraw_insurance(&mut w, admin, creator_ata, BUDGET);
+    assert!(r.is_ok(), "the creator's own tag 41: {}", logs(&r));
+    assert_eq!(
+        token_amount(&w.svm, &w.creator_ata),
+        BUDGET,
+        "the creator gets its insurance back"
+    );
+    w.svm.warp_to_slot(now(&w) + 10);
+    // The first depositor's stake less the 1,000 dead shares minted at the genesis deposit.
+    assert_eq!(withdraw_all(&mut w, &alice), STAKE - 1_000);
+}
+
+/// The guard leaves insurance LP pools alone: a FEE_ONLY and a FIRST_LOSS InitPool still bind,
+/// hand custody to `vault_auth` and record the seed.
+#[test]
+fn insurance_pool_bind_still_works_for_both_risk_modes() {
+    for (risk_mode, target_bps) in [(2u8, 0u16), (1u8, 5_000u16)] {
+        let mut w = market_only();
+        let mut ipd = vec![0u8];
+        ipd.extend_from_slice(&5u64.to_le_bytes());
+        ipd.extend_from_slice(&0u64.to_le_bytes());
+        ipd.push(risk_mode);
+        ipd.extend_from_slice(&target_bps.to_le_bytes());
+        ipd.extend_from_slice(&3_000u16.to_le_bytes());
+        ipd.extend_from_slice(&500u16.to_le_bytes());
+        let r = init_pool_with(&mut w, ipd);
+        assert!(r.is_ok(), "InitPool risk mode {risk_mode}: {}", logs(&r));
+        assert_eq!(read_pool(&w.svm, &w.pool).pool_mode, 0);
+        let r = bind(&mut w);
+        assert!(r.is_ok(), "bind risk mode {risk_mode}: {}", logs(&r));
+        let va = w.vault_auth.to_bytes();
+        assert_eq!(custody(&w), (va, va));
+        assert_eq!(read_pool(&w.svm, &w.pool).creator_seed_atoms(), BUDGET);
+        // A repeat bind reaches the wrapper CPI and is refused there: the log line the trading-pool
+        // test checks for is the one a CPI writes.
+        let r = bind(&mut w);
+        assert!(
+            logs(&r).contains(&format!("Program {} invoke", w.wrapper_id)),
+            "{}",
+            logs(&r)
+        );
+    }
+}
