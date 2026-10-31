@@ -273,6 +273,12 @@ impl World {
 /// (`risk_mode`) -> FIRST_LOSS: real Bind (19, records the seed) + BurnAssetAdmin (21); FEE_ONLY:
 /// the bind runs after the first deposit (see `scene`). No staker yet.
 fn world(risk_mode: u8) -> World {
+    world_with_bind(risk_mode, true)
+}
+
+/// `world`, optionally WITHOUT the FIRST_LOSS Bind + BurnAssetAdmin (the pool is then not the
+/// market's insurance authority).
+fn world_with_bind(risk_mode: u8, bind: bool) -> World {
     let (so, wso) = (stake_so(), wrapper_so());
     assert!(
         so.exists(),
@@ -439,7 +445,7 @@ fn world(risk_mode: u8) -> World {
         creator_ata,
         risk_mode,
     };
-    if risk_mode == RISK_FIRST_LOSS {
+    if risk_mode == RISK_FIRST_LOSS && bind {
         assert!(w.pool().is_first_loss());
         for tag in [19u8, 21u8] {
             bind_like(&mut w, tag);
@@ -1141,4 +1147,351 @@ fn d8_pricing_alone_closes_the_jit_when_the_gate_does_not_apply() {
     assert!(deposit(&mut w, &jit, JIT).is_ok());
     let (jp, ap) = resolve_and_exit_after(&mut w, &alice, &jit, SEED, N);
     assert_jit_captures_nothing(jp, ap, ALICE);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GH#331: the wrapper's staker fee leg on a Live FIRST_LOSS market. Real fee-bearing trades
+// (wrapper TradeNoCpi) accrue it in the wrapper; the permissionless wrapper tag 87 pays it into
+// `pool.vault`, where the pre-accrue books it to whoever holds LP at that moment. Forged, besides
+// funding: the zero-filled wrapper-owned portfolio accounts (what a client's create_account
+// produces).
+
+const PF_LEN: usize = 10_603;
+const PF_ID_OFF: usize = PF_LEN - 24;
+const PF_SEQ_OFF: usize = PF_LEN - 16;
+const PF_CONTROL_OFF: usize = PF_LEN - 24 - 104 + 96;
+const TRADE_PRICE: u64 = 100;
+const TRADE_FEE_BPS: u64 = 500;
+const TRADER_CAP: u64 = 30_000_000_000;
+const SIZE_Q: i128 = 1_000_000 * 1_000_000;
+/// The staker leg one open + close of SIZE_Q accrues at these parameters.
+const LEG: u64 = 1_600_000;
+
+/// `insurance_reserve_accrued_atoms - insurance_reserve_withdrawn_atoms`, read raw.
+fn staker_leg_owed(w: &World) -> u64 {
+    use percolator_stake::state::{
+        WRAPPER_OFF_INSURANCE_RESERVE_ACCRUED as ACC, WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN as WD,
+    };
+    let d = w.svm.get_account(&w.market).unwrap().data;
+    let r = |o: usize| u128::from_le_bytes(d[o..o + 16].try_into().unwrap());
+    (r(ACC) - r(WD)) as u64
+}
+
+struct Trader {
+    kp: Keypair,
+    pf: Pubkey,
+}
+
+fn pf_epoch(w: &World, pf: &Pubkey) -> u64 {
+    (read_u64(&w.svm, pf, PF_CONTROL_OFF) >> 1) & ((1u64 << 49) - 1)
+}
+
+/// Wrapper InitPortfolio (1) + portfolio Deposit (3) of `amount`.
+fn trader(w: &mut World, amount: u64) -> Trader {
+    let kp = Keypair::new();
+    w.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+    let pf = Pubkey::new_unique();
+    let wid = w.wrapper_id;
+    let acct = Account {
+        lamports: 1_000_000_000,
+        data: vec![0u8; PF_LEN],
+        owner: wid,
+        executable: false,
+        rent_epoch: 0,
+    };
+    w.svm.set_account(pf, acct).unwrap();
+    let payer = w.payer.insecure_clone();
+    let ix = Instruction {
+        program_id: wid,
+        accounts: vec![
+            AccountMeta::new(kp.pubkey(), true),
+            AccountMeta::new(w.market, false),
+            AccountMeta::new(pf, false),
+        ],
+        data: vec![1u8],
+    };
+    let r = send(&mut w.svm, &payer, &[&kp], ix);
+    assert!(r.is_ok(), "InitPortfolio: {}", logs(&r));
+    let src = Pubkey::new_unique();
+    let (mint, k) = (w.mint, kp.pubkey());
+    set_token_account(&mut w.svm, src, &mint, &k, amount);
+    let mut d = vec![3u8];
+    d.extend_from_slice(&read_u64(&w.svm, &pf, PF_ID_OFF).to_le_bytes());
+    d.extend_from_slice(&read_u64(&w.svm, &pf, PF_SEQ_OFF).to_le_bytes());
+    d.extend_from_slice(&(amount as u128).to_le_bytes());
+    let ix = Instruction {
+        program_id: wid,
+        accounts: vec![
+            AccountMeta::new(k, true),
+            AccountMeta::new(w.market, false),
+            AccountMeta::new(pf, false),
+            AccountMeta::new(src, false),
+            AccountMeta::new(w.wrapper_vault, false),
+            AccountMeta::new_readonly(token_program(), false),
+        ],
+        data: d,
+    };
+    let r = send(&mut w.svm, &payer, &[&kp], ix);
+    assert!(r.is_ok(), "portfolio Deposit: {}", logs(&r));
+    Trader { kp, pf }
+}
+
+/// Wrapper TradeNoCpi (6) of `size_q` at TRADE_PRICE with a real TRADE_FEE_BPS fee.
+fn trade(w: &mut World, a: &Trader, b: &Trader, size_q: i128) {
+    let mut d = vec![6u8];
+    d.extend_from_slice(&read_u64(&w.svm, &a.pf, PF_ID_OFF).to_le_bytes());
+    d.extend_from_slice(&pf_epoch(w, &a.pf).to_le_bytes());
+    d.extend_from_slice(&read_u64(&w.svm, &b.pf, PF_ID_OFF).to_le_bytes());
+    d.extend_from_slice(&pf_epoch(w, &b.pf).to_le_bytes());
+    d.extend_from_slice(&0u16.to_le_bytes());
+    d.extend_from_slice(&read_u64(&w.svm, &w.market, ASSET0_MARKET_ID_OFF).to_le_bytes());
+    d.extend_from_slice(&size_q.to_le_bytes());
+    d.extend_from_slice(&TRADE_PRICE.to_le_bytes());
+    d.extend_from_slice(&TRADE_FEE_BPS.to_le_bytes());
+    d.extend_from_slice(&10_000u16.to_le_bytes());
+    let ix = Instruction {
+        program_id: w.wrapper_id,
+        accounts: vec![
+            AccountMeta::new(a.kp.pubkey(), true),
+            AccountMeta::new(b.kp.pubkey(), true),
+            AccountMeta::new(w.market, false),
+            AccountMeta::new(a.pf, false),
+            AccountMeta::new(b.pf, false),
+        ],
+        data: d,
+    };
+    let (ak, bk, payer) = (
+        a.kp.insecure_clone(),
+        b.kp.insecure_clone(),
+        w.payer.insecure_clone(),
+    );
+    let r = send(&mut w.svm, &payer, &[&ak, &bk], ix);
+    assert!(r.is_ok(), "fee-bearing TradeNoCpi: {}", logs(&r));
+}
+
+/// One open + close of SIZE_Q between two fresh traders: accrues LEG to the staker leg.
+fn fee_round_trip(w: &mut World) {
+    let a = trader(w, TRADER_CAP);
+    let b = trader(w, TRADER_CAP);
+    trade(w, &a, &b, SIZE_Q);
+    trade(w, &a, &b, -SIZE_Q);
+}
+
+/// Wrapper tag 87 (WithdrawInsuranceReserveToStake), signed by a random key. Returns the amount
+/// it moved into `pool.vault`.
+fn tag87(w: &mut World) -> Result<u64, Option<u32>> {
+    let cranker = Keypair::new();
+    w.svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: w.wrapper_id,
+        accounts: vec![
+            AccountMeta::new(cranker.pubkey(), true),
+            AccountMeta::new(w.market, false),
+            AccountMeta::new_readonly(w.pool, false),
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new(w.wrapper_vault, false),
+            AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+            AccountMeta::new_readonly(token_program(), false),
+        ],
+        data: vec![87u8],
+    };
+    let payer = w.payer.insecure_clone();
+    let v0 = w.vault_balance();
+    let r = send(&mut w.svm, &payer, &[&cranker], ix);
+    match r {
+        Ok(()) => Ok(w.vault_balance() - v0),
+        Err(_) => Err(custom(&r)),
+    }
+}
+
+/// FIRST_LOSS, Live, NO forged state: alice 10M and bob 2M stake, a sync deploys 6M, then one
+/// fee round trip accrues LEG to the staker leg, not yet paid (nobody has cranked tag 87).
+fn fl_fees() -> (World, Staker, Staker) {
+    let mut w = world(RISK_FIRST_LOSS);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    let bob = new_staker(&mut w, BOB);
+    assert!(deposit(&mut w, &bob, BOB).is_ok());
+    let r = sync(&mut w);
+    assert!(r.is_ok(), "sync: {}", logs(&r));
+    w.warp(1_000);
+    fee_round_trip(&mut w);
+    assert_eq!(
+        staker_leg_owed(&w),
+        LEG,
+        "real trades accrued the staker leg"
+    );
+    (w, alice, bob)
+}
+
+/// The value a FIRST_LOSS Deposit prices LP against before this fix: booked liquid value +
+/// stake-class units at the entry reading.
+fn fl_entry_value(w: &World) -> u64 {
+    let deployed = w.units().map_or(0, |u| {
+        percolator_stake::math::deployed_value(u.units_stake, u.units_total, u.snap_mint).unwrap()
+    });
+    w.tpv() + deployed
+}
+
+/// Exit `s` at the first slot its cooldown allows; returns the collateral paid.
+fn exit_after_cooldown(w: &mut World, s: &Staker) -> u64 {
+    let cd = w.pool().cooldown_slots;
+    w.warp(cd + 1);
+    exit_all(w, s, Tail::V5)
+}
+
+/// RED before GH#331 (the JIT staker takes floor(LEG * JIT / (JIT + 12M)) = 1,428,571 of the
+/// 1.6M leg; bob gets 2,028,571 instead of ~2,266,666), GREEN after: the deposit is priced with
+/// the owed leg, so the crank it then triggers moves nothing to it.
+#[test]
+fn staker_leg_jit_deposit_then_tag87_captures_nothing() {
+    let (mut w, _alice, bob) = fl_fees();
+    let jit = new_staker(&mut w, JIT);
+    let r = deposit(&mut w, &jit, JIT);
+    assert!(r.is_ok(), "jit deposit: {}", logs(&r));
+    assert_eq!(
+        tag87(&mut w),
+        Ok(LEG),
+        "the permissionless crank pays the whole leg"
+    );
+    let paid = exit_after_cooldown(&mut w, &jit);
+    let profit = paid as i128 - JIT as i128;
+    assert!(
+        profit <= 0 && profit > -(TOL as i128),
+        "JIT staker captured {profit} of the {LEG} staker leg (paid {paid} for {JIT})"
+    );
+    // The incumbents keep the leg: bob's pro-rata share of it (2M of 12M), less dead-share dust.
+    let bob_paid = exit_all(&mut w, &bob, Tail::V5);
+    let want = BOB + LEG * BOB / (ALICE + BOB);
+    assert!(
+        bob_paid.abs_diff(want) < TOL,
+        "bob got {bob_paid}, expected about {want}"
+    );
+}
+
+/// Exactness: the priced leg is what tag 87 pays in the same slot, and nothing once paid.
+#[test]
+fn staker_leg_reader_matches_the_real_tag87_payout() {
+    use percolator_stake::state::read_wrapper_staker_fee_leg;
+    let (mut w, _alice, _bob) = fl_fees();
+    let leg = |w: &World| {
+        let d = w.svm.get_account(&w.market).unwrap().data;
+        read_wrapper_staker_fee_leg(&d, &w.vault_auth.to_bytes())
+    };
+    assert_eq!(leg(&w), Some(LEG as u128));
+    assert_eq!(tag87(&mut w), Ok(LEG));
+    assert_eq!(leg(&w), Some(0));
+    // Nothing owed: tag 87 refuses (NoInsuranceReserveToClaim) and the reader agrees.
+    assert!(tag87(&mut w).is_err());
+}
+
+/// Crank first: the leg is booked before the deposit prices, so the price is the one the pool
+/// always used (booked value incl. the payout, + deployed units), to the atom.
+#[test]
+fn staker_leg_crank_first_prices_exactly_as_before() {
+    let (mut w, _alice, _bob) = fl_fees();
+    assert_eq!(tag87(&mut w), Ok(LEG));
+    let want = percolator_stake::math::calc_lp_for_deposit(
+        w.pool().total_lp_supply,
+        fl_entry_value(&w) + LEG, // the deposit's pre-accrue books the payout first
+        JIT,
+    )
+    .unwrap();
+    let jit = new_staker(&mut w, JIT);
+    assert!(deposit(&mut w, &jit, JIT).is_ok());
+    assert_eq!(token_amount(&w.svm, &jit.lp_ata), want);
+    let paid = exit_after_cooldown(&mut w, &jit);
+    assert!(
+        paid <= JIT && paid + TOL > JIT,
+        "round trip paid {paid} for {JIT}"
+    );
+}
+
+/// No fee history (nothing owed): an honest deposit mints exactly what it did before.
+#[test]
+fn staker_leg_nothing_owed_prices_exactly_as_before() {
+    let mut w = world(RISK_FIRST_LOSS);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    assert!(sync(&mut w).is_ok());
+    w.warp(1_000);
+    assert_eq!(staker_leg_owed(&w), 0);
+    let want = percolator_stake::math::calc_lp_for_deposit(
+        w.pool().total_lp_supply,
+        fl_entry_value(&w),
+        BOB,
+    )
+    .unwrap();
+    let bob = new_staker(&mut w, BOB);
+    assert!(deposit(&mut w, &bob, BOB).is_ok());
+    assert_eq!(token_amount(&w.svm, &bob.lp_ata), want);
+}
+
+/// With no real LP holder (only the dead shares) the owed leg is not priced: the deposit mints
+/// exactly what it did before (that backlog is left as it was, see `accrue_fees_inner`).
+#[test]
+fn staker_leg_is_not_priced_without_real_lp_holders() {
+    let mut w = world(RISK_FIRST_LOSS);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    w.warp(1_000);
+    fee_round_trip(&mut w);
+    exit_all(&mut w, &alice, Tail::V5);
+    assert_eq!(
+        w.pool().total_lp_supply,
+        percolator_stake::state::MINIMUM_LIQUIDITY,
+        "only the dead shares are left"
+    );
+    assert_eq!(staker_leg_owed(&w), LEG);
+    let want = percolator_stake::math::calc_lp_for_deposit(
+        w.pool().total_lp_supply,
+        fl_entry_value(&w),
+        BOB,
+    )
+    .unwrap();
+    let bob = new_staker(&mut w, BOB);
+    let r = deposit(&mut w, &bob, BOB);
+    assert!(r.is_ok(), "deposit: {}", logs(&r));
+    assert_eq!(token_amount(&w.svm, &bob.lp_ata), want);
+}
+
+/// FEE_ONLY: tag 87 never pays this pool (StakePoolModeMismatch, 59), and its deposit price does
+/// not move with the wrapper's staker leg.
+#[test]
+fn staker_leg_fee_only_pool_is_not_priced() {
+    let mut w = world(RISK_FEE_ONLY);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    bind_like(&mut w, 19);
+    w.warp(1_000);
+    fee_round_trip(&mut w);
+    assert_eq!(staker_leg_owed(&w), LEG);
+    assert_eq!(tag87(&mut w), Err(Some(59)));
+    let want = percolator_stake::math::calc_lp_for_deposit(w.pool().total_lp_supply, w.tpv(), JIT)
+        .unwrap();
+    let jit = new_staker(&mut w, JIT);
+    assert!(deposit(&mut w, &jit, JIT).is_ok());
+    assert_eq!(token_amount(&w.svm, &jit.lp_ata), want);
+}
+
+/// A FIRST_LOSS pool that is not the market's insurance authority (no Bind): tag 87 refuses it
+/// (wrapper StakePoolAuthorityMismatch, 56), so the leg the wrapper has accrued is not priced.
+#[test]
+fn staker_leg_unbound_pool_is_not_priced() {
+    let mut w = world_with_bind(RISK_FIRST_LOSS, false);
+    let alice = new_staker(&mut w, ALICE);
+    assert!(deposit(&mut w, &alice, ALICE).is_ok());
+    w.warp(1_000);
+    fee_round_trip(&mut w);
+    assert_eq!(staker_leg_owed(&w), LEG);
+    assert_eq!(tag87(&mut w), Err(Some(56)));
+    let want = percolator_stake::math::calc_lp_for_deposit(
+        w.pool().total_lp_supply,
+        fl_entry_value(&w),
+        BOB,
+    )
+    .unwrap();
+    let bob = new_staker(&mut w, BOB);
+    assert!(deposit(&mut w, &bob, BOB).is_ok());
+    assert_eq!(token_amount(&w.svm, &bob.lp_ata), want);
 }
