@@ -1142,3 +1142,435 @@ fn d8_pricing_alone_closes_the_jit_when_the_gate_does_not_apply() {
     let (jp, ap) = resolve_and_exit_after(&mut w, &alice, &jit, SEED, N);
     assert_jit_captures_nothing(jp, ap, ALICE);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GH#324: a raw transfer into pool.vault must not move the mode-0 deposit price (#290 / #298),
+// while mark-to-close pricing keeps every legitimate growth source (wrapper capacity, creator
+// class, S2 backlog). Every donation and every pushed atom is a REAL SPL Transfer. Forged, as in
+// the tests above: funding balances, the seed record (`fo_live` / `fl_live` / `forge_seed`), and
+// in the S2 tests the wrapper's `insurance_reserve_withdrawn_atoms` (as `f3_*::push_fees`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ZERO_SHARES_MINTED: u32 = 22;
+const PENDING_CLOSEOUT_GROWTH: u32 = 49;
+const DON10: u64 = 10_000_000;
+/// What the 1,000 dead shares (N7 floor) keep of a close-out surplus.
+const DEAD_DUST: u64 = 3_000;
+const P_BACKLOG: u64 = 2_000_000;
+
+fn mode_name(risk_mode: u8) -> &'static str {
+    if risk_mode == RISK_FIRST_LOSS {
+        "FIRST_LOSS"
+    } else {
+        "FEE_ONLY"
+    }
+}
+
+/// AdminSetTrancheConfig (stake tag 15) with `junior_fee_mult_bps` = 20,000.
+fn tranche_on(w: &mut World) {
+    let admin = w.admin.insecure_clone();
+    let junior_fee_mult_bps: u16 = 20_000;
+    let mut data = vec![15u8];
+    data.extend_from_slice(&junior_fee_mult_bps.to_le_bytes());
+    let accounts = vec![
+        AccountMeta::new(w.admin.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+    ];
+    let r = w.send_stake(&[&admin], accounts, data);
+    assert!(r.is_ok(), "AdminSetTrancheConfig failed: {}", logs(&r));
+    assert!(w.pool().tranche_enabled(), "tranches were not enabled");
+}
+
+/// Stake tag 1 (senior) or 16 (DepositJunior) on a FEE_ONLY pool.
+fn deposit_tag(w: &mut World, s: &Staker, amount: u64, tag: u8) -> TxResult {
+    let (dpda, _) = derive_deposit_pda(&w.stake_id, &w.pool, &s.kp.pubkey());
+    let mut data = vec![tag];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let accounts = vec![
+        AccountMeta::new(s.kp.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+        AccountMeta::new(s.ata, false),
+        AccountMeta::new(w.vault, false),
+        AccountMeta::new(w.lp_mint, false),
+        AccountMeta::new(s.lp_ata, false),
+        AccountMeta::new_readonly(w.vault_auth, false),
+        AccountMeta::new(dpda, false),
+        AccountMeta::new_readonly(token_program(), false),
+        AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(w.market, false),
+    ];
+    let kp = s.kp.insecure_clone();
+    w.send_stake(&[&kp], accounts, data)
+}
+
+/// `donor` sends `amount` into pool.vault by a REAL SPL Transfer from its own token account (the
+/// donor is funded with `amount` first).
+fn spl_donation(w: &mut World, donor: &Staker, amount: u64) {
+    let bal = token_amount(&w.svm, &donor.ata);
+    let mint = w.mint;
+    let owner = donor.kp.pubkey();
+    set_token_account(&mut w.svm, donor.ata, &mint, &owner, bal + amount);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: token_program(),
+        accounts: vec![
+            AccountMeta::new(donor.ata, false),
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new_readonly(donor.kp.pubkey(), true),
+        ],
+        data,
+    };
+    let payer = w.payer.insecure_clone();
+    let r = send(&mut w.svm, &payer, &[&donor.kp], ix);
+    assert!(r.is_ok(), "SPL transfer failed: {}", logs(&r));
+}
+
+/// A wrapper tag-87 push of `p` atoms: the atoms arrive by a REAL SPL Transfer and the payout
+/// counter advances by `p` (forged, as `f3_dead_share_accrue_guard_e2e.rs::push_fees`).
+/// Only `withdrawn` is forged, so it ends above `accrued` and the wrapper would refuse a later
+/// CloseSlab; the S2 tests never close the slab.
+fn push_tag87(w: &mut World, p: u64) {
+    let off = percolator_stake::state::WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN;
+    let mut acct = w.svm.get_account(&w.market).unwrap();
+    let cur = u128::from_le_bytes(acct.data[off..off + 16].try_into().unwrap());
+    acct.data[off..off + 16].copy_from_slice(&(cur + p as u128).to_le_bytes());
+    let m = w.market;
+    w.svm.set_account(m, acct).unwrap();
+    let wrapper = new_staker(w, 0);
+    spl_donation(w, &wrapper, p);
+}
+
+fn tail_for(w: &World) -> Tail {
+    if w.risk_mode == RISK_FIRST_LOSS {
+        Tail::V5
+    } else {
+        Tail::Slab
+    }
+}
+
+/// Alice (10M) is the mature incumbent; the seed recorded at bind equals the wrapper capacity, so
+/// no honest close-out growth is pending.
+fn incumbent(risk_mode: u8) -> (World, Staker) {
+    let mut w = world(risk_mode);
+    let alice = new_staker(&mut w, ALICE);
+    let r = deposit(&mut w, &alice, ALICE);
+    assert!(r.is_ok(), "alice deposit failed: {}", logs(&r));
+    if risk_mode == RISK_FEE_ONLY {
+        bind_like(&mut w, 19);
+    }
+    assert_eq!(
+        w.pool().creator_seed_atoms(),
+        SEED,
+        "PIN: the bind did not record the seed"
+    );
+    w.warp(1_000);
+    (w, alice)
+}
+
+fn deposit_lp(w: &mut World, s: &Staker, amount: u64) -> u64 {
+    let before = token_amount(&w.svm, &s.lp_ata);
+    let r = deposit(w, s, amount);
+    assert!(r.is_ok(), "deposit of {amount} failed: {}", logs(&r));
+    token_amount(&w.svm, &s.lp_ata) - before
+}
+
+/// FEE_ONLY: 2M of honest growth is priced into a 100M deposit, and the incumbent's 10M donation
+/// on top changes nothing. RED before the fix (45,454,547 LP with the donation).
+#[test]
+fn d8_donation_fee_only_growth_priced_donation_not() {
+    let (mut w, _alice) = incumbent(RISK_FEE_ONLY);
+    let j = new_staker(&mut w, JIT);
+    let lp_plain = deposit_lp(&mut w, &j, JIT);
+
+    let (mut w, _alice) = fo_live();
+    let j = new_staker(&mut w, JIT);
+    let lp_growth = deposit_lp(&mut w, &j, JIT);
+
+    let (mut w, alice) = fo_live();
+    spl_donation(&mut w, &alice, DON10);
+    let j = new_staker(&mut w, JIT);
+    let lp_growth_don = deposit_lp(&mut w, &j, JIT);
+    assert_eq!(lp_plain, JIT, "no growth pending, yet the price is not 1:1");
+    assert!(
+        lp_growth < lp_plain * 9 / 10,
+        "honest growth was not priced: {lp_growth} LP for {JIT}"
+    );
+    assert_eq!(lp_growth_don, lp_growth, "the donation was priced");
+}
+
+/// FIRST_LOSS (synced, 2M of honest creator-class growth): the incumbent's donation does not move
+/// the price, and a Live exit loses only the honest-growth premium. RED before the fix (1,054,945
+/// LP after the donation).
+#[test]
+fn d8_donation_first_loss_growth_priced_donation_not() {
+    let (mut w, alice) = fl_live();
+    let c0 = new_staker(&mut w, BOB);
+    let lp0 = deposit_lp(&mut w, &c0, BOB);
+    spl_donation(&mut w, &alice, DON10);
+    let c1 = new_staker(&mut w, BOB);
+    let lp1 = deposit_lp(&mut w, &c1, BOB);
+    // pv = 6M liquid + 6M deployed + 2M growth = 14M; supply 12M: 2M * 12,000,001 / 14,000,001.
+    assert_eq!(lp0, 1_714_285, "PIN: the honest growth was not priced");
+    assert_eq!(lp1, lp0, "the donation was priced");
+    w.warp(300);
+    let paid = exit_all(&mut w, &c1, Tail::V5);
+    // Withdraw prices booked value: (10M liquid + 6M deployed) * 1,714,285 / 15,428,570.
+    assert_eq!(
+        paid, 1_777_777,
+        "the Live exit lost more than the honest-growth premium"
+    );
+}
+
+/// Front-run: the incumbent alice donates just before bob's deposit. Bob is priced 1:1 and exits
+/// Live whole; the close-out still books the donation to the LP holder, so alice only gets her own
+/// donation back (the donate-then-tax front-run no longer pays). RED before the fix (bob is minted
+/// 5,000,000 LP for 10,000,000).
+fn front_run(risk_mode: u8) {
+    let mode = mode_name(risk_mode);
+    let (mut w, alice) = incumbent(risk_mode);
+    let tail = tail_for(&w);
+    spl_donation(&mut w, &alice, DON10);
+    let bob = new_staker(&mut w, DON10);
+    let lp = deposit_lp(&mut w, &bob, DON10);
+    assert_eq!(lp, DON10, "{mode}: the donation moved the price");
+    w.warp(300);
+    let paid_b = exit_all(&mut w, &bob, tail);
+    w.warp(10);
+    admin_resolve(&mut w);
+    w.warp(300);
+    let fund = token_amount(&w.svm, &w.wrapper_vault);
+    let r = recover_terminal(&mut w, fund);
+    assert!(r.is_ok(), "{mode}: tag 29 failed: {}", logs(&r));
+    let creator = token_amount(&w.svm, &w.creator_ata);
+    let paid_a = exit_all(&mut w, &alice, tail);
+    assert_eq!(
+        paid_b,
+        DON10,
+        "{mode}: bob lost {} to the front-run",
+        DON10 - paid_b
+    );
+    assert_eq!(
+        creator, SEED,
+        "{mode}: the creator did not get exactly its seed"
+    );
+    assert!(
+        paid_a <= ALICE + DON10,
+        "{mode}: the donor profited: alice got {paid_a} for {}",
+        ALICE + DON10
+    );
+    assert!(
+        paid_a + DEAD_DUST >= ALICE + DON10,
+        "{mode}: tag 29 did not book the donation to the LP holder: alice got {paid_a}"
+    );
+}
+
+#[test]
+fn d8_donation_fee_only_front_run_does_not_tax_live_exit() {
+    front_run(RISK_FEE_ONLY);
+}
+
+#[test]
+fn d8_donation_first_loss_front_run_does_not_tax_live_exit() {
+    front_run(RISK_FIRST_LOSS);
+}
+
+/// The intended remaining effect (#290: "only the donor loses it"): a mature depositor who enters
+/// after the incumbent's donation and holds to the close shares it pro rata with the incumbent.
+/// Before the fix bob is priced with the donation and gets back exactly 10M.
+#[test]
+fn d8_donation_hold_to_close_shares_the_donation() {
+    use percolator_stake::state::MATURITY_GATE_SLOTS as N;
+    let (mut w, alice) = incumbent(RISK_FEE_ONLY);
+    spl_donation(&mut w, &alice, DON10);
+    let bob = new_staker(&mut w, DON10);
+    assert_eq!(
+        deposit_lp(&mut w, &bob, DON10),
+        DON10,
+        "PIN: the donation is not priced"
+    );
+    w.warp(N);
+    admin_resolve(&mut w);
+    w.warp(300);
+    let r = recover_terminal(&mut w, SEED);
+    assert!(r.is_ok(), "tag 29 failed: {}", logs(&r));
+    assert_eq!(
+        token_amount(&w.svm, &w.creator_ata),
+        SEED,
+        "the creator did not get exactly its seed"
+    );
+    let paid_b = exit_all(&mut w, &bob, Tail::Slab);
+    let paid_a = exit_all(&mut w, &alice, Tail::Slab);
+    // 20M LP share the 10M donation: half each, less dead-share dust.
+    let half = DON10 / 2;
+    assert!(
+        paid_b + DEAD_DUST >= DON10 + half && paid_b <= DON10 + half,
+        "bob did not get half the donation: {paid_b} for {DON10}"
+    );
+    assert!(
+        paid_a + DEAD_DUST >= ALICE + half && paid_a <= ALICE + half,
+        "alice did not get half her donation back: {paid_a} for {}",
+        ALICE + DON10
+    );
+}
+
+/// The #290 DoS shape: after the incumbent's 30M donation a 3-atom deposit still mints. RED
+/// before the fix (ZeroSharesMinted).
+#[test]
+fn d8_donation_cannot_force_zero_shares() {
+    for risk_mode in [RISK_FEE_ONLY, RISK_FIRST_LOSS] {
+        let mode = mode_name(risk_mode);
+        let (mut w, alice) = incumbent(risk_mode);
+        let bob = new_staker(&mut w, 1_000);
+        assert_eq!(
+            deposit_lp(&mut w, &bob, 1),
+            1,
+            "{mode}: a 1-atom deposit before the donation did not mint 1 LP"
+        );
+        spl_donation(&mut w, &alice, 30_000_000);
+        w.warp(10);
+        let r = deposit(&mut w, &bob, 3);
+        assert_ne!(
+            custom(&r),
+            Some(ZERO_SHARES_MINTED),
+            "{mode}: the donation forced ZeroSharesMinted"
+        );
+        assert!(r.is_ok(), "{mode}: 3-atom deposit failed: {}", logs(&r));
+    }
+}
+
+/// Tranche FEE_ONLY: a 1-atom donation no longer refuses both deposit paths (RED before the fix:
+/// 49 / 49), while honest pending growth still does.
+#[test]
+fn d8_donation_tranche_one_atom_does_not_freeze_but_growth_still_refuses() {
+    let (mut w, alice) = incumbent(RISK_FEE_ONLY);
+    tranche_on(&mut w);
+    spl_donation(&mut w, &alice, 1);
+    w.warp(10);
+    let bob = new_staker(&mut w, 4_000_000);
+    let jun = new_staker(&mut w, 4_000_000);
+    let r1 = deposit(&mut w, &bob, 1_000_000);
+    let r2 = deposit_tag(&mut w, &jun, 1_000_000, 16);
+    assert!(
+        r1.is_ok(),
+        "a 1-atom donation froze senior deposits: {}",
+        logs(&r1)
+    );
+    assert!(
+        r2.is_ok(),
+        "a 1-atom donation froze junior deposits: {}",
+        logs(&r2)
+    );
+
+    let (mut w, _alice) = incumbent(RISK_FEE_ONLY);
+    tranche_on(&mut w);
+    forge_seed(&mut w, SEED_LOW);
+    let bob = new_staker(&mut w, 4_000_000);
+    let jun = new_staker(&mut w, 4_000_000);
+    let r1 = deposit(&mut w, &bob, 1_000_000);
+    let r2 = deposit_tag(&mut w, &jun, 1_000_000, 16);
+    assert_eq!(
+        custom(&r1),
+        Some(PENDING_CLOSEOUT_GROWTH),
+        "honest growth no longer refuses senior deposits: {}",
+        logs(&r1)
+    );
+    assert_eq!(
+        custom(&r2),
+        Some(PENDING_CLOSEOUT_GROWTH),
+        "honest growth no longer refuses junior deposits: {}",
+        logs(&r2)
+    );
+}
+
+/// FIRST_LOSS with an S2 backlog: a tag-87 push of P lands before any staker; alice's genesis
+/// deposit consumes it unbooked (S2) and is the first LP.
+fn fl_with_backlog(p: u64) -> (World, Staker) {
+    let mut w = world(RISK_FIRST_LOSS);
+    push_tag87(&mut w, p);
+    let alice = new_staker(&mut w, ALICE);
+    assert_eq!(
+        deposit_lp(&mut w, &alice, ALICE),
+        ALICE - 1_000,
+        "the genesis deposit did not mint 1:1 less the dead shares"
+    );
+    let pool = w.pool();
+    assert_eq!(
+        pool.s2_backlog_owed_atoms(),
+        p,
+        "PIN: S2 did not record the backlog"
+    );
+    assert_eq!(pool.total_fees_earned, 0, "PIN: the backlog was booked");
+    assert_eq!(
+        w.vault_balance() - w.tpv(),
+        p,
+        "PIN: the backlog is not sitting unbooked in the vault"
+    );
+    w.warp(1_000);
+    (w, alice)
+}
+
+/// CONTROL (passes before and after the fix): the S2 backlog is still priced. A JIT deposit N
+/// slots before the terminal (mature: the gate does not apply) captures nothing of it. If the
+/// backlog were dropped from pricing (unbooked = 0), the JIT would capture most of the backlog.
+#[test]
+fn d8_s2_backlog_still_priced_jit_captures_nothing() {
+    use percolator_stake::state::MATURITY_GATE_SLOTS as N;
+    let (mut w, alice) = fl_with_backlog(P_BACKLOG);
+    let jit = new_staker(&mut w, JIT);
+    deposit_lp(&mut w, &jit, JIT);
+    w.warp(N);
+    admin_resolve(&mut w);
+    w.warp(300);
+    let fund = token_amount(&w.svm, &w.wrapper_vault);
+    let r = recover_terminal(&mut w, fund);
+    assert!(r.is_ok(), "tag 29 failed: {}", logs(&r));
+    let jp = exit_all(&mut w, &jit, Tail::V5);
+    let ap = exit_all(&mut w, &alice, Tail::V5);
+    assert!(
+        jp <= JIT + TOL,
+        "the JIT captured {} of the S2 backlog",
+        jp as i128 - JIT as i128
+    );
+    assert!(
+        ap + 2 * TOL >= ALICE + P_BACKLOG,
+        "the incumbent lost the backlog: got {ap} for {ALICE} + {P_BACKLOG}"
+    );
+}
+
+/// S2 backlog AND the incumbent's donation, across a real sync top-up: the price includes exactly
+/// the backlog (the counter is not stale after the sync), never the donation. RED before the fix
+/// (909,090 LP).
+#[test]
+fn d8_s2_backlog_priced_across_sync_donation_not() {
+    let (mut w, alice) = fl_with_backlog(P_BACKLOG);
+    let r = sync(&mut w);
+    assert!(r.is_ok(), "sync failed: {}", logs(&r));
+    assert!(
+        w.units().unwrap().units_stake > 0,
+        "PIN: the sync deployed no stake units"
+    );
+    assert_eq!(
+        w.vault_balance() - w.tpv(),
+        P_BACKLOG,
+        "the backlog did not survive the top-up"
+    );
+    spl_donation(&mut w, &alice, DON10);
+    let pool = w.pool();
+    let u = w.units().unwrap();
+    let deployed =
+        percolator_stake::math::deployed_value(u.units_stake, u.units_total, u.snap_mint).unwrap();
+    let want = percolator_stake::math::calc_lp_for_deposit(
+        pool.total_lp_supply,
+        pool.total_pool_value().unwrap() + deployed + P_BACKLOG,
+        BOB,
+    )
+    .unwrap();
+    let bob = new_staker(&mut w, BOB);
+    let lp = deposit_lp(&mut w, &bob, BOB);
+    assert_eq!(
+        lp, want,
+        "the price did not include exactly the S2 backlog (or it included the donation)"
+    );
+}
