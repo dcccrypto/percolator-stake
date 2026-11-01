@@ -2285,3 +2285,293 @@ proptest::proptest! {
         proptest::prop_assert_eq!(untouchable(&w), u0);
     }
 }
+
+// ── GH#337: a third party unitises a FEE_ONLY market (wrapper tag 116 is permissionless) ──────
+
+const E_INSURANCE_UNITS_INVALID: u32 = 35;
+/// Wrapper InsuranceBackstopRefused: tag 41 on a unitised market without the units ledger.
+const W_INSURANCE_BACKSTOP_REFUSED: u32 = 116;
+
+fn ins_units_pda(w: &World) -> Pubkey {
+    percolator_stake::state::derive_wrapper_ins_units(&w.wrapper_id, &w.market).0
+}
+
+/// Wrapper tag 116 sent by a stranger (its only signer is the payer) while the market is Live:
+/// creates the ledger and sets the market's units flag.
+fn third_party_unitise(w: &mut World) {
+    let stranger = Keypair::new();
+    w.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: w.wrapper_id,
+        accounts: vec![
+            AccountMeta::new(stranger.pubkey(), true),
+            AccountMeta::new(w.market, false),
+            AccountMeta::new(ins_units_pda(w), false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data: vec![116u8],
+    };
+    let r = send(&mut w.svm, &stranger, &[], ix);
+    assert!(r.is_ok(), "third-party tag 116: {}", logs(&r));
+}
+
+/// Stake tag 29 with an explicit tail after account 8.
+fn recover_tail(
+    w: &mut World,
+    amount: u64,
+    tail: Vec<AccountMeta>,
+) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+    let mut accounts = vec![
+        AccountMeta::new_readonly(Pubkey::new_unique(), false),
+        AccountMeta::new(w.pool, false),
+        AccountMeta::new(w.vault, false),
+        AccountMeta::new_readonly(w.vault_auth, false),
+        AccountMeta::new(w.market, false),
+        AccountMeta::new(w.wrapper_vault, false),
+        AccountMeta::new_readonly(w.wrapper_vault_auth, false),
+        AccountMeta::new_readonly(Pubkey::from_str(TOKEN_PROGRAM).unwrap(), false),
+        AccountMeta::new_readonly(w.wrapper_id, false),
+    ];
+    accounts.extend(tail);
+    let mut data = vec![29u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    let payer = w.payer.insecure_clone();
+    send(
+        &mut w.svm,
+        &payer,
+        &[],
+        Instruction {
+            program_id: w.stake_id,
+            accounts,
+            data,
+        },
+    )
+}
+
+/// Everything the close-out decides: creator, pool vault, wrapper vault, the pool's books.
+fn close_out_state(w: &World) -> [u64; 7] {
+    let p = read_pool(&w.svm, &w.pool);
+    [
+        token_amount(&w.svm, &w.creator_ata),
+        token_amount(&w.svm, &w.vault),
+        token_amount(&w.svm, &w.wrapper_vault),
+        p.total_fees_earned,
+        p.total_returned,
+        p.terminal_unclaimed_atoms(),
+        p.total_pool_value().unwrap(),
+    ]
+}
+
+/// GH#337. A stranger's tag 116 while Live (any time before the resolve) unitises a FEE_ONLY
+/// market. Without the ledger, tag 29(amount > 0) is refused by the wrapper (116) and nothing
+/// moves (unchanged). With the ledger anywhere in the FEE_ONLY tail, tag 29 succeeds, and the
+/// close-out equals the never-unitised control to the atom, including split partial amounts
+/// (stake signs its own CPI) and the retirement through tag 30. An uncreated ledger passed on
+/// a never-unitised market takes the pre-units path and changes nothing.
+/// NEGATIVE CONTROL: on the base .so the ledger in either of the first two tail slots fails
+/// IllegalOwner, and in the third slot it is ignored, so the wrapper refuses tag 41 (116).
+#[test]
+fn gh_337_fee_only_unitised_market_tag29_takes_the_ledger_in_any_tail_position() {
+    let stray_meta = |w: &mut World| {
+        let stray = Pubkey::new_unique();
+        let (mint, va) = (w.mint, w.vault_auth);
+        set_token_account(&mut w.svm, stray, &mint, &va, 0);
+        AccountMeta::new(stray, false)
+    };
+    let close = |w: &mut World| {
+        let admin = w.admin.insecure_clone();
+        let r = admin_close_slab(w, &admin);
+        assert!(r.is_ok(), "tag 30: {}", logs(&r));
+    };
+
+    // Control: never unitised, the creator account only.
+    let mut w = world("gh_337_control").unwrap();
+    admin_resolve(&mut w);
+    let creator = AccountMeta::new(w.creator_ata, false);
+    assert!(recover_tail(&mut w, BUDGET, vec![creator]).is_ok());
+    close(&mut w);
+    let control = close_out_state(&w);
+    assert_eq!(control[0], BUDGET, "the creator got its seed");
+
+    for layout in 0..5 {
+        let mut w = world("gh_337_unitised").unwrap();
+        third_party_unitise(&mut w);
+        admin_resolve(&mut w);
+        let (creator, units) = (
+            AccountMeta::new(w.creator_ata, false),
+            AccountMeta::new(ins_units_pda(&w), false),
+        );
+        let before = close_out_state(&w);
+        let r = recover_tail(&mut w, BUDGET, vec![creator.clone()]);
+        assert_eq!(
+            custom(&r),
+            Some(W_INSURANCE_BACKSTOP_REFUSED),
+            "no ledger: {}",
+            logs(&r)
+        );
+        assert_eq!(close_out_state(&w), before, "nothing moved");
+        let r = recover_tail(&mut w, BUDGET, vec![units.clone()]);
+        assert_eq!(
+            custom(&r),
+            Some(E_CREATOR_ACCOUNT_REQUIRED),
+            "ledger, no creator: {}",
+            logs(&r)
+        );
+        let tails = match layout {
+            0 => vec![vec![units, creator]],
+            1 => vec![vec![creator, units]],
+            2 => vec![vec![stray_meta(&mut w), creator, units]],
+            3 => vec![vec![units, stray_meta(&mut w), creator]],
+            // Two partial calls (the pool's own CPI is signed, so any amount <= capacity works).
+            _ => vec![vec![creator.clone(), units.clone()], vec![units, creator]],
+        };
+        let n = tails.len() as u64;
+        for tail in tails {
+            let r = recover_tail(&mut w, BUDGET / n, tail);
+            assert!(r.is_ok(), "layout {layout}: {}", logs(&r));
+        }
+        let u = percolator_stake::state::read_wrapper_ins_units(
+            &w.svm.get_account(&ins_units_pda(&w)).unwrap().data,
+            &w.market.to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            u.creator_paid_to_stake, BUDGET as u128,
+            "all of it was creator class"
+        );
+        close(&mut w);
+        assert_eq!(
+            close_out_state(&w),
+            control,
+            "layout {layout} == the never-unitised control"
+        );
+    }
+
+    // Never unitised, uncreated ledger passed: the pre-units path, the same result.
+    let mut w = world("gh_337_uncreated").unwrap();
+    admin_resolve(&mut w);
+    let tail = vec![
+        AccountMeta::new(w.creator_ata, false),
+        AccountMeta::new(ins_units_pda(&w), false),
+    ];
+    let r = recover_tail(&mut w, BUDGET, tail);
+    assert!(r.is_ok(), "uncreated ledger: {}", logs(&r));
+    assert!(w
+        .svm
+        .get_account(&ins_units_pda(&w))
+        .map_or(true, |a| a.data.is_empty()));
+    close(&mut w);
+    assert_eq!(close_out_state(&w), control);
+}
+
+/// GH#337: the ledger slot accepts only THE ledger. The market account (wrapper-owned, not the
+/// derived key) in the tail is still a non-token account (IllegalOwner). An account at the
+/// derived key that is neither the wrapper's nor empty is refused (35; FORGED, since only the
+/// wrapper can create that PDA).
+#[test]
+fn gh_337_fee_only_ledger_slot_refuses_a_wrong_account_forged() {
+    let mut w = world("gh_337_wrong_account").unwrap();
+    third_party_unitise(&mut w);
+    admin_resolve(&mut w);
+    let tail = vec![
+        AccountMeta::new(w.creator_ata, false),
+        AccountMeta::new(w.market, false),
+    ];
+    let r = recover_tail(&mut w, BUDGET, tail);
+    assert_eq!(
+        r.as_ref().err().map(|e| e.err.clone()),
+        Some(TransactionError::InstructionError(
+            2,
+            InstructionError::IllegalOwner
+        )),
+        "{}",
+        logs(&r)
+    );
+
+    let mut w = world("gh_337_wrong_owner").unwrap();
+    admin_resolve(&mut w);
+    let units = ins_units_pda(&w);
+    w.svm
+        .set_account(
+            units,
+            Account {
+                lamports: 10_000_000,
+                data: vec![1u8; 208],
+                owner: system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let tail = vec![
+        AccountMeta::new(w.creator_ata, false),
+        AccountMeta::new(units, false),
+    ];
+    let r = recover_tail(&mut w, BUDGET, tail);
+    assert_eq!(custom(&r), Some(E_INSURANCE_UNITS_INVALID), "{}", logs(&r));
+}
+
+/// GH#337: passing the ledger never changes a FEE_ONLY split. Seeds FORGED after the bind
+/// (`forge_seed`; real flows here only reach seed == fund, since after the bind only vault_auth may
+/// top up and a FEE_ONLY pool never does): 3M (the fund grew 2M above the seed) and 7M (the fund
+/// is 2M below the seed),
+/// plus, in the second case, a real 1M SPL donation into pool.vault. Each runs two partial tag 29
+/// calls (2M, then 3M) on a never-unitised market and on a unitised one with the ledger; every
+/// intermediate state must match. The ledger's `creator_paid_to_stake` is only the tag-41 total
+/// (2M, then 5M). Read as the creator's cap it gives the same split for seed 3M, but for seed
+/// 7M it pays the creator 2M then 5M instead of 3M then 6M and books the donation to the
+/// stakers: the split would depend on whether a stranger unitised the market.
+#[test]
+fn gh_337_fee_only_unitised_split_equals_control_forged_seed() {
+    let donate = |w: &mut World, x: u64| {
+        let donor = Keypair::new();
+        w.svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+        let src = Pubkey::new_unique();
+        let mint = w.mint;
+        set_token_account(&mut w.svm, src, &mint, &donor.pubkey(), x);
+        let mut data = vec![3u8];
+        data.extend_from_slice(&x.to_le_bytes());
+        let ix = Instruction {
+            program_id: Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+            accounts: vec![
+                AccountMeta::new(src, false),
+                AccountMeta::new(w.vault, false),
+                AccountMeta::new_readonly(donor.pubkey(), true),
+            ],
+            data,
+        };
+        assert!(send(&mut w.svm, &donor, &[], ix).is_ok());
+    };
+    for (seed, donation) in [(3_000_000u64, 0u64), (7_000_000, 1_000_000)] {
+        let mut runs = Vec::new();
+        for unitised in [false, true] {
+            let mut w = world("gh_337_split").unwrap();
+            forge_seed(&mut w, Some(seed));
+            if unitised {
+                third_party_unitise(&mut w);
+            }
+            admin_resolve(&mut w);
+            if donation > 0 {
+                donate(&mut w, donation);
+            }
+            let mut steps = Vec::new();
+            for amount in [2_000_000u64, 3_000_000] {
+                let mut tail = vec![AccountMeta::new(w.creator_ata, false)];
+                if unitised {
+                    tail.push(AccountMeta::new(ins_units_pda(&w), false));
+                }
+                let r = recover_tail(&mut w, amount, tail);
+                assert!(r.is_ok(), "seed {seed} unitised {unitised}: {}", logs(&r));
+                steps.push(close_out_state(&w));
+            }
+            eprintln!(
+                "GH#337 split seed {seed} donation {donation} unitised {unitised}: {steps:?}"
+            );
+            runs.push(steps);
+        }
+        assert_eq!(
+            runs[1], runs[0],
+            "seed {seed}: the ledger must not change the split"
+        );
+    }
+}

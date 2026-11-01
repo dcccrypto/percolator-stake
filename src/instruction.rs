@@ -422,6 +422,12 @@ pub enum StakeInstruction {
     /// their SPL owner: owner = vault_auth -> the stray to sweep; owner = `pool.admin` -> the
     /// creator's account, REQUIRED (`CreatorAccountRequired`, 46) whenever the settlement owes the
     /// creator something (`min(surplus, seed - forwarded) > 0`). Clients should always pass it.
+    /// Plus, in any position, the OPTIONAL `[writable]` `InsuranceUnitsV20` PDA
+    /// (`["ins_units", market]`), told apart by its key. The pool never creates it, but wrapper
+    /// tag 116 is permissionless, and on a market a third party has unitised the wrapper refuses
+    /// tag 41 without it (wrapper error 116). It may be uncreated (empty: the pre-units tag 41 is then used); a
+    /// non-empty account the wrapper does not own is `InsuranceUnitsInvalid` (35). It only rides
+    /// into tag 41: the close-out split stays the seed cap. Pass it whenever `amount > 0`.
     RecoverTerminalInsurance { amount: u64 },
 
     /// 30: AdminCloseSlab — F-9. CPI proxy for the wrapper's CloseSlab (tag 13).
