@@ -95,7 +95,8 @@ fn create_or_adopt_pda<'a>(
 /// withdrawals — `clock.slot` would never reach the saturating deadline (#121).
 const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 
-/// Minimum delay before a proposed cooldown increase takes effect (≈48 hours at 2.5 slots/sec).
+/// Exit window a proposed cooldown increase leaves LP holders once their current cooldown
+/// ends (≈48 hours at 2.5 slots/sec).
 ///
 /// N-2 — Timelock (#242). The capital-LOCK vector is a `cooldown_slots` INCREASE: a
 /// compromised admin could set cooldown = MAX_COOLDOWN_SLOTS (~1 year) in a single
@@ -103,11 +104,16 @@ const MAX_COOLDOWN_SLOTS: u64 = 78_840_000;
 /// two-phase timelock — ProposeCooldownIncrease (tag 7) records the pending value and
 /// proposal slot in StakePool (`pending_cooldown_slots` / `cooldown_proposed_at_slot`,
 /// stored in the previously-free `_reserved[10..26]` — no struct-size change / version
-/// bump), and CommitCooldownIncrease (tag 8) applies it only after TIMELOCK_SLOTS have
-/// elapsed, giving LP holders a guaranteed ≥48h exit window. CancelCooldownIncrease
-/// (tag 9) withdraws a pending proposal. UpdateConfig now REJECTS a cooldown increase
+/// bump), and CommitCooldownIncrease (tag 8) applies it only once
+/// `proposed_at + cooldown_slots + 1 + TIMELOCK_SLOTS` is reached (GH#335). A staker who
+/// deposited in the proposal slot can first withdraw at `proposed_at + cooldown_slots + 1`
+/// (Withdraw's exclusive gate), so every LP holder whose last deposit is at or before the
+/// proposal gets a guaranteed ≥48h exit window under the current cooldown, however long it
+/// is (a later deposit or top-up shortens it by that many slots). CancelCooldownIncrease (tag 9)
+/// withdraws a pending proposal. UpdateConfig now REJECTS a cooldown increase
 /// (`CooldownIncreaseRequiresTimelock`); decreases (LP-friendly) and `deposit_cap`
-/// changes remain immediate.
+/// changes remain immediate, and a decrease also cancels a pending proposal so the
+/// commit wait can never be shortened by lowering the cooldown first.
 ///
 /// FlushToInsurance and SetMarketResolved are intentionally NOT timelocked: flush moves
 /// collateral into the PDA-custodied insurance fund (recoverable via ReturnInsurance,
@@ -2006,6 +2012,13 @@ fn process_update_config(
         if cooldown > pool.cooldown_slots {
             return Err(StakeError::CooldownIncreaseRequiresTimelock.into());
         }
+        // GH#335: the commit wait is measured from the cooldown in force, so a decrease
+        // cancels a pending increase (the admin re-proposes against the new cooldown).
+        // Otherwise "decrease, then commit" in one tx would skip the old cooldown's wait.
+        if cooldown < pool.cooldown_slots {
+            pool.set_pending_cooldown_slots(0);
+            pool.set_cooldown_proposed_at_slot(0);
+        }
         pool.cooldown_slots = cooldown;
     }
     if let Some(cap) = new_deposit_cap {
@@ -2124,10 +2137,12 @@ fn process_accept_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
 /// The admin proposes a NEW (larger) `cooldown_slots`. Records the pending value and
 /// the current slot; the increase does not take effect until CommitCooldownIncrease is
-/// called after TIMELOCK_SLOTS have elapsed — guaranteeing LP holders a ≥48h exit window
-/// before withdrawals can be slowed. Re-proposing overwrites the pending value AND resets
-/// the timer (the new, longer window applies). A decrease/unchanged value is rejected here
-/// (those go through UpdateConfig immediately).
+/// called `cooldown_slots + 1 + TIMELOCK_SLOTS` slots later — guaranteeing every LP holder
+/// whose last deposit is at or before the proposal a ≥48h exit window after their current
+/// cooldown ends, before withdrawals can be slowed.
+/// Re-proposing overwrites the pending value AND resets the timer (the new, longer window
+/// applies). A decrease/unchanged value is rejected here (those go through UpdateConfig
+/// immediately, and a decrease cancels a pending proposal).
 ///
 /// Accounts:
 ///   0. `[signer]` Admin
@@ -2178,7 +2193,7 @@ fn process_propose_cooldown_increase(
     // clock.slot is never 0 on a live chain, so it is a safe "active proposal" sentinel.
     pool.set_cooldown_proposed_at_slot(clock.slot);
 
-    msg!("ProposeCooldownIncrease: pending; commit after TIMELOCK_SLOTS");
+    msg!("ProposeCooldownIncrease: pending; commit after cooldown_slots + 1 + TIMELOCK_SLOTS");
     Ok(())
 }
 
@@ -2186,8 +2201,9 @@ fn process_propose_cooldown_increase(
 // 8: CommitCooldownIncrease — step 2 of the #242 cooldown-increase timelock
 // ═══════════════════════════════════════════════════════════════
 
-/// Applies a previously-proposed cooldown increase, but ONLY after TIMELOCK_SLOTS have
-/// elapsed since the proposal. Clears the pending state on success.
+/// Applies a previously-proposed cooldown increase, but ONLY once
+/// `proposed_at + cooldown_slots + 1 + TIMELOCK_SLOTS` is reached. Clears the pending
+/// state on success.
 ///
 /// Accounts:
 ///   0. `[signer]` Admin
@@ -2230,7 +2246,15 @@ fn process_commit_cooldown_increase(
     if proposed_at == 0 {
         return Err(StakeError::NoPendingCooldownProposal.into());
     }
-    if !timelock_window_elapsed(proposed_at, TIMELOCK_SLOTS, clock.slot)? {
+    // GH#335: a staker who deposited in the proposal slot is held by the current cooldown
+    // until `proposed_at + cooldown_slots + 1` (Withdraw's exclusive gate), so the exit
+    // window starts there, not at the proposal. cooldown_slots cannot change while a
+    // proposal is pending (a decrease cancels it).
+    let wait = TIMELOCK_SLOTS
+        .checked_add(pool.cooldown_slots)
+        .and_then(|w| w.checked_add(1))
+        .ok_or(StakeError::Overflow)?;
+    if !timelock_window_elapsed(proposed_at, wait, clock.slot)? {
         return Err(StakeError::TimelockNotElapsed.into());
     }
 
