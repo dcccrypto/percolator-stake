@@ -7,6 +7,9 @@
 //!
 //! Also pins AUD-FC-B6: a FIRST_LOSS Withdraw needs the staker writable, not the fee payer.
 //!
+//! GH#335: a cooldown-increase commit waits out the current cooldown before its 48h
+//! exit window, and a cooldown decrease cancels a pending increase.
+//!
 //! Real stake .so + real wrapper .so under LiteSVM, same harness as
 //! `f3_dead_share_accrue_guard_e2e.rs` (FIRST_LOSS pool, real InitPool / Deposit / Withdraw).
 //! Rebuild `target/deploy/percolator_stake.so` after changing source, or these tests exercise
@@ -401,6 +404,7 @@ struct World {
     stake_id: Pubkey,
     payer: Keypair,
     accts: InitPoolAccounts,
+    admin: Keypair,
 }
 
 
@@ -451,6 +455,7 @@ fn world(test_name: &str, cooldown_slots: u64) -> World {
         stake_id,
         payer,
         accts,
+        admin,
     }
 }
 
@@ -663,4 +668,252 @@ fn fcb6_withdraw_needs_a_writable_staker_not_the_fee_payer() {
         )
     });
     assert_eq!(token_amount(&w.svm, &s.lp_ata), 0);
+}
+
+// ---- GH#335: cooldown-increase timelock (tags 7/8/9) and UpdateConfig (tag 4) ----
+
+const TIMELOCK: u64 = percolator_stake::processor::TIMELOCK_SLOTS;
+/// processor.rs MAX_COOLDOWN_SLOTS (private there).
+const MAX_COOLDOWN: u64 = 78_840_000;
+/// Proposal slot: any slot != 0 (0 is the "no proposal" sentinel).
+const PROPOSED_AT: u64 = 10_000;
+
+impl World {
+    /// One admin-signed tx with `ixs` (fresh blockhash so an identical retry is not deduped).
+    fn admin_send(
+        &mut self,
+        ixs: &[Instruction],
+    ) -> Result<(), litesvm::types::FailedTransactionMetadata> {
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            ixs,
+            Some(&self.payer.pubkey()),
+            &[&self.payer, &self.admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).map(|_| ())
+    }
+}
+
+/// Tag 7 ProposeCooldownIncrease { u64 }, 8 CommitCooldownIncrease, 9 CancelCooldownIncrease.
+fn cooldown_ix(w: &World, tag: u8, new_cooldown: Option<u64>) -> Instruction {
+    let mut data = vec![tag];
+    let mut accounts = vec![
+        AccountMeta::new_readonly(w.admin.pubkey(), true),
+        AccountMeta::new(w.accts.pool_pda, false),
+    ];
+    if let Some(c) = new_cooldown {
+        data.extend_from_slice(&c.to_le_bytes());
+    }
+    if tag != 9 {
+        accounts.push(AccountMeta::new_readonly(
+            solana_sdk::sysvar::clock::id(),
+            false,
+        ));
+    }
+    Instruction {
+        program_id: w.stake_id,
+        accounts,
+        data,
+    }
+}
+
+const COOLDOWN_INCREASE_REQUIRES_TIMELOCK: u32 = 25;
+const TIMELOCK_NOT_ELAPSED: u32 = 26;
+const NO_PENDING_COOLDOWN_PROPOSAL: u32 = 27;
+
+/// `Some(code)` for a Custom program error, `None` for success or any other error.
+fn custom_code(r: &Result<(), litesvm::types::FailedTransactionMetadata>) -> Option<u32> {
+    match r.as_ref().err()?.err {
+        solana_sdk::transaction::TransactionError::InstructionError(
+            _,
+            solana_sdk::instruction::InstructionError::Custom(c),
+        ) => Some(c),
+        _ => None,
+    }
+}
+
+/// Tag 4 UpdateConfig { cooldown: Some(c), deposit_cap: None }.
+fn update_cooldown_ix(w: &World, cooldown: u64) -> Instruction {
+    let mut data = vec![4u8, 1];
+    data.extend_from_slice(&cooldown.to_le_bytes());
+    data.push(0);
+    data.extend_from_slice(&0u64.to_le_bytes());
+    Instruction {
+        program_id: w.stake_id,
+        accounts: vec![
+            AccountMeta::new_readonly(w.admin.pubkey(), true),
+            AccountMeta::new(w.accts.pool_pda, false),
+        ],
+        data,
+    }
+}
+
+/// (cooldown_slots, pending_cooldown_slots, cooldown_proposed_at_slot)
+fn cooldown_state(w: &World) -> (u64, u64, u64) {
+    let p = read_pool(&w.svm, &w.accts.pool_pda);
+    (
+        p.cooldown_slots,
+        p.pending_cooldown_slots,
+        p.cooldown_proposed_at_slot,
+    )
+}
+
+/// GH#335: a staker who deposited in the proposal slot gets exactly TIMELOCK_SLOTS of exit
+/// window under the current cooldown, however long it is. Withdraw first releases them at
+/// `proposed_at + cooldown + 1` (exclusive gate); the commit is refused until
+/// `proposed_at + cooldown + 1 + TIMELOCK_SLOTS`, so the last slot before it is still theirs.
+///
+/// Pre-fix the commit landed at `proposed_at + TIMELOCK_SLOTS`: C + 1 slots short for every
+/// cooldown, and with cooldown >= TIMELOCK_SLOTS before the staker could ever leave.
+#[test]
+fn cooldown_increase_commit_leaves_a_full_exit_window() {
+    for cooldown in [5u64, 216_000, 432_000, 432_001, 1_000_000] {
+        let mut w = world(
+            "cooldown_increase_commit_leaves_a_full_exit_window",
+            cooldown,
+        );
+        warp_to(&mut w, PROPOSED_AT);
+        let first = deposit(&mut w, 2_000);
+        let last = deposit(&mut w, 2_000);
+        let stays = deposit(&mut w, 2_000);
+        assert_eq!(last_deposit_slot(&w, &first), PROPOSED_AT);
+        w.admin_send(&[cooldown_ix(&w, 7, Some(MAX_COOLDOWN))])
+            .expect("propose");
+
+        let free = PROPOSED_AT + cooldown + 1;
+        let earliest_commit = free + TIMELOCK;
+
+        // The window opens when the current cooldown releases the staker...
+        warp_to(&mut w, free - 1);
+        let lp = token_amount(&w.svm, &first.lp_ata);
+        assert_cooldown_refusal(
+            try_withdraw(&mut w, &first, lp),
+            "inside the current cooldown",
+        );
+        warp_to(&mut w, free);
+        try_withdraw(&mut w, &first, lp).expect("first slot of the exit window");
+
+        // ...and is still open in the last slot before the earliest commit.
+        warp_to(&mut w, earliest_commit - 1);
+        let r = w.admin_send(&[cooldown_ix(&w, 8, None)]);
+        assert_eq!(
+            custom_code(&r),
+            Some(TIMELOCK_NOT_ELAPSED),
+            "cooldown {cooldown}: commit one slot early"
+        );
+        let lp = token_amount(&w.svm, &last.lp_ata);
+        try_withdraw(&mut w, &last, lp).expect("last slot of the exit window");
+
+        warp_to(&mut w, earliest_commit);
+        w.admin_send(&[cooldown_ix(&w, 8, None)])
+            .expect("commit at the earliest slot");
+        assert_eq!(cooldown_state(&w), (MAX_COOLDOWN, 0, 0));
+        let lp = token_amount(&w.svm, &stays.lp_ata);
+        assert_cooldown_refusal(try_withdraw(&mut w, &stays, lp), "held by the new cooldown");
+    }
+}
+
+/// GH#335: a cooldown decrease cancels a pending increase, so "decrease, then commit" in
+/// one tx cannot skip the wait the current cooldown set. Pre-fix that tx succeeded and
+/// applied the increase.
+#[test]
+fn cooldown_decrease_cancels_a_pending_increase() {
+    let cooldown = 1_000_000u64;
+    let mut w = world("cooldown_decrease_cancels_a_pending_increase", cooldown);
+    warp_to(&mut w, PROPOSED_AT);
+    w.admin_send(&[cooldown_ix(&w, 7, Some(MAX_COOLDOWN))])
+        .expect("propose");
+    // Without the clear, a decrease to 1 lets the commit pass from here (wait 1 + 1 + TIMELOCK).
+    warp_to(&mut w, PROPOSED_AT + TIMELOCK + 2);
+
+    let r = w.admin_send(&[update_cooldown_ix(&w, 1), cooldown_ix(&w, 8, None)]);
+    assert_eq!(custom_code(&r), Some(NO_PENDING_COOLDOWN_PROPOSAL));
+    assert_eq!(
+        cooldown_state(&w),
+        (cooldown, MAX_COOLDOWN, PROPOSED_AT),
+        "the tx rolled back"
+    );
+
+    w.admin_send(&[update_cooldown_ix(&w, 500_000)])
+        .expect("a decrease alone applies");
+    assert_eq!(
+        cooldown_state(&w),
+        (500_000, 0, 0),
+        "and clears the proposal"
+    );
+    let r = w.admin_send(&[cooldown_ix(&w, 8, None)]);
+    assert_eq!(custom_code(&r), Some(NO_PENDING_COOLDOWN_PROPOSAL));
+}
+
+/// Cancel and re-propose keep their behaviour: cancel clears the proposal, re-proposing
+/// overwrites the value and restarts the timer, and propose still refuses a non-increase.
+#[test]
+fn cooldown_increase_cancel_and_repropose_still_work() {
+    let cooldown = 5u64;
+    let mut w = world(
+        "cooldown_increase_cancel_and_repropose_still_work",
+        cooldown,
+    );
+    warp_to(&mut w, PROPOSED_AT);
+    w.admin_send(&[cooldown_ix(&w, 7, Some(100))])
+        .expect("propose");
+    assert_eq!(cooldown_state(&w), (cooldown, 100, PROPOSED_AT));
+    w.admin_send(&[cooldown_ix(&w, 9, None)]).expect("cancel");
+    assert_eq!(cooldown_state(&w), (cooldown, 0, 0));
+    for tag in [8u8, 9] {
+        let r = w.admin_send(&[cooldown_ix(&w, tag, None)]);
+        assert_eq!(
+            custom_code(&r),
+            Some(NO_PENDING_COOLDOWN_PROPOSAL),
+            "tag {tag}"
+        );
+    }
+
+    w.admin_send(&[cooldown_ix(&w, 7, Some(100))])
+        .expect("propose again");
+    let again = PROPOSED_AT + 20;
+    warp_to(&mut w, again);
+    w.admin_send(&[cooldown_ix(&w, 7, Some(200))])
+        .expect("re-propose");
+    assert_eq!(
+        cooldown_state(&w),
+        (cooldown, 200, again),
+        "re-propose restarts the timer"
+    );
+    let r = w.admin_send(&[cooldown_ix(&w, 7, Some(cooldown))]);
+    assert_eq!(custom_code(&r), Some(COOLDOWN_INCREASE_REQUIRES_TIMELOCK));
+
+    warp_to(&mut w, again + cooldown + TIMELOCK);
+    let r = w.admin_send(&[cooldown_ix(&w, 8, None)]);
+    assert_eq!(custom_code(&r), Some(TIMELOCK_NOT_ELAPSED));
+    warp_to(&mut w, again + cooldown + 1 + TIMELOCK);
+    w.admin_send(&[cooldown_ix(&w, 8, None)]).expect("commit");
+    assert_eq!(cooldown_state(&w), (200, 0, 0));
+}
+
+/// UpdateConfig without a pending increase is unchanged: a decrease applies at once, an
+/// increase still needs the timelock, and an unchanged value keeps a pending proposal.
+#[test]
+fn cooldown_update_without_a_decrease_keeps_the_proposal() {
+    let mut w = world("cooldown_update_without_a_decrease_keeps_the_proposal", 100);
+    warp_to(&mut w, PROPOSED_AT);
+    w.admin_send(&[update_cooldown_ix(&w, 50)])
+        .expect("decrease");
+    assert_eq!(cooldown_state(&w), (50, 0, 0));
+    let r = w.admin_send(&[update_cooldown_ix(&w, 60)]);
+    assert_eq!(custom_code(&r), Some(COOLDOWN_INCREASE_REQUIRES_TIMELOCK));
+
+    w.admin_send(&[cooldown_ix(&w, 7, Some(80))])
+        .expect("propose");
+    w.admin_send(&[update_cooldown_ix(&w, 50)])
+        .expect("unchanged value");
+    assert_eq!(
+        cooldown_state(&w),
+        (50, 80, PROPOSED_AT),
+        "an unchanged value keeps the proposal"
+    );
+    warp_to(&mut w, PROPOSED_AT + 50 + 1 + TIMELOCK);
+    w.admin_send(&[cooldown_ix(&w, 8, None)]).expect("commit");
+    assert_eq!(cooldown_state(&w), (80, 0, 0));
 }

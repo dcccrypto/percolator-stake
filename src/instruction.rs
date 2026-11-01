@@ -498,9 +498,10 @@ pub enum StakeInstruction {
 
     /// 7: ProposeCooldownIncrease — step 1 of the #242 cooldown-increase timelock.
     /// The admin proposes a NEW (larger) `cooldown_slots`; it does not take effect until
-    /// CommitCooldownIncrease is called after TIMELOCK_SLOTS (≈48h), guaranteeing LP
-    /// holders an exit window. A decrease/unchanged value is rejected here (use
-    /// UpdateConfig, which applies decreases immediately).
+    /// CommitCooldownIncrease can be called `cooldown_slots + 1 + TIMELOCK_SLOTS` slots
+    /// later (≈48h after the current cooldown), guaranteeing LP holders an exit window. A
+    /// decrease/unchanged value is rejected here (use UpdateConfig, which applies
+    /// decreases immediately and cancels a pending proposal).
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
@@ -509,7 +510,8 @@ pub enum StakeInstruction {
     ProposeCooldownIncrease { new_cooldown_slots: u64 },
 
     /// 8: CommitCooldownIncrease — step 2 of the #242 timelock. Applies the pending
-    /// cooldown increase, but only after TIMELOCK_SLOTS have elapsed since the proposal.
+    /// cooldown increase, but only once `proposed_at + cooldown_slots + 1 + TIMELOCK_SLOTS`
+    /// is reached.
     ///
     /// Accounts:
     ///   0. `[signer]` Admin
