@@ -1414,8 +1414,9 @@ fn process_withdraw(
     let deposit_pda = next_account_info(accounts_iter)?;
     let token_program = next_account_info(accounts_iter)?;
     let clock_sysvar = next_account_info(accounts_iter)?;
-    // #290: OPTIONAL wrapper market account (pool.slab). When present, pending wrapper-paid
-    // fees are accrued before pricing; when absent the accrual is skipped (see pre_accrue_fee_modes).
+    // #290: wrapper market account (pool.slab). When present, pending wrapper-paid fees are
+    // accrued before pricing (see pre_accrue_fee_modes). A mode-0 Withdraw without it is
+    // refused (book_terminal_surplus_before_pricing, GH#315).
     let fee_slab = accounts_iter.next();
     // v5 FIRST_LOSS: [11] the wrapper's InsuranceUnitsV20, [12] the wrapper program, [13] system.
     let v5_units_ai = accounts_iter.next();
@@ -3701,7 +3702,8 @@ fn process_admin_set_tranche_config(
     Ok(())
 }
 
-/// Deposit into the junior (first-loss) tranche.
+/// Deposit into the junior tranche (FEE_ONLY pools only, so on v5 it takes no loss; see
+/// `StakeInstruction::DepositJunior`).
 fn process_deposit_junior(
     program_id: &Pubkey,
     accounts: &[AccountInfo],

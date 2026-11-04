@@ -60,7 +60,8 @@ pub enum StakeError {
     /// - Junior tranche deposits are paused while an insurance loss is outstanding:
     ///   a junior depositing during an open claim would inherit a pre-existing
     ///   loss it was never exposed to (and the mirror case could snipe the
-    ///   recovery). Deposits resume once insurance is returned.
+    ///   recovery). Deposits resume once insurance is returned. Not reachable on
+    ///   v5: tranche pools are FEE_ONLY, and only a FIRST_LOSS Sync deploys.
     /// - H-1 (security review): `AdminResolveMarket` (tag 24) and `SetMarketResolved`
     ///   (tag 18) both reject while this condition holds, because once the wrapper
     ///   market is resolved (mode != 0), `RecoverFlushedInsurance`'s only CPI
@@ -165,7 +166,8 @@ pub enum StakeError {
     /// D8 / stake #318 (M-3): a TRANCHE pool (FEE_ONLY only) cannot price a deposit while
     /// close-out growth is pending: the growth would have to be apportioned between the senior
     /// and junior sub-pools, which the close-out booking does not do per tranche. The deposit
-    /// waits until the market is closed out, or the pool has no pending growth. Pools without
+    /// waits until the pool has no pending growth; it cannot wait for the close-out, because a
+    /// resolved market refuses every deposit (`MarketResolved`, 8). Pools without
     /// tranches (every v5 pool the wizard creates) are priced with the growth and never see this.
     PendingCloseoutGrowth = 49,
 }
@@ -229,7 +231,7 @@ pub fn error_hint(code: u32) -> &'static str {
         47 => "Insurance custody not bound — the market's insurance authority and operator must both be the pool's vault authority before the asset admin can be burned; re-bind first",
         48 => "Multi-asset market not supported — a v5 staking pool can only be created on (InitPool) and bind a single-asset market whose permissionless asset-init fee is 0; on InitPool set the fee to 0 (wrapper tag 59) first; on a bind this cannot be undone for this market",
         46 => "Creator account required — the terminal insurance surplus belongs to the pool creator (pool.admin); pass pool.admin's token account for the pool collateral (S1)",
-        49 => "Pending close-out growth — this tranche pool's market holds insurance growth that will be booked to the LP holders at the close, and a tranche deposit cannot be priced with it; deposit after the close-out (D8 / #318)",
+        49 => "Pending close-out growth — this tranche pool's market holds insurance growth that will be booked to the LP holders at the close, and a tranche deposit cannot be priced with it; tranche deposits are refused while it is pending, and every deposit is refused once the market resolves (D8 / #318)",
         _ => "Unknown error — check the error code and pool state",
     }
 }
