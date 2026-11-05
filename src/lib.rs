@@ -32,7 +32,7 @@
 //!  13  - InitTradingPool:     Initialize pool in trading LP mode
 //!  14  - AdminSetHwmConfig:   Set high-water mark configuration
 //!  15  - AdminSetTrancheConfig: Configure senior/junior tranches
-//!  16  - DepositJunior:       Deposit into junior (first-loss) tranche
+//!  16  - DepositJunior:       Deposit into the junior tranche (FEE_ONLY; no loss on v5)
 //!  18  - SetMarketResolved:   Admin marks pool as resolved (blocks deposits);
 //!                              gated on total_flushed <= total_returned (H-1)
 //!  19  - BindInsuranceAuthority: one-time bind of insurance_authority to our PDA

@@ -243,7 +243,8 @@ pub fn calc_junior_collateral_for_withdraw(
 /// senior_balance = total_pool_value - junior_balance.
 /// senior_total_lp = total_lp_supply - junior_total_lp.
 ///
-/// Senior LPs only lose if junior_balance is fully wiped (== 0).
+/// On v5 neither sub-pool takes a loss: tranches exist only on FEE_ONLY pools, which never
+/// deploy into insurance, so `total_flushed` stays 0 and `distribute_loss` has no loss to apply.
 ///
 /// # Returns
 /// * `Some(collateral)` to return (rounds down)

@@ -173,11 +173,10 @@ pub enum StakeInstruction {
     ///   7. `[writable]` Deposit PDA (per-user, cooldown check)
     ///   8. `[]` Token program
     ///   9. `[]` Clock sysvar
-    ///  10. `[]` OPTIONAL wrapper market (`pool.slab`). #290: when present on a mode-0
-    ///      pool, pending wrapper-paid fees are accrued before pricing the redemption.
-    ///      When absent, that accrual is skipped, so the withdrawer redeems at the
-    ///      not-yet-accrued (lower or equal) price. Clients should always pass it.
-    ///      v5 FIRST_LOSS: REQUIRED and `[writable]` (the units refresh CPI).
+    ///  10. `[]` Wrapper market (`pool.slab`). REQUIRED on a mode-0 pool: a mode-0 Withdraw
+    ///      without it is refused (GH#315). #290: pending wrapper-paid fees are accrued, and
+    ///      a terminal surplus is booked, before the redemption is priced.
+    ///      v5 FIRST_LOSS: also `[writable]` (the units refresh CPI).
     ///  11. `[writable]` v5 FIRST_LOSS only: the wrapper's `InsuranceUnitsV20`.
     ///  12. `[]` v5 FIRST_LOSS only: the wrapper program.
     ///  13. `[]` v5 FIRST_LOSS only: System program (the refresh CPI's account list).
@@ -580,7 +579,9 @@ pub enum StakeInstruction {
     ///   1. `[writable]` Pool PDA
     AdminSetTrancheConfig { junior_fee_mult_bps: u16 },
 
-    /// 16: Deposit into the junior (first-loss) tranche.
+    /// 16: Deposit into the junior tranche. Tranches exist only on FEE_ONLY pools (tag 15 and
+    /// this instruction refuse FIRST_LOSS), which never deploy into insurance, so on v5 the
+    /// junior takes no loss: the tranche only changes how fees are shared (`junior_fee_mult_bps`).
     ///
     /// Accounts: same as Deposit, including the #290 wrapper market at index 11.
     DepositJunior { amount: u64 },

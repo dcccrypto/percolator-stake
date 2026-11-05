@@ -349,10 +349,13 @@ pub const SYNC_COOLDOWN_DEFAULT_SLOTS: u64 = 150;
 ///
 /// 150 slots (~1 minute) on purpose. It equals the protocol's standard stake cooldown (D7 / D22
 /// enforce >= 150 at the vault-LP bind; clients already use 150) and `SYNC_COOLDOWN_DEFAULT_SLOTS`,
-/// so a staker who has been in the pool for one cooldown is mature and an honest staker is never
-/// touched: the gate only bites a deposit placed inside the last cooldown before a resolve, which
-/// is exactly the JIT window (the stake cooldown of 5 slots some devnet pools use "enables JIT
-/// staking", D7). It is deliberately SHORT (the memo's word): mark-to-close pricing already makes
+/// so a staker who has been in the pool for one cooldown is mature: the gate bites a deposit
+/// placed inside the last cooldown before a resolve, which is exactly the JIT window (the stake
+/// cooldown of 5 slots some devnet pools use "enables JIT staking", D7). One exception: the young
+/// record is a single bucket that every deposit less than this many slots after the previous one
+/// joins and re-stamps (`StakeDeposit::record_young_mint`), so a staker who deposits more often
+/// than every 150 slots, up to the last cooldown before a resolve, has the whole chain capped at
+/// cost. It is deliberately SHORT (the memo's word): mark-to-close pricing already makes
 /// the deposit fair, so the gate is only the backstop for a growth that the pre-terminal reading
 /// under-estimated; a long gate would only lock out honest late stakers from the close-out they
 /// legitimately funded. A pool-config value would let the creator (who is the admin and times
@@ -543,11 +546,11 @@ impl StakeDeposit {
     // raw index means any future _reserved layout change surfaces at compile time
     // instead of silently corrupting tranche isolation.
 
-    /// Whether this deposit belongs to the junior tranche.
     /// D8 maturity gate: the YOUNG tranche of this deposit record, `_reserved[16..40]`
     /// (`young_lp`, `young_cost`, `young_slot`, LE u64 each; the record size is unchanged):
-    /// LP minted by the most recent deposits (all within `MATURITY_GATE_SLOTS` of each other) and
-    /// the collateral they cost. Everything else in `lp_amount` is mature.
+    /// LP minted by the most recent run of deposits, each less than `MATURITY_GATE_SLOTS` after
+    /// the one before it (so the run can be longer than that), and the collateral they cost.
+    /// `young_slot` is the last deposit's slot. Everything else in `lp_amount` is mature.
     pub fn young_lp(&self) -> u64 {
         u64::from_le_bytes(self._reserved[16..24].try_into().unwrap())
     }
@@ -577,6 +580,7 @@ impl StakeDeposit {
         Some(())
     }
 
+    /// Whether this deposit belongs to the junior tranche.
     pub fn is_junior_deposit(&self) -> bool {
         self._reserved[8] == 1
     }
