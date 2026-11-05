@@ -36,7 +36,7 @@ use std::str::FromStr;
 
 const WRAPPER_ID: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 /// The stake id the deployed v2.2 wrapper pins (fresh-ID devnet build).
-const STAKE_ID: &str = "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V";
+const STAKE_ID: &str = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MARKET_LEN_V22_CAP1: usize = 4059;
@@ -727,7 +727,7 @@ fn fl_scene(kind: Kind) -> (World, Staker, Staker) {
     assert_eq!(
         u.units_stake, DEPLOYED as u128,
         "PIN: the wrapper classes the pool's vault_auth as STAKE class. If this is 0, the wrapper \
-         .so does not pin stake 7JrgAUHi: set GH311_WRAPPER_SO to the deployed v2.2 wrapper"
+         .so does not pin stake A6DVNubv: set GH311_WRAPPER_SO to the fresh v2.2 wrapper (5NGgnU2j build)"
     );
     assert_eq!(
         u.units_creator, SEED as u128,
