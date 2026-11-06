@@ -70,15 +70,16 @@ pub enum StakeError {
     ///   Call `RecoverFlushedInsurance` until fully caught up before resolving.
     InsuranceLossOutstanding = 24,
     /// #242 timelock: a `cooldown_slots` INCREASE must go through the two-phase
-    /// timelock (ProposeCooldownIncrease → wait TIMELOCK_SLOTS → CommitCooldownIncrease),
-    /// not the immediate UpdateConfig path. A decrease or unchanged value is still
-    /// allowed via UpdateConfig.
+    /// timelock (ProposeCooldownIncrease → wait cooldown + 1 + TIMELOCK_SLOTS →
+    /// CommitCooldownIncrease), not the immediate UpdateConfig path. A decrease or
+    /// unchanged value is still allowed via UpdateConfig.
     CooldownIncreaseRequiresTimelock = 25,
-    /// #242 timelock: CommitCooldownIncrease was called before TIMELOCK_SLOTS had
-    /// elapsed since the proposal. LP holders are still inside their exit window.
+    /// #242 timelock: CommitCooldownIncrease was called before
+    /// `proposed_at + cooldown_slots + 1 + TIMELOCK_SLOTS`. LP holders are still inside
+    /// their exit window.
     TimelockNotElapsed = 26,
     /// #242 timelock: CommitCooldownIncrease / CancelCooldownIncrease with no active
-    /// proposal (cooldown_proposed_at_slot == 0).
+    /// proposal (cooldown_proposed_at_slot == 0; a cooldown decrease also clears it).
     NoPendingCooldownProposal = 27,
     /// N7 (CONSOLIDATED-PLAN §2.2): the pool's true genesis deposit (total_lp_supply
     /// == 0 && total_pool_value == 0) must exceed MINIMUM_LIQUIDITY so the
@@ -208,8 +209,8 @@ pub fn error_hint(code: u32) -> &'static str {
         23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
         24 => "Insurance loss outstanding — total_flushed > total_returned. Junior tranche deposits are paused, and AdminResolveMarket/SetMarketResolved are blocked until RecoverFlushedInsurance fully returns the flushed insurance (resolving first would strand it — recovery requires LIVE mode)",
         25 => "Cooldown increase requires a timelock — raising the cooldown is not immediate; propose it first, then apply it once the timelock has elapsed (#242)",
-        26 => "Timelock not elapsed — the proposed cooldown increase is not yet applicable; wait for the timelock window to pass (#242)",
-        27 => "No pending cooldown proposal — there is no proposed cooldown increase to apply; propose one first, or it was cancelled (#242)",
+        26 => "Timelock not elapsed — the proposed cooldown increase is not yet applicable; wait until cooldown + 1 + TIMELOCK_SLOTS slots after the proposal (#242)",
+        27 => "No pending cooldown proposal — there is no proposed cooldown increase to apply; propose one first, or it was cancelled or cleared by a cooldown decrease (#242)",
         28 => "Deposit below minimum liquidity — the pool's first-ever deposit must exceed MINIMUM_LIQUIDITY so a permanent dead-share floor can be locked (N7 anti-inflation hardening); deposit a larger amount",
         29 => "No real LP holders — the pool's only LP supply is the MINIMUM_LIQUIDITY dead-share floor, so AccrueFees refuses to book fees nobody could redeem; the fees stay in the vault and are booked once a real staker deposits (F3)",
         30 => "Market not terminal — RecoverTerminalInsurance needs the bound wrapper market to be Resolved (or closed); while the market is Live use RecoverFlushedInsurance, and a non-zero amount needs a Resolved (not closed) market (F-9)",
