@@ -4366,7 +4366,8 @@ fn process_recover_terminal_insurance(
     let percolator_program = next_account_info(accounts_iter)?; // 8: wrapper program
     // v5 FIRST_LOSS: [9] the wrapper's InsuranceUnitsV20 (REQUIRED: the wrapper burns the stake
     // class at terminal), [10] the creator's token account (S1 forward; owner == pool.admin),
-    // then [11] the optional stray account. Legacy pools keep [9] = stray.
+    // then [11] the optional stray account. FEE_ONLY (and legacy mode 0, which this build cannot
+    // create): optional stray, creator and units ledger in any order (see below).
     let rest: Vec<&AccountInfo> = accounts_iter.collect();
 
     verify_token_program(token_program)?;
@@ -4437,7 +4438,12 @@ fn process_recover_terminal_insurance(
     //   used. (Before, this refused for ever and the seed was stranded.)
     // * FEE_ONLY: up to two optional token accounts in any order, told apart by their SPL owner
     //   field: `vault_auth` -> the stray sweep (the pre-S1 [9]); `pool.admin` -> the creator's
-    //   account, needed whenever the terminal surplus belongs to the creator.
+    //   account, needed whenever the terminal surplus belongs to the creator. Plus, anywhere in
+    //   the tail, the optional units ledger PDA (GH#337): wrapper tag 116 is permissionless, so a
+    //   third party can unitise a FEE_ONLY market, and from then on wrapper tag 41 refuses
+    //   without the ledger. Found by its key, like the wrapper finds it; wrapper-owned -> the
+    //   units CPI, uncreated -> the pre-units CPI, anything else at that key -> 35. It changes
+    //   no split: the close-out below keeps the seed cap for FEE_ONLY (`creator_class_released`).
     let (v5_units, creator, stray) = if first_loss {
         let units = *rest.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
         let creator = *rest.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -4454,9 +4460,21 @@ fn process_recover_terminal_insurance(
         };
         (unitised.then_some(units), Some(creator), rest.get(2).copied())
     } else {
+        let (expected, _) = state::derive_wrapper_ins_units(percolator_program.key, market.key);
+        let units = match rest.iter().copied().find(|ai| *ai.key == expected) {
+            Some(ai) if ai.owner == percolator_program.key => Some(ai),
+            Some(ai) if ai.data_is_empty() => None,
+            Some(_) => return Err(StakeError::InsuranceUnitsInvalid.into()),
+            None => None,
+        };
         let mut creator: Option<&AccountInfo> = None;
         let mut stray: Option<&AccountInfo> = None;
-        for ai in rest.iter().take(2).copied() {
+        for ai in rest
+            .iter()
+            .copied()
+            .filter(|ai| *ai.key != expected)
+            .take(2)
+        {
             if *ai.owner != crate::spl_token::id() {
                 return Err(ProgramError::IllegalOwner);
             }
@@ -4476,7 +4494,7 @@ fn process_recover_terminal_insurance(
                 return Err(StakeError::InvalidAccount.into());
             }
         }
-        (None, creator, stray)
+        (units, creator, stray)
     };
 
     // TERMINAL GATE. Booking a raw vault surplus is only safe once the market can
@@ -4615,8 +4633,10 @@ fn process_recover_terminal_insurance(
     // (`creator_paid_to_stake_atoms`, unitised FIRST_LOSS markets) is no longer forwarded in
     // full: it only CAPS the creator's seed return (what is left of the seed after the pro-rata
     // losses the unit ledger charged to the creator class); the growth above the seed is booked
-    // to the stakers with the rest of the surplus.
-    let creator_class_released = match v5_units {
+    // to the stakers with the rest of the surplus. FEE_ONLY passes its ledger to the CPI only, and
+    // keeps the seed cap alone, as Withdraw and AdminCloseSlab do: its whole fund is creator class,
+    // and whether a caller passes the ledger must not move the split.
+    let creator_class_released = match v5_units.filter(|_| first_loss) {
         Some(units) => {
             let u = state::read_wrapper_ins_units(&units.try_borrow_data()?, &pool.slab)
                 .ok_or(StakeError::InsuranceUnitsInvalid)?;
