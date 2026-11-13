@@ -235,3 +235,17 @@ pub fn error_hint(code: u32) -> &'static str {
         _ => "Unknown error — check the error code and pool state",
     }
 }
+
+#[cfg(test)]
+mod copy_sweep {
+    use super::*;
+
+    /// Every code up to the highest assigned one carries a non-empty hint; the
+    /// walk runs from the newest code downward so a gap shows up at the top first.
+    #[test]
+    fn hint_copy_for_codes_zero_to_forty_nine_is_never_blank() {
+        for code in (0u32..=49).rev() {
+            assert!(!error_hint(code).trim().is_empty(), "code {code} has no copy");
+        }
+    }
+}

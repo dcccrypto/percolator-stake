@@ -1823,3 +1823,60 @@ mod tests {
 // Keeping this note here so nobody adds u64 Kani proofs that timeout.
 
 // (PERC-272 tests moved to mod tests above)
+
+#[cfg(test)]
+mod pro_rata_replay {
+    use super::*;
+
+    // Replay seed for the sweep below; changing it only changes which pools are sampled.
+    const REPLAY_SEED: u64 = 0xA6E1_52D8_0F47_93BC;
+
+    fn lane(s: &mut u64) -> u64 {
+        // splitmix64 step
+        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// With the virtual offset in place a mint followed by a full redeem of the
+    /// minted LP can only round toward the pool, never against it.
+    #[test]
+    fn stake_ember_ledger_0xa6e1_mint_then_redeem_stays_inside_the_deposit() {
+        let mut s = REPLAY_SEED;
+        let mut live = 0u32;
+        for _ in 0..128 {
+            let supply = lane(&mut s) % 4_000_000_019;
+            let value = lane(&mut s) % 4_000_000_019;
+            let dep = lane(&mut s) % 1_000_003 + 1;
+            if supply == 0 {
+                continue;
+            }
+            if let Some(lp) = calc_lp_for_deposit(supply, value, dep) {
+                let back = calc_collateral_for_withdraw(supply + lp, value + dep, lp)
+                    .expect("supply is non-zero here");
+                assert!(back <= dep, "redeemed {back} against a deposit of {dep}");
+                live += 1;
+            }
+        }
+        assert!(live > 0);
+    }
+
+    /// The tail lane settles before the head re-reads: junior takes the loss
+    /// first, so the cases below climb from inside junior to past both tranches.
+    #[test]
+    fn loss_waterfall_climbs_through_both_tranches() {
+        let cases: [(u64, u64, u64, (u64, u64)); 5] = [
+            (4_100, 9_700, 1, (1, 0)),
+            (4_100, 9_700, 4_100, (4_100, 0)),
+            (4_100, 9_700, 4_101, (4_100, 1)),
+            (4_100, 9_700, 13_800, (4_100, 9_700)),
+            (4_100, 9_700, u64::MAX, (4_100, 9_700)),
+        ];
+        for (jr, sr, loss, want) in cases {
+            let got = distribute_loss(jr, sr, loss);
+            assert_eq!(got, want, "jr={jr} sr={sr} loss={loss}");
+        }
+    }
+}
