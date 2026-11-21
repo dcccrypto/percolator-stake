@@ -1,290 +1,59 @@
 # percolator-stake
 
-Standalone Insurance LP staking program for [Percolator](https://github.com/aeyakovenko/percolator) — the permissionless perpetual futures engine on Solana.
+Insurance LP staking program for [Percolator](https://github.com/dcccrypto/percolator), a perpetual futures protocol on Solana. Users deposit collateral into a per-market pool and receive LP tokens. The pool can flush collateral into the wrapper's insurance fund by CPI and take it back after resolution.
 
-## Architecture
+The pool PDA becomes the wrapper's admin for that market, so cooldowns, deposit caps and flush limits live in this program and the wrapper stays small.
 
-PDA-admin design — the stake program's PDA **becomes** the wrapper admin, enabling isolated security audits.
+## How it works
 
-```
-┌─────────────────────────────────────────────────┐
-│                  percolator-stake                │
-│                                                  │
-│  User ──► Deposit ──► Stake Vault ──► LP Mint    │
-│  User ◄── Withdraw ◄─ Stake Vault ◄── LP Burn   │
-│                          │                       │
-│              FlushToInsurance                     │
-│                          │                       │
-│                    CPI TopUpInsurance             │
-│                          ▼                       │
-│  ┌──────────────────────────────────────────┐    │
-│  │         percolator-prog (wrapper)        │    │
-│  │     stake_pool PDA = wrapper admin       │    │
-│  └──────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────┘
-```
+PDAs (all derived under this program's ID):
 
-**PDA derivation:**
-- `stake_pool` = `[b"stake_pool", slab_pubkey]` — pool state + wrapper admin
-- `vault_auth` = `[b"vault_auth", pool_pda]` — token vault authority
-- `stake_deposit` = `[b"stake_deposit", pool_pda, user_pubkey]` — per-user LP position
+| PDA | Seeds | Purpose |
+|-----|-------|---------|
+| `stake_pool` | `[b"stake_pool", slab]` | Pool state; wrapper admin for the market |
+| `vault_auth` | `[b"vault_auth", stake_pool]` | Owns the collateral vault and LP mint |
+| `stake_deposit` | `[b"stake_deposit", stake_pool, user]` | Per-user deposit slot and LP amount |
 
-## PDA Reference
+The core flow is `InitPool`, `Deposit`, `Withdraw` (after a cooldown) and `FlushToInsurance`. The program also has admin handoff and cooldown-change instructions, insurance authority bind/rotate/burn, fee accrual, a trading-LP pool mode and several CPI proxies to the wrapper.
 
-This section details all Program Derived Addresses used by the stake program.
+Instruction tags, data layouts and account lists are documented on the `StakeInstruction` enum in [`src/instruction.rs`](src/instruction.rs). Account layouts are in [`src/state.rs`](src/state.rs).
 
-### StakePool PDA
+The pool's `percolator_program` field is checked against an allowlist of wrapper program IDs; the stake program will not CPI into anything else. The devnet wrapper ID is compiled in only with the `devnet` feature, so it cannot end up in a mainnet build.
 
-The stake pool account holds all global state for a given slab (market).
-
-| Property | Value |
-|----------|-------|
-| **Seeds** | `[b"stake_pool", slab_pubkey]` |
-| **Program ID** | Stake program ID (passed in InitPool) |
-| **Owner** | Stake program (created via CPI in InitPool) |
-| **Size** | 472 bytes (STAKE_POOL_SIZE) |
-
-**Key Fields:**
-- `is_initialized` — 1 if pool is active, 0 otherwise
-- `admin` — Pool administrator (can call UpdateConfig, CPI admin functions)
-- `admin_transferred` — 1 after TransferAdmin (required before accepting deposits)
-- `slab` — The percolator market pubkey this pool manages
-- `vault` — Token account holding collateral buffer (owned by vault_auth PDA)
-- `lp_mint` — LP token mint (authority = vault_auth PDA)
-- `cooldown_slots` — Slot delay before withdrawals allowed (must be > 0)
-- `deposit_cap` — Max pool value (0 = unlimited)
-- `total_deposited`, `total_lp_supply`, `total_flushed`, `total_returned`, `total_withdrawn` — Accounting totals
-- `percolator_program` — Wrapper program ID (for CPI calls)
-
-**Example derivation (Typescript using @solana/web3.js):**
-
-```typescript
-import { PublicKey } from '@solana/web3.js';
-
-const programId = new PublicKey('...stake program...');
-const slabPubkey = new PublicKey('...market slab...');
-
-const [stakePoolPda, poolBump] = await PublicKey.findProgramAddress(
-  [Buffer.from('stake_pool'), slabPubkey.toBuffer()],
-  programId
-);
-```
-
-### VaultAuthority PDA
-
-The vault authority is a PDA that owns the LP mint and vault token account. It signs all vault operations.
-
-| Property | Value |
-|----------|-------|
-| **Seeds** | `[b"vault_auth", stake_pool_pda]` |
-| **Program ID** | Stake program ID |
-| **Owner** | System program (PDA has no account, just signing authority) |
-| **Used for** | Signing mint_to, burn, transfer via invoke_signed |
-
-**Example derivation:**
-
-```typescript
-const [vaultAuthPda, vaultAuthBump] = await PublicKey.findProgramAddress(
-  [Buffer.from('vault_auth'), stakePoolPda.toBuffer()],
-  programId
-);
-```
-
-### StakeDeposit PDA (Per-User)
-
-Each user has a deposit PDA per pool that tracks their cooldown and LP balance.
-
-| Property | Value |
-|----------|-------|
-| **Seeds** | `[b"stake_deposit", pool_pda, user_pubkey]` |
-| **Program ID** | Stake program ID |
-| **Owner** | Stake program (created via CPI in Deposit) |
-| **Size** | 120 bytes (STAKE_DEPOSIT_SIZE) |
-
-**Key Fields:**
-- `is_initialized` — 1 if deposit is active
-- `pool` — Back-reference to stake pool PDA
-- `user` — User pubkey
-- `last_deposit_slot` — Slot of most recent deposit (cooldown starts here)
-- `lp_amount` — Total LP tokens held by this user
-
-**Example derivation:**
-
-```typescript
-const [depositPda, depositBump] = await PublicKey.findProgramAddress(
-  [Buffer.from('stake_deposit'), stakePoolPda.toBuffer(), userPubkey.toBuffer()],
-  programId
-);
-```
-
-### Token Accounts (Standard SPL Token)
-
-**LP Mint Account:**
-- Mint authority: vault_auth PDA (signs all mint_to and burn operations)
-- Freeze authority: vault_auth PDA
-- Decimals: 6
-
-**Vault Token Account (Collateral Buffer):**
-- Owner: vault_auth PDA
-- Mint: collateral_mint (matches slab's collateral)
-- Purpose: Holds collateral awaiting flushes to wrapper insurance
-
-**User Collateral ATA:**
-- Owner: user pubkey
-- Mint: collateral_mint
-- Purpose: User's collateral source/destination
-
-**User LP ATA:**
-- Owner: user pubkey
-- Mint: lp_mint
-- Purpose: User's LP token balance
-
-## Instructions
-
-| # | Instruction | Description |
-|---|-------------|-------------|
-| 0 | `InitPool` | Create pool, LP mint, vault for a slab |
-| 1 | `Deposit` | User deposits tokens → vault, receives LP |
-| 2 | `Withdraw` | Burn LP → withdraw from vault (cooldown enforced) |
-| 3 | `FlushToInsurance` | Move vault tokens → wrapper insurance via CPI |
-| 4 | `UpdateConfig` | Admin updates cooldown period / deposit cap |
-| 5 | `TransferAdmin` | One-time transfer: human admin → pool PDA |
-| 6 | `AdminSetOracleAuthority` | CPI forward to wrapper |
-| 7 | `AdminSetRiskThreshold` | CPI forward to wrapper |
-| 8 | `AdminSetMaintenanceFee` | CPI forward to wrapper |
-| 9 | `AdminResolveMarket` | CPI forward to wrapper |
-| 10 | `AdminWithdrawInsurance` | CPI WithdrawInsuranceLimited (post-resolution) |
-| 11 | `AdminSetInsurancePolicy` | CPI SetInsuranceWithdrawPolicy |
-
-## Two-Layer Safety
-
-1. **Wrapper hardening** — constitutional bounds no admin can violate ([PR #5](https://github.com/aeyakovenko/percolator-prog/pull/5))
-2. **Stake program policies** — flexible rules (cooldown, caps, flush limits) within those bounds
-
-Security audits are fully isolated between layers.
-
-## Verification
-
-**270 tests, 0 failures. 85 Kani proof harnesses.**
-
-The `percolator_program` field in the `StakePool` account is an allowlist of authorized wrapper program IDs. Only programs on this allowlist can receive CPI calls from the stake program. This is the fix for finding F-4 (unauthorized program CPI).
-
-### Kani Proofs (85 harnesses)
-
-Uses `#[kani::unwind(33)]` with u32 mirrors for CBMC tractability. Properties proven over bounded domains generalize to production u64/u128 via scale invariance.
-
-| Category | Proofs | Key Properties |
-|----------|--------|----------------|
-| Conservation | 5 | Deposit→withdraw no-inflation, two-party conservation, flush+return roundtrip |
-| Arithmetic Safety | 4 | Panic-freedom across full u32 input space |
-| Fairness / Monotonicity | 3 | Rounding favors pool, larger deposit → more LP |
-| Withdrawal Bounds | 2 | Full burn ≤ pool value, partial ≤ full |
-| Flush Bounds | 2 | Flush ≤ deposited, max flush → zero remaining |
-| Pool Value | 4 | Correctness, monotonicity, flush/return conservation |
-| Zero Boundaries | 2 | No free LP, no free collateral |
-| Cooldown | 3 | No-panic, not-immediate, exact boundary |
-| Deposit Cap | 3 | Zero = uncapped, boundary precision |
-| C9 Orphaned Value | 3 | All 4 LP state machine quadrants covered |
-| Flush Mechanics | 2 | Exact value reduction, determinism |
-| Extended Safety | 2 | Full-range panic-freedom for remaining functions |
-
-**Rating: 25 STRONG, 6 GOOD, 4 STRUCTURAL.**
-
-See [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md) for the full proof-by-proof analysis.
-
-### Tests (270)
-
-| Suite | Count | Coverage |
-|-------|-------|----------|
-| Math | 63 | Conservation, fairness, edge cases, large values, proptest |
-| Unit | 39 | Deposit, withdraw, flush, cooldown, PDA derivation |
-| Proptest | 17 | Fuzz LP math across random inputs |
-| Struct Layout | 10 | Bytemuck serialization roundtrips |
-| CPI Tags | 9 | All wrapper instruction tags verified |
-| Error Codes | 3 | Error variant mapping |
-| Integration | 129 | End-to-end program flows, percolator_program allowlist |
-
-## Audit
-
-4 rounds of security review. Full report: [`docs/AUDIT.md`](docs/AUDIT.md).
-
-| Severity | Found | Fixed |
-|----------|-------|-------|
-| CRITICAL | 11 | 11 ✅ |
-| HIGH | 6 | 5 ✅ |
-| MEDIUM | 7 | 5 ✅ |
-| LOW | 4 | 1 ✅ |
-
-## Build
+## Build and test
 
 ```bash
-# Build BPF
-cargo build-sbf
-
-# Run tests
+cargo build-sbf                  # SBF binary (mainnet allowlist)
+cargo build-sbf -- --features devnet
 cargo test
+```
 
-# Run Kani proofs (local-only — not run in CI; see .github/workflows/kani-manual.yml for on-demand runs)
-# One-time setup: cargo install --locked kani-verifier && cargo kani setup
+Kani proofs live in `kani-proofs/` and are not run in CI by default (see `.github/workflows/kani-manual.yml`):
+
+```bash
+cargo install --locked kani-verifier && cargo kani setup
 cd kani-proofs && cargo kani --lib
 ```
 
 ## Docs
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Full architecture with CPI flow diagrams
-- [`docs/AUDIT.md`](docs/AUDIT.md) — 4-round security audit report
-- [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md) — Proof-by-proof analysis
-- [`docs/WRAPPER-HARDENING.md`](docs/WRAPPER-HARDENING.md) — Wrapper foot gun limits
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): architecture and CPI flow
+- [`docs/AUDIT.md`](docs/AUDIT.md): audit notes
+- [`docs/KANI-DEEP-ANALYSIS.md`](docs/KANI-DEEP-ANALYSIS.md): what the Kani harnesses cover
+- [`docs/WRAPPER-HARDENING.md`](docs/WRAPPER-HARDENING.md): wrapper limits the stake program relies on
+- [`docs/SECURITY-UPGRADE-AUTHORITY.md`](docs/SECURITY-UPGRADE-AUTHORITY.md): upgrade-authority policy and rotation runbook
 
-## Deployment Security
+## Deployments
 
-### Upgrade Authority
+Program IDs change on redeploy, so none are listed here. The current devnet IDs are pinned in [percolator-sdk](https://github.com/dcccrypto/percolator-sdk) (`src/config/program-ids.ts`). The upgrade-authority doc sets the policy for any mainnet use: the upgrade authority must be a multisig or burned.
 
-The BPF upgrade authority controls whether the deployed program binary can be replaced. A compromised upgrade authority key allows an attacker to deploy an arbitrary replacement program at the same program ID, bypassing all on-chain checks.
+## Related repositories
 
-**Requirement:** The upgrade authority for `percolator_stake.so` MUST be held by an N-of-M multisig (e.g., [Squads](https://squads.so/)) or burned (immutable) before mainnet use.
-
-To verify the current upgrade authority:
-```bash
-solana program show <PROGRAM_ID>
-```
-
-To transfer to a multisig:
-```bash
-solana program set-upgrade-authority <PROGRAM_ID> --new-upgrade-authority <MULTISIG_PUBKEY>
-```
-
-To make the program immutable (no further upgrades possible):
-```bash
-solana program set-upgrade-authority <PROGRAM_ID> --final
-```
-
-**Current state (observed 2026-09-28, devnet only):** the stake program `GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3`
-is upgradeable by `FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7`, a **single EOA** that also upgrades the
-devnet wrapper, nft and match programs. That is tolerated only because devnet holds no real value
-and there is no mainnet deployment. The mainnet requirement above is **not yet met**. The per-program
-table, policy and rotation plan are in [`docs/SECURITY-UPGRADE-AUTHORITY.md`](docs/SECURITY-UPGRADE-AUTHORITY.md).
-
-**Enforcement (#240):** this requirement is gated by
-[`scripts/check-upgrade-authority.sh`](scripts/check-upgrade-authority.sh) — it fails CI
-unless every checked program's authority is burned or held by an allowlisted governance
-multisig. Full runbook (transfer-to-Squads / burn / verify):
-[`docs/SECURITY-UPGRADE-AUTHORITY.md`](docs/SECURITY-UPGRADE-AUTHORITY.md). The opt-in
-[`upgrade-authority-gate`](.github/workflows/upgrade-authority-gate.yml) workflow runs it
-in CI once the `UPGRADE_AUTH_*` repo variables are configured.
-
-## Related Repositories
-
-| Repository | Description |
-|-----------|-------------|
-| [percolator](https://github.com/dcccrypto/percolator) | Core risk engine crate (Rust) |
-| [percolator-prog](https://github.com/dcccrypto/percolator-prog) | Solana on-chain program (wrapper) |
-| [percolator-matcher](https://github.com/dcccrypto/percolator-matcher) | Reference matcher program for LP pricing |
-| [percolator-sdk](https://github.com/dcccrypto/percolator-sdk) | TypeScript SDK for client integration |
-| [percolator-ops](https://github.com/dcccrypto/percolator-ops) | Operations dashboard |
-| [percolator-mobile](https://github.com/dcccrypto/percolator-mobile) | Solana Seeker mobile trading app |
-| [percolator-launch](https://github.com/dcccrypto/percolator-launch) | Full-stack launch platform (monorepo) |
+- [percolator](https://github.com/dcccrypto/percolator): risk engine
+- [percolator-prog](https://github.com/dcccrypto/percolator-prog): on-chain wrapper program
+- [percolator-sdk](https://github.com/dcccrypto/percolator-sdk): TypeScript SDK
+- [percolator-launch](https://github.com/dcccrypto/percolator-launch): web app
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE).
