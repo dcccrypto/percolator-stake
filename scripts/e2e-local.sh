@@ -20,6 +20,11 @@
 #   (cd B/percolator-prog && cargo build-sbf -- --features devnet)
 # `--features devnet` pins stake id 7JrgAUHi..., which is why E2E_STAKE_ID is set below.
 #
+# Only f9/v5_s3_s1/task13/v22live (F9_WRAPPER_SO) and d8/gh311 (GH311_WRAPPER_SO) take an env
+# override. Every other e2e suite (gh268, c1, f3, mode0_*, n6, poc_*, v16, v17) reads the CI
+# layout ../percolator-prog/target/deploy/percolator_prog.so and panics if it is missing, so
+# this script refuses to run unless that sibling file is the same build as WRAPPER_SO.
+#
 # Usage: WRAPPER_SO=/abs/B/percolator-prog/target/deploy/percolator_prog.so \
 #          scripts/e2e-local.sh <suite> [test-filter]
 set -euo pipefail
@@ -28,7 +33,14 @@ set -euo pipefail
 suite=${1:?usage: scripts/e2e-local.sh <suite> [test-filter]}
 shift
 cd "$(dirname "$0")/.."
+sib="../percolator-prog/target/deploy/percolator_prog.so"
+if ! cmp -s "$sib" "$WRAPPER_SO"; then
+  echo "sibling wrapper $sib is missing or differs from WRAPPER_SO; suites without an env" >&2
+  echo "override (gh268, c1, f3, ...) would use it. Copy it first:" >&2
+  echo "  mkdir -p ../percolator-prog/target/deploy && cp \"$WRAPPER_SO\" $sib" >&2
+  exit 2
+fi
 cargo build-sbf -- --features devnet
 export E2E_STAKE_ID=7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V
-export F9_WRAPPER_SO=$WRAPPER_SO GH311_WRAPPER_SO=$WRAPPER_SO GH268_WRAPPER_SO=$WRAPPER_SO
+export F9_WRAPPER_SO=$WRAPPER_SO GH311_WRAPPER_SO=$WRAPPER_SO
 exec cargo test --features no-entrypoint --no-fail-fast --test "$suite" -- "$@"
