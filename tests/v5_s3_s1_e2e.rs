@@ -28,8 +28,8 @@
 use litesvm::LiteSVM;
 use percolator_stake::state::{
     deposit_consent_bytes, derive_deposit_pda, derive_pool_pda, derive_vault_authority,
-    derive_wrapper_ins_units, read_wrapper_ins_units, StakePool, WrapperInsUnits,
-    MINIMUM_LIQUIDITY, STAKE_POOL_SIZE,
+    derive_wrapper_ins_units, read_wrapper_ins_units, read_wrapper_terminal, StakePool,
+    WrapperInsUnits, WrapperTerminal, MINIMUM_LIQUIDITY, STAKE_POOL_SIZE,
 };
 use percolator_stake::wrapper_layout::{
     ASSET0_AUTHORITY_EPOCH_OFF, ASSET0_INSURANCE_TOP_UP_OFF, ASSET0_MARKET_ID_OFF,
@@ -71,6 +71,9 @@ const E_NO_PENDING_TARGET: u32 = 40;
 const E_NOT_SUPPORTED_ON_FIRST_LOSS: u32 = 41;
 const E_ASSET_ADMIN_NOT_BURNED: u32 = 42;
 const E_NOTHING_TO_SYNC: u32 = 43;
+const E_MARKET_RESOLVED: u32 = 8;
+const E_INVALID_POOL_MODE: u32 = 17;
+const E_LIQUIDITY_EXHAUSTED: u32 = 36;
 
 fn stake_so() -> PathBuf {
     if let Ok(p) = std::env::var("E2E_STAKE_SO") {
@@ -282,6 +285,11 @@ impl World {
 /// real Bind (19) -> optionally BurnAssetAdmin (21). No staker yet; the units ledger does not
 /// exist until the first first-loss deposit.
 fn world(burn_asset_admin: bool) -> World {
+    world_mode(burn_asset_admin, false)
+}
+
+/// `world`, or with `fee_only` the 23-byte InitPool with risk mode FEE_ONLY (target 0).
+fn world_mode(burn_asset_admin: bool, fee_only: bool) -> World {
     let (so, wso) = (stake_so(), wrapper_so());
     assert!(
         so.exists() && wso.exists(),
@@ -393,6 +401,12 @@ fn world(burn_asset_admin: bool) -> World {
     let mut ipd = vec![0u8];
     ipd.extend_from_slice(&5u64.to_le_bytes());
     ipd.extend_from_slice(&0u64.to_le_bytes());
+    if fee_only {
+        ipd.push(percolator_stake::state::RISK_MODE_FEE_ONLY);
+        for _ in 0..3 {
+            ipd.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
     send(
         &mut svm,
         &payer,
@@ -437,11 +451,18 @@ fn world(burn_asset_admin: bool) -> World {
         creator_ata,
     };
     let p = w.pool();
-    assert!(p.is_first_loss(), "16-byte InitPool = FIRST_LOSS");
-    assert_eq!(
-        (p.deploy_target_bps, p.liquid_buffer_bps, p.hysteresis_bps),
-        (5_000, 3_000, 500)
-    );
+    if fee_only {
+        assert!(
+            !p.is_first_loss() && p.deploy_target_bps == 0,
+            "23-byte InitPool = FEE_ONLY"
+        );
+    } else {
+        assert!(p.is_first_loss(), "16-byte InitPool = FIRST_LOSS");
+        assert_eq!(
+            (p.deploy_target_bps, p.liquid_buffer_bps, p.hysteresis_bps),
+            (5_000, 3_000, 500)
+        );
+    }
     let admin = w.admin.insecure_clone();
     for tag in if burn_asset_admin { vec![19u8, 21u8] } else { vec![19u8] } {
         let accounts = vec![
@@ -1208,5 +1229,286 @@ fn closeout_first_loss_zero_stakers_creator_capped_rest_unclaimed_forged_seed() 
         token_amount(&w.svm, &w.vault),
         p.total_pool_value().unwrap() + SEED - SEED_REC,
         "vault == books + unclaimed"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SetMarketResolved (18) on a FIRST_LOSS pool whose wrapper market is still Live
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Tag 18 does not read the wrapper, so the local `market_resolved` flag can be set while the
+// market is Live. Sync (31, through wrapper tags 116 / 9 / 57) is the stakers' only Live way back
+// for the deployed share: it must keep recovering there, while the flag still closes the pool to
+// new money (deposits and top-ups). On a terminal market Sync stays refused and
+// RecoverTerminalInsurance (29) pays the deployed share out. Same harness and forged state as
+// above (token balances as funding); the FEE_ONLY control uses the 23-byte InitPool.
+
+fn set_market_resolved(w: &mut World) -> TxResult {
+    let admin = w.admin.insecure_clone();
+    let accounts = vec![
+        AccountMeta::new_readonly(w.admin.pubkey(), true),
+        AccountMeta::new(w.pool, false),
+    ];
+    w.send_stake(&[&admin], accounts, vec![18])
+}
+
+/// One staker deposits 10M; a sync deploys 5M (target 50%).
+fn deposit_and_deploy_half(w: &mut World) -> Staker {
+    let a = new_staker(w, 10_000_000);
+    let r = deposit(w, &a, 10_000_000);
+    assert!(r.is_ok(), "deposit failed: {}", logs(&r));
+    let r = sync(w);
+    assert!(r.is_ok(), "sync top-up failed: {}", logs(&r));
+    let (liquid, deployed, _) = w.valuation();
+    assert_eq!(
+        (liquid, deployed),
+        (5_000_000, 5_000_000),
+        "expected a 50/50 split after the top-up"
+    );
+    w.warp(10);
+    a
+}
+
+/// LP the liquid part can pay right now (one staker plus the dead shares).
+fn lp_payable(w: &World, held: u64) -> u64 {
+    let (liquid, deployed, supply) = w.valuation();
+    if liquid + deployed == 0 {
+        return 0;
+    }
+    let max = ((liquid as u128) * (supply as u128) / ((liquid + deployed) as u128)) as u64;
+    held.min(max.saturating_sub(1))
+}
+
+/// The flag set on a Live market must not freeze the deployed share: Sync keeps recovering and
+/// the staker exits in full over successive syncs.
+#[test]
+fn set_market_resolved_on_live_market_sync_still_recovers() {
+    let mut w = world(true);
+    let a = deposit_and_deploy_half(&mut w);
+    let r = set_market_resolved(&mut w);
+    assert!(r.is_ok(), "tag 18 on a Live market failed: {}", logs(&r));
+    assert!(w.pool().market_resolved(), "tag 18 did not set the flag");
+    let mode = read_wrapper_terminal(&w.svm.get_account(&w.market).unwrap().data);
+    assert_eq!(
+        mode,
+        WrapperTerminal::NotTerminal,
+        "the wrapper market must still be Live"
+    );
+
+    let start = token_amount(&w.svm, &a.ata);
+    let lp = token_amount(&w.svm, &a.lp_ata);
+    let r = withdraw(&mut w, &a, lp / 2);
+    assert!(
+        r.is_ok(),
+        "withdrawing the liquid half failed: {}",
+        logs(&r)
+    );
+    let rest = token_amount(&w.svm, &a.lp_ata);
+    let r = withdraw(&mut w, &a, rest);
+    assert_eq!(
+        custom(&r),
+        Some(E_LIQUIDITY_EXHAUSTED),
+        "expected the deployed half to wait for a sync: {}",
+        logs(&r)
+    );
+
+    w.warp(w.pool().sync_cooldown_slots);
+    let v0 = token_amount(&w.svm, &w.vault);
+    let r = sync(&mut w);
+    assert!(
+        r.is_ok(),
+        "sync recovery on a Live market was refused after tag 18: {}",
+        logs(&r)
+    );
+    let first = token_amount(&w.svm, &w.vault) - v0;
+    assert!(first > 2_000_000, "first recovery too small: {first}");
+
+    for round in 0..80 {
+        let held = token_amount(&w.svm, &a.lp_ata);
+        if held == 0 {
+            break;
+        }
+        let n = lp_payable(&w, held);
+        if n > 0 {
+            let r = withdraw(&mut w, &a, n);
+            assert!(
+                r.is_ok(),
+                "round {round}: withdraw {n} failed: {}",
+                logs(&r)
+            );
+        }
+        w.warp(w.pool().sync_cooldown_slots.max(6));
+        let r = sync(&mut w);
+        assert!(
+            r.is_ok() || custom(&r) == Some(E_NOTHING_TO_SYNC),
+            "round {round}: sync failed with something other than NothingToSync: {}",
+            logs(&r)
+        );
+    }
+    let got = token_amount(&w.svm, &a.ata) - start;
+    assert_eq!(
+        token_amount(&w.svm, &a.lp_ata),
+        0,
+        "staker still holds LP after the exit loop (got {got})"
+    );
+    assert_eq!(
+        got,
+        10_000_000 - MINIMUM_LIQUIDITY,
+        "staker must get everything but the dead shares back"
+    );
+}
+
+/// The flag still closes a Live pool to new money: no deposit and no top-up.
+#[test]
+fn set_market_resolved_on_live_market_blocks_deposit_and_topup() {
+    let mut w = world(true);
+    let a = new_staker(&mut w, 10_000_000);
+    let r = deposit(&mut w, &a, 10_000_000);
+    assert!(r.is_ok(), "deposit failed: {}", logs(&r));
+    let r = set_market_resolved(&mut w);
+    assert!(r.is_ok(), "tag 18 failed: {}", logs(&r));
+    w.warp(10);
+
+    let b = new_staker(&mut w, 1_000_000);
+    let r = deposit(&mut w, &b, 1_000_000);
+    assert_eq!(
+        custom(&r),
+        Some(E_MARKET_RESOLVED),
+        "deposit after tag 18 was not refused: {}",
+        logs(&r)
+    );
+
+    let v0 = token_amount(&w.svm, &w.vault);
+    let r = sync(&mut w);
+    assert_eq!(
+        custom(&r),
+        Some(E_MARKET_RESOLVED),
+        "top-up after tag 18 was not refused: {}",
+        logs(&r)
+    );
+    assert_eq!(
+        token_amount(&w.svm, &w.vault),
+        v0,
+        "the pool vault moved on a refused top-up"
+    );
+}
+
+/// A flagged pool on a Live market with nothing to do returns the normal NothingToSync.
+#[test]
+fn set_market_resolved_on_live_market_noop_sync_is_nothing_to_sync() {
+    let mut w = world(true);
+    let _a = deposit_and_deploy_half(&mut w);
+    let r = set_market_resolved(&mut w);
+    assert!(r.is_ok(), "tag 18 failed: {}", logs(&r));
+    w.warp(w.pool().sync_cooldown_slots);
+    let r = sync(&mut w);
+    assert_eq!(
+        custom(&r),
+        Some(E_NOTHING_TO_SYNC),
+        "expected NothingToSync on an in-band pool: {}",
+        logs(&r)
+    );
+}
+
+/// The documented order (AdminResolveMarket, then SetMarketResolved, then
+/// RecoverTerminalInsurance): Sync is refused on the terminal market, tag 29 pays the deployed
+/// share, the staker exits in full.
+#[test]
+fn resolve_then_set_market_resolved_then_terminal_recovery_full_exit() {
+    let mut w = world(true);
+    let a = deposit_and_deploy_half(&mut w);
+    admin_resolve(&mut w);
+    let r = set_market_resolved(&mut w);
+    assert!(r.is_ok(), "tag 18 after tag 24 failed: {}", logs(&r));
+    w.warp(w.pool().sync_cooldown_slots);
+    let r = sync(&mut w);
+    assert_eq!(
+        custom(&r),
+        Some(E_MARKET_RESOLVED),
+        "sync on a terminal market was not refused: {}",
+        logs(&r)
+    );
+    let (_, deployed, _) = w.valuation();
+    let r = recover_terminal(&mut w, deployed);
+    assert!(
+        r.is_ok(),
+        "tag 29 for the deployed {deployed} failed: {}",
+        logs(&r)
+    );
+    w.warp(10);
+    let before = token_amount(&w.svm, &a.ata);
+    let lp = token_amount(&w.svm, &a.lp_ata);
+    let r = withdraw(&mut w, &a, lp);
+    assert!(r.is_ok(), "full exit after tag 29 failed: {}", logs(&r));
+    let got = token_amount(&w.svm, &a.ata) - before;
+    assert_eq!(
+        got,
+        10_000_000 - MINIMUM_LIQUIDITY,
+        "full exit paid the wrong amount"
+    );
+}
+
+/// RecoverTerminalInsurance sets the flag itself; Sync is then refused.
+#[test]
+fn tag29_sets_flag_then_sync_refused() {
+    let mut w = world(true);
+    let _a = deposit_and_deploy_half(&mut w);
+    admin_resolve(&mut w);
+    assert!(
+        !w.pool().market_resolved(),
+        "tag 24 alone set the local flag"
+    );
+    let (_, deployed, _) = w.valuation();
+    let r = recover_terminal(&mut w, deployed);
+    assert!(
+        r.is_ok(),
+        "tag 29 for the deployed {deployed} failed: {}",
+        logs(&r)
+    );
+    assert!(w.pool().market_resolved(), "tag 29 did not set the flag");
+    w.warp(w.pool().sync_cooldown_slots);
+    let r = sync(&mut w);
+    assert_eq!(
+        custom(&r),
+        Some(E_MARKET_RESOLVED),
+        "sync after tag 29 was not refused: {}",
+        logs(&r)
+    );
+}
+
+/// FEE_ONLY: tag 18 sets the flag, blocks deposits and is one-way; Sync is FIRST_LOSS-only.
+#[test]
+fn fee_only_set_market_resolved_blocks_deposits() {
+    let mut w = world_mode(true, true);
+    let a = new_staker(&mut w, 2_000_000);
+    let r = deposit_raw(&mut w, 1, &a, 1_000_000, None);
+    assert!(r.is_ok(), "FEE_ONLY deposit failed: {}", logs(&r));
+    let r = set_market_resolved(&mut w);
+    assert!(r.is_ok(), "FEE_ONLY tag 18 failed: {}", logs(&r));
+    assert!(
+        w.pool().market_resolved(),
+        "FEE_ONLY tag 18 did not set the flag"
+    );
+    w.warp(10);
+    let r = deposit_raw(&mut w, 1, &a, 1_000_000, None);
+    assert_eq!(
+        custom(&r),
+        Some(E_MARKET_RESOLVED),
+        "FEE_ONLY deposit after tag 18 was not refused: {}",
+        logs(&r)
+    );
+    let r = sync(&mut w);
+    assert_eq!(
+        custom(&r),
+        Some(E_INVALID_POOL_MODE),
+        "sync on a FEE_ONLY pool was not refused: {}",
+        logs(&r)
+    );
+    let r = set_market_resolved(&mut w);
+    assert_eq!(
+        custom(&r),
+        Some(E_MARKET_RESOLVED),
+        "a second tag 18 was not refused: {}",
+        logs(&r)
     );
 }
