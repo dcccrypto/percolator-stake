@@ -23,7 +23,7 @@
 #
 # Only f9/v5_s3_s1/task13/v22live (F9_WRAPPER_SO) and d8/gh311 (GH311_WRAPPER_SO) take an env
 # override. The other wrapper suites (gh268, c1, f3, mode0_*, n6, poc_ah2, poc_ah3,
-# poc_last_junior_residual; v16/v17 too, but they encode the older v16/v17 wire) read the CI
+# poc_last_junior_residual, v16, v17; all pass on a58219b with this build) read the CI
 # layout ../percolator-prog/target/deploy/percolator_prog.so and panic if it is missing, so
 # this script refuses to run unless that sibling file is the same build as WRAPPER_SO.
 #
