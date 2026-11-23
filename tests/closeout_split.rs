@@ -158,7 +158,9 @@ fn closeout_m1_seed_at_bind_examples() {
 #[test]
 fn closeout_m1_m2_readers_and_clear() {
     use percolator_stake::wrapper_layout as wl;
-    let mut d = vec![0u8; wl::ASSET0_INS_SPENT_SHORT_OFF + 16];
+    // A real cap-1 market length: raw readers refuse a market that does not tile the layout.
+    let mut d = vec![0u8; wl::MIN_MARKET_ACCOUNT_LEN + wl::MARKET_ASSET_SLOT_LEN];
+    assert!(d.len() >= wl::ASSET0_INS_SPENT_SHORT_OFF + 16);
     d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
     d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
     d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;

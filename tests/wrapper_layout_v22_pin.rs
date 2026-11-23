@@ -76,7 +76,7 @@ fn state_and_cpi_consume_the_single_source() {
 /// (1266) and NOT at 1250 must not read as Resolved. Under a stale-offset program it is.
 #[test]
 fn terminal_reader_does_not_look_at_the_v21_mode_byte() {
-    let mut d = vec![0u8; 3835];
+    let mut d = vec![0u8; 4043];
     d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
     d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
     d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
@@ -88,4 +88,28 @@ fn terminal_reader_does_not_look_at_the_v21_mode_byte() {
     d[V22_RC23_MODE_OFF] = 0;
     d[w::MARKET_MODE_OFF] = 1;
     assert_eq!(state::read_wrapper_terminal(&d), state::WrapperTerminal::Resolved);
+}
+
+/// The 083a0d08 port shrank the engine header 806 -> 790 with no VERSION bump. An rc23 market
+/// (592 + 806 + n x 2661, VERSION 19) must be refused by every raw reader, not read 16 B off.
+#[test]
+fn an_rc23_806_byte_header_market_is_refused_by_length() {
+    let stamp = |len: usize| {
+        let mut d = vec![0u8; len];
+        d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
+        d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
+        d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
+        d
+    };
+    for n in [1usize, 2, 4] {
+        let new = stamp(w::MARKET_GROUP_OFF + w::MARKET_GROUP_LEN + n * w::MARKET_ASSET_SLOT_LEN);
+        let old = stamp(w::MARKET_GROUP_OFF + w::V22_RC23_MARKET_GROUP_LEN + n * w::MARKET_ASSET_SLOT_LEN);
+        assert!(w::header_is_pinned(&new), "790-byte layout, {n} slots");
+        assert!(!w::header_is_pinned(&old), "806-byte layout, {n} slots");
+        let mut old_resolved = old.clone();
+        old_resolved[V22_RC23_MODE_OFF] = 1;
+        assert_eq!(state::read_wrapper_terminal(&old_resolved), state::WrapperTerminal::UnknownLayout);
+        assert_eq!(state::read_wrapper_engine_insurance(&old), None);
+        assert_eq!(state::read_wrapper_terminal(&new), state::WrapperTerminal::NotTerminal);
+    }
 }

@@ -1109,7 +1109,9 @@ fn gh311_fl_loss_direct_tag41_close_slab_then_tag29_matches_the_control_forged_l
 fn gh311_fl_partial_direct_tag41_is_refused_while_tag29_partial_still_pays() {
     const PARTIAL: u64 = 3_000_000;
     let (mut w, _alice, _bob) = fl_scene(Kind::Plain);
+    let ctrl_vault = w.vault_balance();
     assert!(recover_terminal(&mut w, PARTIAL).is_ok(), "control: tag 29 partial still pays");
+    assert_eq!(w.vault_balance(), ctrl_vault + PARTIAL, "control: tag 29 moved exactly the partial amount");
 
     let (mut w, _alice, _bob) = fl_scene(Kind::Plain);
     let (vault_before, pool_before) = (w.vault_balance(), w.pool().total_returned);

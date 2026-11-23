@@ -63,12 +63,11 @@ pub const GROUP_MODE_OFF: usize = 658;
 /// Header-relative offset of the engine `insurance` balance (u128 LE; the fund wrapper tag 41
 /// withdraws at terminal). 333 = market_group_id 32 + `V16ConfigAccount` 281 +
 /// asset_slot_capacity 4 + vault 16. CLOSE-OUT RULE (2026-10-14, every v5 mode): read once, at
-/// BindInsuranceAuthority, to record the creator's seed. `offset_of!` against engine
-/// 3ce4cbd1 (`MarketGroupV16HeaderAccount`: size 806, mode 674, next_market_id 629, i.e. the
-/// rc23 layout; all header offsets here are -16 since the 083a0d08 port, re-measured with
-/// `offset_of!` on engine agent/1123-layout2-percolator: size 790, mode 658, next_market_id 613,
-/// vault 317, insurance 333, reserved credit 477, budget total 493; slot offsets unchanged; was the
-/// pinned layout); real-bytes pin `f9_fee_only_bind_records_creator_seed_from_real_wrapper`.
+/// BindInsuranceAuthority, to record the creator's seed. Was 349 by `offset_of!` against engine
+/// 3ce4cbd1 (rc23: header 806, mode 674, next_market_id 629). Since the 083a0d08 port every header
+/// offset here is -16, re-measured with `offset_of!` on engine 58466a0d: header 790, mode 658,
+/// next_market_id 613, vault 317, insurance 333, reserved credit 477, budget total 493; slot offsets
+/// unchanged. Real-bytes pin `f9_fee_only_bind_records_creator_seed_from_real_wrapper`.
 pub const GROUP_INSURANCE_OFF: usize = 333;
 /// Header-relative `source_insurance_credit_reserved_total_atoms` (u128 LE): insurance reserved
 /// for source credits, not the insurance authority's. Engine 3ce4cbd1 layout dump: 493 (477 since the 083a0d08 port).
@@ -204,14 +203,30 @@ const _: () = assert!(GROUP_MODE_OFF < MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_MODE_OFF + 1 + 8 <= MARKET_GROUP_LEN);
 const _: () = assert!(GROUP_INSURANCE_OFF + 16 <= MARKET_GROUP_LEN);
 
-/// True iff `data` carries the wrapper magic and EXACTLY the pinned header VERSION. Every raw
-/// slab reader must call this before touching an offset in this module.
+/// One wrapper asset slot: the 1024-byte wrapper region + the 1637-byte engine slot.
+pub const MARKET_ASSET_SLOT_LEN: usize = ASSET_ORACLE_WRAPPER_LEN + 1637;
+const _: () = assert!(MARKET_ASSET_SLOT_LEN == 2661);
+/// Wrapper account kind byte of a market.
+const KIND_MARKET: u8 = 1;
+
+/// True iff a market account of `len` bytes is exactly this layout's header + whole asset slots.
+/// The upstream 083a0d08 port shrank the engine header 806 -> 790 without a VERSION bump, so an
+/// older VERSION-19 market (592 + 806 + n x 2661) is told apart only by its length: it never
+/// tiles this layout (16 is not a multiple of 2661), so it is refused instead of misread -16 off.
+pub fn market_len_tiles(len: usize) -> bool {
+    len >= MIN_MARKET_ACCOUNT_LEN && (len - MIN_MARKET_ACCOUNT_LEN) % MARKET_ASSET_SLOT_LEN == 0
+}
+
+/// True iff `data` carries the wrapper magic and EXACTLY the pinned header VERSION, and, for a
+/// market account, a length that tiles this layout ([`market_len_tiles`]). Every raw slab reader
+/// must call this before touching an offset in this module.
 pub fn header_is_pinned(data: &[u8]) -> bool {
     const MAGIC: u64 = 0x5045_5243_5631_3600;
     match (data.get(0..8), data.get(8..10)) {
         (Some(m), Some(v)) => {
             u64::from_le_bytes(m.try_into().unwrap()) == MAGIC
                 && u16::from_le_bytes(v.try_into().unwrap()) == WRAPPER_VERSION
+                && (data.get(10) != Some(&KIND_MARKET) || market_len_tiles(data.len()))
         }
         _ => false,
     }
