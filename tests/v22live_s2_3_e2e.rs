@@ -37,7 +37,7 @@ use std::str::FromStr;
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V18_CAP1: usize = 4059;
+const MARKET_LEN_V18_CAP1: usize = 4043;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 const BUDGET: u64 = 5_000_000;
 const STAKE: u64 = 10_000_000;

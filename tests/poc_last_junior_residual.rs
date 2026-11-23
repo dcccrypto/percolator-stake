@@ -50,7 +50,7 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V17_CAP1: usize = 4059; // same v2.2 -rem cap-1 market as poc_ah3_senior_recovery_snipe.rs
+const MARKET_LEN_V17_CAP1: usize = 4043; // same v2.2 -rem cap-1 market as poc_ah3_senior_recovery_snipe.rs
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 /// Junior fee multiplier (2x). Junior weight = jb * 20_000, senior = sb * 10_000.

@@ -55,7 +55,7 @@ fn stake_id_str() -> String {
 }
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V22_CAP1: usize = 4059;
+const MARKET_LEN_V22_CAP1: usize = 4043;
 const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 /// The creator's insurance seed (wrapper tag 9 before the pool exists).

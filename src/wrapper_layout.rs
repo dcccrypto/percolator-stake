@@ -44,40 +44,47 @@ pub const WRAPPER_VERSION: u16 = 19;
 
 /// Start of the engine `MarketGroupV16HeaderAccount` inside a market account.
 pub const MARKET_GROUP_OFF: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
-/// `size_of::<MarketGroupV16HeaderAccount>()`. v2.1: 758. v2.2: 806
+/// `size_of::<MarketGroupV16HeaderAccount>()`. v2.1: 758. v2.2 rc23: 806
 /// (`V16ConfigAccount` +40 B: band_bps, band_max_epoch_slots, band_max_pin_slots,
 /// rent_max_e9_per_slot, band_max_positions_per_side [Wave B review, engine 30b2ec20]).
-pub const MARKET_GROUP_LEN: usize = 806;
+/// Now 790: Toly's upstream 083a0d08 (ported) drops the 16-byte `public_b_chunk_atoms` config
+/// field (`V16ConfigAccount` 297 -> 281 B), so every header field after the config moves -16.
+pub const MARKET_GROUP_LEN: usize = 790;
+/// The v2.2 header before upstream 083a0d08 dropped `public_b_chunk_atoms` (16 B).
+pub const V22_RC23_MARKET_GROUP_LEN: usize = 806;
 pub const V21_MARKET_GROUP_LEN: usize = 758;
 
 /// Header-relative offset of `next_market_id` (the asset-generation frontier,
-/// `ResolveMarket` tag 19). v2.1: 581; v2.2: 629 (after the grown config).
-pub const GROUP_NEXT_MARKET_ID_OFF: usize = 629;
+/// `ResolveMarket` tag 19). v2.1: 581; v2.2 rc23: 629; now 613 (config -16 B).
+pub const GROUP_NEXT_MARKET_ID_OFF: usize = 613;
 /// Header-relative offset of the engine `mode` byte (0 Live, 1 Resolved, 2 Recovery).
-/// v2.1: 626; v2.2: 674.
-pub const GROUP_MODE_OFF: usize = 674;
+/// v2.1: 626; v2.2 rc23: 674; now 658.
+pub const GROUP_MODE_OFF: usize = 658;
 /// Header-relative offset of the engine `insurance` balance (u128 LE; the fund wrapper tag 41
-/// withdraws at terminal). v2.2: 349 = market_group_id 32 + `V16ConfigAccount` 297 +
+/// withdraws at terminal). 333 = market_group_id 32 + `V16ConfigAccount` 281 +
 /// asset_slot_capacity 4 + vault 16. CLOSE-OUT RULE (2026-10-14, every v5 mode): read once, at
 /// BindInsuranceAuthority, to record the creator's seed. `offset_of!` against engine
 /// 3ce4cbd1 (`MarketGroupV16HeaderAccount`: size 806, mode 674, next_market_id 629, i.e. the
+/// rc23 layout; all header offsets here are -16 since the 083a0d08 port, re-measured with
+/// `offset_of!` on engine agent/1123-layout2-percolator: size 790, mode 658, next_market_id 613,
+/// vault 317, insurance 333, reserved credit 477, budget total 493; slot offsets unchanged; was the
 /// pinned layout); real-bytes pin `f9_fee_only_bind_records_creator_seed_from_real_wrapper`.
-pub const GROUP_INSURANCE_OFF: usize = 349;
+pub const GROUP_INSURANCE_OFF: usize = 333;
 /// Header-relative `source_insurance_credit_reserved_total_atoms` (u128 LE): insurance reserved
-/// for source credits, not the insurance authority's. Engine 3ce4cbd1 layout dump: 493.
-pub const GROUP_INS_CREDIT_RESERVED_OFF: usize = 493;
+/// for source credits, not the insurance authority's. Engine 3ce4cbd1 layout dump: 493 (477 since the 083a0d08 port).
+pub const GROUP_INS_CREDIT_RESERVED_OFF: usize = 477;
 /// Header-relative `insurance_domain_budget_remaining_total` (u128 LE): the BUDGETED slice of
 /// insurance, the only part the insurance authority/operator can withdraw (wrapper tags 57/41).
 /// Fee legs (protocol / LP / staker reserve / creator), reserved credit and unrouted rent are
 /// all outside it (wrapper CloseSlab: `unbudgeted = I - reserved - budget - rent_unrouted`).
-/// Engine 3ce4cbd1 layout dump: 509.
-pub const GROUP_INS_BUDGET_TOTAL_OFF: usize = 509;
+/// Engine 3ce4cbd1 layout dump: 509 (493 since the 083a0d08 port).
+pub const GROUP_INS_BUDGET_TOTAL_OFF: usize = 493;
 /// Header-relative `config.max_market_slots` (u32 LE; `V16ConfigAccount` offset 2 + the 32-byte
 /// group id). M-1b: the close-out seed is recorded only on single-asset markets.
 /// `offset_of!` against engine 3ce4cbd1: 34.
 pub const GROUP_MAX_MARKET_SLOTS_OFF: usize = 34;
-/// Header-relative engine `vault` (u128 LE). `offset_of!` against engine 3ce4cbd1: 333.
-pub const GROUP_VAULT_OFF: usize = 333;
+/// Header-relative engine `vault` (u128 LE). `offset_of!` against engine 3ce4cbd1: 333 (317 since the 083a0d08 port).
+pub const GROUP_VAULT_OFF: usize = 317;
 /// `AssetStateV16Account` (first field of the engine slot) offsets, engine 3ce4cbd1:
 /// `stale_account_count_long` / `_short` (u64 LE). M-1b LOW: a stale K/F cohort carries a hidden
 /// loss reservation the stake program cannot compute, so the bind fails closed while either > 0.
@@ -162,33 +169,33 @@ pub const MARKET_PERMISSIONLESS_INIT_FEE_OFF: usize = HEADER_LEN + CONFIG_PERMIS
 
 // ── Value pins. Edit an input above without updating these and the build fails. ──
 const _: () = assert!(MARKET_GROUP_OFF == 592);
-const _: () = assert!(ASSET0_WRAPPER_START == 1398);
-const _: () = assert!(ASSET0_MARKET_ID_OFF == 2422);
-const _: () = assert!(ASSET0_AUTHORITY_EPOCH_OFF == 1982);
-const _: () = assert!(ASSET0_INSURANCE_TOP_UP_OFF == 1894);
-const _: () = assert!(ASSET0_BACKING_FEE_LONG_OFF == 1918);
-const _: () = assert!(ASSET0_BACKING_FEE_SHORT_OFF == 1926);
-const _: () = assert!(ASSET0_TRADE_FEE_OFF == 1934);
-const _: () = assert!(MARKET_ASSET_GENERATION_FRONTIER_OFF == 1221);
-const _: () = assert!(MARKET_MODE_OFF == 1266);
-const _: () = assert!(MARKET_INSURANCE_OFF == 941);
-const _: () = assert!(MARKET_INS_CREDIT_RESERVED_OFF == 1085);
-const _: () = assert!(MARKET_INS_BUDGET_TOTAL_OFF == 1101);
+const _: () = assert!(ASSET0_WRAPPER_START == 1382);
+const _: () = assert!(ASSET0_MARKET_ID_OFF == 2406);
+const _: () = assert!(ASSET0_AUTHORITY_EPOCH_OFF == 1966);
+const _: () = assert!(ASSET0_INSURANCE_TOP_UP_OFF == 1878);
+const _: () = assert!(ASSET0_BACKING_FEE_LONG_OFF == 1902);
+const _: () = assert!(ASSET0_BACKING_FEE_SHORT_OFF == 1910);
+const _: () = assert!(ASSET0_TRADE_FEE_OFF == 1918);
+const _: () = assert!(MARKET_ASSET_GENERATION_FRONTIER_OFF == 1205);
+const _: () = assert!(MARKET_MODE_OFF == 1250);
+const _: () = assert!(MARKET_INSURANCE_OFF == 925);
+const _: () = assert!(MARKET_INS_CREDIT_RESERVED_OFF == 1069);
+const _: () = assert!(MARKET_INS_BUDGET_TOTAL_OFF == 1085);
 const _: () = assert!(MARKET_MAX_MARKET_SLOTS_OFF == 626);
-const _: () = assert!(MARKET_VAULT_OFF == 925);
-const _: () = assert!(ASSET0_ENGINE_SLOT_OFF == 2422);
-const _: () = assert!(ASSET0_STALE_COUNT_LONG_OFF == 2759);
-const _: () = assert!(ASSET0_STALE_COUNT_SHORT_OFF == 2767);
-const _: () = assert!(ASSET0_INS_BUDGET_LONG_OFF == 3049);
-const _: () = assert!(ASSET0_INS_BUDGET_SHORT_OFF == 3065);
-const _: () = assert!(ASSET0_INS_SPENT_LONG_OFF == 3081);
-const _: () = assert!(ASSET0_INS_SPENT_SHORT_OFF == 3097);
+const _: () = assert!(MARKET_VAULT_OFF == 909);
+const _: () = assert!(ASSET0_ENGINE_SLOT_OFF == 2406);
+const _: () = assert!(ASSET0_STALE_COUNT_LONG_OFF == 2743);
+const _: () = assert!(ASSET0_STALE_COUNT_SHORT_OFF == 2751);
+const _: () = assert!(ASSET0_INS_BUDGET_LONG_OFF == 3033);
+const _: () = assert!(ASSET0_INS_BUDGET_SHORT_OFF == 3049);
+const _: () = assert!(ASSET0_INS_SPENT_LONG_OFF == 3065);
+const _: () = assert!(ASSET0_INS_SPENT_SHORT_OFF == 3081);
 const _: () = assert!(GROUP_MAX_MARKET_SLOTS_OFF + 4 <= MARKET_GROUP_LEN);
-const _: () = assert!(ASSET0_INSURANCE_AUTHORITY_OFF == 1422);
-const _: () = assert!(ASSET0_INSURANCE_OPERATOR_OFF == 1454);
+const _: () = assert!(ASSET0_INSURANCE_AUTHORITY_OFF == 1406);
+const _: () = assert!(ASSET0_INSURANCE_OPERATOR_OFF == 1438);
 const _: () = assert!(GROUP_INS_BUDGET_TOTAL_OFF + 16 <= MARKET_GROUP_LEN);
 const _: () = assert!(ASSET_INSURANCE_OPERATOR_OFF + 32 <= ASSET_INSURANCE_TOP_UP_OFF);
-const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1398);
+const _: () = assert!(MIN_MARKET_ACCOUNT_LEN == 1382);
 const _: () = assert!(MARKET_PERMISSIONLESS_INIT_FEE_OFF == 128);
 const _: () = assert!(CONFIG_PERMISSIONLESS_INIT_FEE_OFF + 16 <= WRAPPER_CONFIG_LEN);
 // Both header-field reads must lie INSIDE the header they are relative to.
