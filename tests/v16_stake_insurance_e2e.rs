@@ -49,7 +49,6 @@ const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 
 // Pinned against the LOCKED wrapper baseline (v16-wrapper-sync-phase2b-tier3-complete
 // @5260d1b): market_account_len_for_capacity(1) measured = 3107.
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 fn stake_so() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -58,6 +57,9 @@ fn stake_so() -> PathBuf {
 }
 
 fn wrapper_so() -> PathBuf {
+    if let Ok(p) = std::env::var("F9_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.push("percolator-prog/target/deploy/percolator_prog.so");
@@ -70,7 +72,7 @@ fn wrapper_so() -> PathBuf {
 //    (v16_program.rs:2826-2874). Default V16CuMarketParams (v16_cu.rs:229-255). ─
 
 fn encode_init_market_default() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8); // tag InitMarket
     out.extend_from_slice(&1u16.to_le_bytes()); // max_portfolio_assets
     out.extend_from_slice(&0u64.to_le_bytes()); // h_min
@@ -92,9 +94,8 @@ fn encode_init_market_default() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes()); // max_account_b_settlement_chunks
     out.extend_from_slice(&1u64.to_le_bytes()); // max_bankrupt_close_chunks
     out.extend_from_slice(&100u64.to_le_bytes()); // max_bankrupt_close_lifetime_slots
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes()); // public_b_chunk_atoms
     out.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
-    debug_assert_eq!(out.len(), 219, "InitMarket wire must be 219 bytes");
+    debug_assert_eq!(out.len(), 203, "InitMarket wire must be 203 bytes");
     out
 }
 
@@ -139,9 +140,9 @@ fn smoke_both_programs_load() {
 }
 
 #[test]
-fn init_market_wire_is_219_bytes() {
+fn init_market_wire_is_203_bytes() {
     // Self-check: our hand-encoded InitMarket matches the wrapper's encoder length.
-    assert_eq!(encode_init_market_default().len(), 219);
+    assert_eq!(encode_init_market_default().len(), 203);
 }
 
 // ── Two-step admin rotation (finding #4) — runtime, through the real program ──

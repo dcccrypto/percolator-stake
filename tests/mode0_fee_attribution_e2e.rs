@@ -42,7 +42,7 @@ use std::str::FromStr;
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
+const MARKET_LEN_V17_CAP1: usize = 4043; // v2.2 variant -rem cap-1 market (592 + 790 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Was 3067 when WRAPPER_CONFIG_LEN was 496; the 2026-07-19 fee-split fields grew
@@ -50,7 +50,6 @@ const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 
 // short and EVERY InitMarket here failed with InvalidAccountData. Recompute via
 // percolator_prog::state::market_account_len_for_capacity(1) when the wrapper
 // config changes again.
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 // ---- Artifact paths ----
 
@@ -61,6 +60,9 @@ fn stake_so() -> PathBuf {
 }
 
 fn wrapper_so() -> PathBuf {
+    if let Ok(p) = std::env::var("F9_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.push("percolator-prog/target/deploy/percolator_prog.so");
@@ -79,7 +81,7 @@ fn mint_data() -> Vec<u8> {
 }
 
 fn encode_init_market_v17() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8); // tag InitMarket
     out.extend_from_slice(&1u16.to_le_bytes()); // max_portfolio_assets
     out.extend_from_slice(&0u64.to_le_bytes()); // h_min
@@ -101,9 +103,8 @@ fn encode_init_market_v17() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes()); // max_account_b_settlement_chunks
     out.extend_from_slice(&1u64.to_le_bytes()); // max_bankrupt_close_chunks
     out.extend_from_slice(&100u64.to_le_bytes()); // max_bankrupt_close_lifetime_slots
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes()); // public_b_chunk_atoms
     out.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
-    debug_assert_eq!(out.len(), 219, "InitMarket wire must be 219 bytes");
+    debug_assert_eq!(out.len(), 203, "InitMarket wire must be 203 bytes");
     out
 }
 
@@ -135,7 +136,8 @@ fn build_live_market_v17(
     admin: &Keypair,
     payer: &Keypair,
 ) -> (Pubkey, Pubkey) {
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
 
     svm.set_account(
@@ -166,12 +168,12 @@ fn build_live_market_v17(
         program_id: wrapper_id,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(market, false),
+            AccountMeta::new(market, true),
             AccountMeta::new_readonly(mint, false),
         ],
         data: encode_init_market_v17(),
     };
-    send(svm, payer, &[admin], init_ix).expect("InitMarket v17");
+    send(svm, payer, &[admin, &market_kp], init_ix).expect("InitMarket v17");
     (market, mint)
 }
 

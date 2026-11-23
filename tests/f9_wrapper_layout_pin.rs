@@ -72,7 +72,7 @@ const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 // v2.2: cap-1 market = 592 + 806 + 2437 = 3835 (v2.1: 3675). The two offsets are the SAME
 // constants stake's CPI builders read at runtime, imported rather than copied, so this test
 // cannot drift from the program it pins.
-const MARKET_LEN_V19_CAP1: usize = 4059;
+const MARKET_LEN_V19_CAP1: usize = 4043;
 use percolator_stake::wrapper_layout::{ASSET0_AUTHORITY_EPOCH_OFF, MARKET_ASSET_GENERATION_FRONTIER_OFF};
 
 fn wrapper_sos() -> Vec<PathBuf> {
@@ -82,6 +82,9 @@ fn wrapper_sos() -> Vec<PathBuf> {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .collect();
+    }
+    if let Ok(p) = std::env::var("F9_WRAPPER_SO") {
+        return vec![PathBuf::from(p)];
     }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
@@ -113,16 +116,15 @@ fn encode_init_market() -> Vec<u8> {
     for v in [10_000u64, 1, 0, 1, 1, 1, 100] {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes());
     out.extend_from_slice(&0u128.to_le_bytes());
-    assert_eq!(out.len(), 219);
+    assert_eq!(out.len(), 203);
     out
 }
 
 fn send(
     svm: &mut LiteSVM,
     payer: &Keypair,
-    signer: &Keypair,
+    signers: &[&Keypair],
     ix: Instruction,
 ) -> Result<(), String> {
     svm.expire_blockhash();
@@ -132,7 +134,7 @@ fn send(
             ix,
         ],
         Some(&payer.pubkey()),
-        &[payer, signer],
+        &[&[payer], signers].concat(),
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx)
@@ -181,7 +183,8 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
         let (admin, payer) = (Keypair::new(), Keypair::new());
         svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
-        let (market, mint) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let market_kp = Keypair::new();
+        let (market, mint) = (market_kp.pubkey(), Pubkey::new_unique());
         let mut md = vec![0u8; 82];
         md[45] = 1;
         svm.set_account(
@@ -209,12 +212,12 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
         send(
             &mut svm,
             &payer,
-            &admin,
+            &[&admin, &market_kp],
             Instruction {
                 program_id: wrapper_id,
                 accounts: vec![
                     AccountMeta::new(admin.pubkey(), true),
-                    AccountMeta::new(market, false),
+                    AccountMeta::new(market, true),
                     AccountMeta::new_readonly(mint, false),
                 ],
                 data: encode_init_market(),
@@ -294,7 +297,7 @@ fn f9_wrapper_mode_offset_pinned_against_every_expected_wrapper_so() {
         send(
             &mut svm,
             &payer,
-            &admin,
+            &[&admin],
             Instruction {
                 program_id: wrapper_id,
                 accounts: vec![

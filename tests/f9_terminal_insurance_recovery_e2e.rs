@@ -48,14 +48,13 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 /// together with `F9_WRAPPER_SO` (a wrapper that pins THAT stake id, e.g. the deployed v2.2 dump)
 /// and `E2E_STAKE_SO` (a stake .so built with that id) to run against the deployed bytes.
 fn stake_id_str() -> String {
-    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V".to_string())
 }
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // v2.2 (wrapper VERSION 19) market account length for capacity 1: 592 + 806 + 2437.
 // (v2.1 / VERSION 18: 3675; see f3_dead_share_accrue_guard_e2e.rs.)
-const MARKET_LEN_V18_CAP1: usize = 4059;
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
+const MARKET_LEN_V18_CAP1: usize = 4043;
 // Asset-0 raw offsets: the SAME constants the program reads at runtime (v2.2 layout 19; the
 // pin test `wrapper_layout_v22_pin` re-derives them against the real wrapper types).
 use percolator_stake::wrapper_layout::{
@@ -149,7 +148,7 @@ fn canonical_vault_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 fn encode_init_market_v17() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8);
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -171,9 +170,8 @@ fn encode_init_market_v17() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&100u64.to_le_bytes());
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes());
     out.extend_from_slice(&0u128.to_le_bytes());
-    assert_eq!(out.len(), 219);
+    assert_eq!(out.len(), 203);
     out
 }
 
@@ -327,7 +325,8 @@ fn world(name: &str) -> Option<World> {
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
 
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
     svm.set_account(
         mint,
@@ -358,12 +357,12 @@ fn world(name: &str) -> Option<World> {
     send(
         &mut svm,
         &payer,
-        &[&admin],
+        &[&admin, &market_kp],
         Instruction {
             program_id: wrapper_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
             data: encode_init_market_v17(),

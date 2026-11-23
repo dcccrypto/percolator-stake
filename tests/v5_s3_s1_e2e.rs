@@ -13,7 +13,7 @@
 //! model a drop in unit value (named `_forged_ledger`; the real-engine insurance loss is the
 //! wrapper suite's `p4_wave_d::xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes`).
 //!
-//! The wrapper .so must pin THIS stake id (A6DVNubv, the v2.2 RC devnet pin): the canonical RC
+//! The wrapper .so must pin THIS stake id (7JrgAUHi, the v2.2 devnet pin; E2E_STAKE_ID overrides): the canonical RC
 //! artifact `artifacts/v22-combination-2026-10-08/wrapper-v22rem-c6ee0b6e-devnet.so`
 //! (sha256 53fddfe7…) by default. To run against the DEPLOYED v2.2 bytes (I-3), set
 //! `F9_WRAPPER_SO` to the dump of 6kpg2wi7 (first 2,534,328 B, sha256 f6e7180d…, pins stake
@@ -51,12 +51,11 @@ const WRAPPER_ID: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 /// together with `F9_WRAPPER_SO` (a wrapper that pins THAT stake id, e.g. the deployed v2.2 dump)
 /// and `E2E_STAKE_SO` (a stake .so built with that id) to run against the deployed bytes.
 fn stake_id_str() -> String {
-    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V".to_string())
 }
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V22_CAP1: usize = 4059;
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
+const MARKET_LEN_V22_CAP1: usize = 4043;
 
 /// The creator's insurance seed (wrapper tag 9 before the pool exists).
 const SEED: u64 = 5_000_000;
@@ -138,9 +137,9 @@ fn canonical_vault_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
-/// Wrapper InitMarket, the same 219-byte form the F-9 suite uses.
+/// Wrapper InitMarket, the same 203-byte form the F-9 suite uses.
 fn encode_init_market() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8);
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -162,9 +161,8 @@ fn encode_init_market() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&100u64.to_le_bytes());
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes());
     out.extend_from_slice(&0u128.to_le_bytes());
-    assert_eq!(out.len(), 219);
+    assert_eq!(out.len(), 203);
     out
 }
 
@@ -302,7 +300,8 @@ fn world(burn_asset_admin: bool) -> World {
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
 
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
     svm.set_account(
         mint,
@@ -332,12 +331,12 @@ fn world(burn_asset_admin: bool) -> World {
     send(
         &mut svm,
         &payer,
-        &[&admin],
+        &[&admin, &market_kp],
         Instruction {
             program_id: wrapper_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
             data: encode_init_market(),
@@ -784,7 +783,7 @@ fn s3_sync_recovers_excess_after_target_lowered() {
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     let admin = w.admin.insecure_clone();
     let r = propose_target(&mut w, &admin, 1_000, None);
     assert!(r.is_ok(), "admin lowers: {}", logs(&r));
@@ -886,7 +885,7 @@ fn s3_unit_value_drop_lowers_lp_price_pro_rata_forged_ledger() {
     let b = new_staker(&mut w, 3_000_000);
     assert!(deposit(&mut w, &a, 6_000_000).is_ok());
     assert!(deposit(&mut w, &b, 3_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     let (lp_a, lp_b) = (token_amount(&w.svm, &a.lp_ata), token_amount(&w.svm, &b.lp_ata));
     let v0 = w.valuation();
     let (va0, vb0) = (share_value(lp_a, v0), share_value(lp_b, v0));
@@ -931,7 +930,7 @@ fn s1_terminal_partial_when_stakers_exist() {
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     assert_eq!(w.pool().total_flushed, 5_000_000);
     admin_resolve(&mut w);
     let fund = token_amount(&w.svm, &w.wrapper_vault);
@@ -1022,7 +1021,7 @@ fn closeout_s2_backlog_goes_to_stakers_not_creator_forged_backlog() {
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     let mut acct = w.svm.get_account(&w.pool).unwrap();
     acct.data[472..480].copy_from_slice(&BACKLOG.to_le_bytes());
     w.svm.set_account(w.pool, acct).unwrap();
@@ -1101,7 +1100,7 @@ fn closeout_first_loss_creator_unit_growth_goes_to_stakers_forged_seed() {
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     forge_seed(&mut w, SEED_REC);
     admin_resolve(&mut w);
     let fund = token_amount(&w.svm, &w.wrapper_vault);
@@ -1126,7 +1125,7 @@ fn closeout_first_loss_creator_class_loss_creator_gets_what_is_left_forged_ledge
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     let mut acct = w.svm.get_account(&w.units).unwrap();
     let u = w.units().unwrap();
     assert_eq!((u.units_stake, u.units_creator), (5_000_000, SEED as u128));
@@ -1161,7 +1160,7 @@ fn closeout_first_loss_partial_calls_conserve_forged_seed() {
     let mut w = world(true);
     let a = new_staker(&mut w, 10_000_000);
     assert!(deposit(&mut w, &a, 10_000_000).is_ok());
-    assert!(sync(&mut w).is_ok());
+    { let r = sync(&mut w); assert!(r.is_ok(), "sync: {}", logs(&r)); }
     forge_seed(&mut w, SEED_REC);
     admin_resolve(&mut w);
     let fund = token_amount(&w.svm, &w.wrapper_vault);

@@ -64,16 +64,15 @@ const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 /// together with `F9_WRAPPER_SO` (a wrapper that pins THAT stake id, e.g. the deployed v2.2 dump)
 /// and `E2E_STAKE_SO` (a stake .so built with that id) to run against the deployed bytes.
 fn stake_id_str() -> String {
-    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+    std::env::var("E2E_STAKE_ID").unwrap_or_else(|_| "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V".to_string())
 }
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
-const MARKET_LEN_V17_CAP1: usize = 4059; // v2.2 variant -rem cap-1 market (592 + 806 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
+const MARKET_LEN_V17_CAP1: usize = 4043; // v2.2 variant -rem cap-1 market (592 + 790 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
 // 3147 = MARKET_GROUP_OFF(592 = HEADER_LEN 16 + WRAPPER_CONFIG_LEN 576)
 //       + MARKET_GROUP_LEN(758) + 1 * MARKET_ASSET_SLOT_LEN(1797).
 // Recompute via percolator_prog::state::market_account_len_for_capacity(1) if
 // the wrapper config changes again.
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 // ── WrapperConfigV16 field offsets, absolute in the market account ───────────
 //
@@ -148,7 +147,7 @@ fn mint_data() -> Vec<u8> {
 }
 
 fn encode_init_market_v17() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8); // tag InitMarket
     out.extend_from_slice(&1u16.to_le_bytes()); // max_portfolio_assets
     out.extend_from_slice(&0u64.to_le_bytes()); // h_min
@@ -170,9 +169,8 @@ fn encode_init_market_v17() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes()); // max_account_b_settlement_chunks
     out.extend_from_slice(&1u64.to_le_bytes()); // max_bankrupt_close_chunks
     out.extend_from_slice(&100u64.to_le_bytes()); // max_bankrupt_close_lifetime_slots
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes()); // public_b_chunk_atoms
     out.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
-    debug_assert_eq!(out.len(), 219, "InitMarket wire must be 219 bytes");
+    debug_assert_eq!(out.len(), 203, "InitMarket wire must be 203 bytes");
     out
 }
 
@@ -263,7 +261,8 @@ fn build_live_market_v17(
     admin: &Keypair,
     payer: &Keypair,
 ) -> (Pubkey, Pubkey) {
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
 
     svm.set_account(
@@ -294,12 +293,12 @@ fn build_live_market_v17(
         program_id: wrapper_id,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(market, false),
+            AccountMeta::new(market, true),
             AccountMeta::new_readonly(mint, false),
         ],
         data: encode_init_market_v17(),
     };
-    send(svm, payer, &[admin], init_ix).expect("InitMarket v17");
+    send(svm, payer, &[admin, &market_kp], init_ix).expect("InitMarket v17");
     (market, mint)
 }
 
@@ -1483,14 +1482,18 @@ fn tag69_restart_asset_oracle_is_not_proxyable_after_asset_admin_burn() {
     // malformed instruction that could never have succeeded — which is precisely
     // how the old PRE-BURN CONTROL earned its keep, and why replacing it with
     // nothing was not an option.
+    // AUD-S1-9: the wrapper refuses a rotation to the key already stored (a no-op that would
+    // burn the shared authority_epoch lane), so the holder hands off to a SECOND key it controls,
+    // which co-signs.
+    let new_oracle = Keypair::new();
     send(
         &mut e.svm,
         &e.payer,
-        &[&e.admin],
+        &[&e.admin, &new_oracle],
         direct_update_asset_authority_ix(
             e.wrapper_id,
             e.admin.pubkey(),
-            e.admin.pubkey(), // self-rotate oracle_authority: holder consents
+            new_oracle.pubkey(), // hand oracle_authority to a second key: holder consents
             market,
             4, // kind = oracle_authority, still held by admin
         ),

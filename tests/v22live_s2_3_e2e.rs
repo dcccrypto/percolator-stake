@@ -37,15 +37,14 @@ use std::str::FromStr;
 const WRAPPER_MAINNET: &str = "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const MARKET_LEN_V18_CAP1: usize = 4059;
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
+const MARKET_LEN_V18_CAP1: usize = 4043;
 const BUDGET: u64 = 5_000_000;
 const STAKE: u64 = 10_000_000;
 const PRICE: u64 = 100;
 
 // Wrapper portfolio layout (v2.2, `PORTFOLIO_ACCOUNT_LEN == 10603` const-asserted in the wrapper):
 // ... matcher config (104 B, control word at +96) | portfolio_id u64 | matcher_sequence u64 | expiry u64.
-const PORTFOLIO_LEN: usize = 10_603;
+const PORTFOLIO_LEN: usize = 10_607;
 const PORTFOLIO_ID_OFF: usize = PORTFOLIO_LEN - 24;
 const PORTFOLIO_SEQ_OFF: usize = PORTFOLIO_LEN - 16;
 const PORTFOLIO_CONTROL_OFF: usize = PORTFOLIO_LEN - 24 - 104 + 96;
@@ -63,7 +62,7 @@ const W_UNAUTHORIZED: u32 = 8;
 
 fn stake_id_str() -> String {
     std::env::var("E2E_STAKE_ID")
-        .unwrap_or_else(|_| "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".to_string())
+        .unwrap_or_else(|_| "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V".to_string())
 }
 
 fn stake_so() -> PathBuf {
@@ -129,10 +128,10 @@ fn canonical_vault_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
-/// The same 219-byte legacy InitMarket the f9 suite sends (max_portfolio_assets = 1,
+/// The same 203-byte legacy InitMarket the f9 suite sends (max_portfolio_assets = 1,
 /// initial_price 100, max_accrual_dt_slots 1, no funding).
 fn encode_init_market_v17() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8);
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -154,9 +153,8 @@ fn encode_init_market_v17() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&100u64.to_le_bytes());
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes());
     out.extend_from_slice(&0u128.to_le_bytes());
-    assert_eq!(out.len(), 219);
+    assert_eq!(out.len(), 203);
     out
 }
 
@@ -257,7 +255,8 @@ fn market_only() -> World {
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
     svm.set_account(
         mint,
@@ -282,12 +281,12 @@ fn market_only() -> World {
         program_id: wrapper_id,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(market, false),
+            AccountMeta::new(market, true),
             AccountMeta::new_readonly(mint, false),
         ],
         data: encode_init_market_v17(),
     };
-    let r = send_ixs(&mut svm, &payer, &[&admin], vec![ix]);
+    let r = send_ixs(&mut svm, &payer, &[&admin, &market_kp], vec![ix]);
     assert!(r.is_ok(), "InitMarket: {}", logs(&r));
 
     let src = Pubkey::new_unique();
@@ -492,7 +491,8 @@ struct Trader {
 fn trader(w: &mut World, amount: u64) -> Trader {
     let kp = Keypair::new();
     w.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
-    let pf = Pubkey::new_unique();
+    let pf_kp = Keypair::new();
+    let pf = pf_kp.pubkey();
     let wid = w.wrapper_id;
     w.svm
         .set_account(pf, Account { lamports: 1_000_000_000, data: vec![0u8; PORTFOLIO_LEN], owner: wid, executable: false, rent_epoch: 0 })
@@ -500,10 +500,10 @@ fn trader(w: &mut World, amount: u64) -> Trader {
     let payer = w.payer.insecure_clone();
     let ix = Instruction {
         program_id: wid,
-        accounts: vec![AccountMeta::new(kp.pubkey(), true), AccountMeta::new(w.market, false), AccountMeta::new(pf, false)],
+        accounts: vec![AccountMeta::new(kp.pubkey(), true), AccountMeta::new(w.market, false), AccountMeta::new(pf, true)],
         data: vec![1u8],
     };
-    let r = send_ixs(&mut w.svm, &payer, &[&kp], vec![ix]);
+    let r = send_ixs(&mut w.svm, &payer, &[&kp, &pf_kp], vec![ix]);
     assert!(r.is_ok(), "InitPortfolio: {}", logs(&r));
     let src = Pubkey::new_unique();
     let (mint, k) = (w.mint, kp.pubkey());
