@@ -57,7 +57,6 @@ const STAKE_ID: &str = "7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MARKET_LEN_V22_CAP1: usize = 4043;
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 /// The creator's insurance seed (wrapper tag 9 before the pool exists).
 const SEED: u64 = 5_000_000;
@@ -84,6 +83,9 @@ fn stake_so() -> PathBuf {
 }
 
 fn wrapper_so() -> PathBuf {
+    if let Ok(p) = std::env::var("F9_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     if let Ok(p) = std::env::var("GH311_WRAPPER_SO") {
         return PathBuf::from(p);
     }
@@ -142,9 +144,9 @@ fn canonical_vault_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
-/// Wrapper InitMarket, the same 219-byte form the F-9 / v5 suites use.
+/// Wrapper InitMarket, the same 203-byte form the F-9 / v5 suites use.
 fn encode_init_market() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8);
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -166,9 +168,8 @@ fn encode_init_market() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&100u64.to_le_bytes());
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes());
     out.extend_from_slice(&0u128.to_le_bytes());
-    assert_eq!(out.len(), 219);
+    assert_eq!(out.len(), 203);
     out
 }
 
@@ -312,7 +313,8 @@ fn world(risk_mode: u8) -> World {
     svm.airdrop(&payer.pubkey(), 200_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
 
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
     svm.set_account(
         mint,
@@ -343,12 +345,12 @@ fn world(risk_mode: u8) -> World {
     send(
         &mut svm,
         &payer,
-        &[&admin],
+        &[&admin, &market_kp],
         Instruction {
             program_id: wrapper_id,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
             data: encode_init_market(),
@@ -1097,29 +1099,25 @@ fn gh311_fl_loss_direct_tag41_close_slab_then_tag29_matches_the_control_forged_l
 // FIRST_LOSS: partial tag 41, repeated withdrawals, Live (#290), account checks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A partial direct tag 41 inside the stake class (no creator value released): the creator's
-/// share is 0, so Withdraw books it all, exactly as tag 29 with the same amount would.
+/// A partial direct tag 41 inside the stake class. Stake's own tag 29 still pays a partial amount
+/// through its signed CPI (the control), but the wrapper now refuses an UNSIGNED partial tag 41
+/// outright (AUD-S1-11: an unsigned call must settle the authority's whole reserve, so nobody can
+/// restart the market-wide cooldown by paying 1 atom) with EngineLockActive (21). Before that rule
+/// this test asserted the two paths booked the same; now it pins the refusal and that the refused
+/// call moved nothing.
 #[test]
-fn gh311_fl_partial_direct_tag41_within_stake_class_matches_tag29() {
+fn gh311_fl_partial_direct_tag41_is_refused_while_tag29_partial_still_pays() {
     const PARTIAL: u64 = 3_000_000;
-    let (mut w, _alice, bob) = fl_scene(Kind::Plain);
-    assert!(recover_terminal(&mut w, PARTIAL).is_ok());
-    let ctrl_paid = exit_all(&mut w, &bob, Tail::V5);
-    let ctrl = outcome(&w, ctrl_paid);
+    let (mut w, _alice, _bob) = fl_scene(Kind::Plain);
+    assert!(recover_terminal(&mut w, PARTIAL).is_ok(), "control: tag 29 partial still pays");
 
-    let (mut w, _alice, bob) = fl_scene(Kind::Plain);
-    assert!(direct_tag41(&mut w, PARTIAL).is_ok());
-    assert_eq!(
-        w.units().unwrap().creator_paid_to_stake,
-        0,
-        "PIN: the stake class covered it"
-    );
-    let paid = exit_all(&mut w, &bob, Tail::V5);
-    let o = outcome(&w, paid);
-    assert_eq!(o.bob_paid, ctrl.bob_paid);
-    assert_eq!(o.total_returned, ctrl.total_returned);
-    assert_eq!(o.pool_value, ctrl.pool_value);
-    assert_eq!(o.vault, ctrl.vault);
+    let (mut w, _alice, _bob) = fl_scene(Kind::Plain);
+    let (vault_before, pool_before) = (w.vault_balance(), w.pool().total_returned);
+    let r = direct_tag41(&mut w, PARTIAL);
+    assert!(r.is_err(), "an unsigned partial tag 41 must be refused");
+    assert!(logs(&r).contains("custom program error: 0x15"), "EngineLockActive (21): {}", logs(&r));
+    assert_eq!(w.units().unwrap().creator_paid_to_stake, 0);
+    assert_eq!((w.vault_balance(), w.pool().total_returned), (vault_before, pool_before), "the refused call moved nothing");
 }
 
 /// Two withdrawals after one direct tag 41: the second books nothing new (idempotent) and the

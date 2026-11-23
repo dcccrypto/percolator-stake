@@ -44,7 +44,6 @@ const STAKE_ID: &str = "9tbLt8fs1C7cJRXAyiGY7Ub88AT7MLWpxLqFNVCkqzA6";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MARKET_LEN_V17_CAP1: usize = 4043; // v2.2 variant -rem cap-1 market (592 + 790 + 2661 [#287 +32]: slot = 2325 + 112 band/rent + 160 funding drift tail + 32 R1 words); was 3147 (v17), 3675 (v2.1)
-const MAX_VAULT_TVL: u128 = 10_000_000_000_000_000;
 
 const GENESIS: u64 = 1_000_000;
 const ATTACK: u64 = 100_000;
@@ -58,6 +57,9 @@ fn stake_so() -> PathBuf {
 }
 
 fn wrapper_so() -> PathBuf {
+    if let Ok(p) = std::env::var("F9_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.push("percolator-prog/target/deploy/percolator_prog.so");
@@ -173,7 +175,7 @@ fn send(
 // ── wrapper market ───────────────────────────────────────────────────────────
 
 fn encode_init_market_v17() -> Vec<u8> {
-    let mut out = Vec::with_capacity(219);
+    let mut out = Vec::with_capacity(203);
     out.push(0u8); // tag InitMarket
     out.extend_from_slice(&1u16.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -195,9 +197,8 @@ fn encode_init_market_v17() -> Vec<u8> {
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&1u64.to_le_bytes());
     out.extend_from_slice(&100u64.to_le_bytes());
-    out.extend_from_slice(&MAX_VAULT_TVL.to_le_bytes());
     out.extend_from_slice(&0u128.to_le_bytes());
-    debug_assert_eq!(out.len(), 219, "InitMarket wire must be 219 bytes");
+    debug_assert_eq!(out.len(), 203, "InitMarket wire must be 203 bytes");
     out
 }
 
@@ -208,7 +209,8 @@ fn build_live_market_v17(
     admin: &Keypair,
     payer: &Keypair,
 ) -> (Pubkey, Pubkey, Pubkey, Pubkey) {
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
 
     svm.set_account(
@@ -244,12 +246,12 @@ fn build_live_market_v17(
         program_id: wrapper_id,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(market, false),
+            AccountMeta::new(market, true),
             AccountMeta::new_readonly(mint, false),
         ],
         data: encode_init_market_v17(),
     };
-    send(svm, payer, &[admin], init_ix).expect("InitMarket v17");
+    send(svm, payer, &[admin, &market_kp], init_ix).expect("InitMarket v17");
     (market, mint, wrapper_vault, wrapper_vault_auth)
 }
 

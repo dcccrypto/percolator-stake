@@ -6691,14 +6691,14 @@ mod tests {
         assert_eq!(bytes[335], 0, "byte 335 still spare");
     }
 
-    /// FEE_ONLY seed reader: pinned layout only, engine insurance at byte 941.
+    /// FEE_ONLY seed reader: pinned layout only, engine insurance at byte 925 (941 before the 083a0d08 port).
     #[test]
     fn fee_only_seed_reader_pinned_layout_only() {
         let mut d = vec![0u8; state::WRAPPER_MIN_MARKET_LEN];
         d[0..8].copy_from_slice(&state::WRAPPER_MAGIC.to_le_bytes());
         d[8..10].copy_from_slice(&state::WRAPPER_SUPPORTED_VERSION.to_le_bytes());
         d[state::WRAPPER_OFF_KIND] = state::WRAPPER_KIND_MARKET;
-        d[941..957].copy_from_slice(&123_456u128.to_le_bytes());
+        d[925..941].copy_from_slice(&123_456u128.to_le_bytes());
         assert_eq!(state::read_wrapper_engine_insurance(&d), Some(123_456));
         let mut short = d.clone();
         short.truncate(state::WRAPPER_MIN_MARKET_LEN - 1);

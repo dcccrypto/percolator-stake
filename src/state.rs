@@ -1700,17 +1700,17 @@ pub fn read_wrapper_engine_insurance(data: &[u8]) -> Option<u128> {
 /// M-1 / M-1b: the engine readings the close-out seed is measured from at bind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WrapperBindInsurance {
-    /// Engine header `insurance` (941), `vault` (925), `source_insurance_credit_reserved_total_atoms` (1085).
+    /// Engine header `insurance` (925), `vault` (909), `source_insurance_credit_reserved_total_atoms` (1069).
     pub insurance: u128,
     pub vault: u128,
     pub credit_reserved: u128,
     /// Engine `config.max_market_slots` (626).
     pub max_market_slots: u32,
     /// ASSET 0's own remaining budget: `(budget_long - spent_long) + (budget_short - spent_short)`
-    /// from its engine slot (3049 / 3065 / 3081 / 3097), i.e. the wrapper's
+    /// from its engine slot (3033 / 3049 / 3065 / 3081), i.e. the wrapper's
     /// `market_insurance_remaining_view(group, 0)` before its `min(insurance)`.
     pub asset0_budget_remaining: u128,
-    /// Asset 0's stale K/F cohorts (2759 / 2767): non-zero = a hidden loss reservation exists.
+    /// Asset 0's stale K/F cohorts (2743 / 2751): non-zero = a hidden loss reservation exists.
     pub asset0_stale_long: u64,
     pub asset0_stale_short: u64,
 }
@@ -1846,8 +1846,8 @@ mod tests {
     #[test]
     fn test_f9_read_wrapper_terminal() {
         use WrapperTerminal::*;
-        assert_eq!(WRAPPER_OFF_MODE, 1266); // v2.1: 1218
-        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1398);
+        assert_eq!(WRAPPER_OFF_MODE, 1250); // v2.1: 1218, v2.2 rc23: 1266
+        assert_eq!(WRAPPER_MIN_MARKET_LEN, 1382);
         assert_eq!(
             read_wrapper_terminal(&wrapper_market_with_mode(0)),
             NotTerminal
