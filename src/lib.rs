@@ -98,7 +98,7 @@
 // add the mainnet arm here and in the wrapper's `STAKE_PROGRAM_ID` together.
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(feature = "devnet")]
-solana_program::declare_id!("7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V"); // v2.1 fresh ID (2026-10-05); was VmpVUArR… (ETDLAdi world), GCHhcgw… before
+solana_program::declare_id!("GcWRfTvsgkdrRybFoo3MoxKixDaAbSLG75ERt8oBMqLq"); // v2.1 fresh ID (2026-10-05); was VmpVUArR… (ETDLAdi world), GCHhcgw… before
 
 pub mod cpi;
 pub mod error;
